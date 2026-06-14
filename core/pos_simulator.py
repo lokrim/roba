@@ -263,6 +263,16 @@ class POSSimulator:
         if sim_time < self.next_order_due:
             return None
 
+        # Closed hours / zero-rate gap between dayparts: the Poisson rate is 0
+        # so the inter-arrival is infinite. Do NOT generate an order and do NOT
+        # park ``next_order_due`` at ``inf`` (which would wedge the loop). Just
+        # defer the due time to the next tick so arrivals resume the moment the
+        # rate becomes positive again (e.g. when operating hours reopen).
+        interval = self._interval(sim_time)
+        if not math.isfinite(interval):
+            self.next_order_due = sim_time
+            return None
+
         generated = self.generate_order(sim_time)
         if generated is None:
             # No active menu items; retry on the next tick.
@@ -274,7 +284,7 @@ class POSSimulator:
         if self.formatter is not None:
             self.formatter.on_order(order, lines)
 
-        self.next_order_due = sim_time + self._interval(sim_time)
+        self.next_order_due = sim_time + interval
         return order
 
     # -- orchestrator registration (§10 / §17) -----------------------------

@@ -25,6 +25,18 @@ from core.pos_simulator import POSSimulator
 from core.signals import SignalType
 
 
+def _set_sim_time(session_factory, sim_time):
+    session = session_factory()
+    try:
+        state = get_or_create_sim_state(session)
+        state.sim_time = sim_time
+        state.day_number = int(sim_time // 86400)
+        state.day_of_week = state.day_number % 7
+        session.commit()
+    finally:
+        session.close()
+
+
 def _seed(session_factory):
     """Tiny inline seed: 2 menu items, 1 recipe each, and POS settings."""
     session = session_factory()
@@ -165,6 +177,54 @@ def test_voided_line_emits_cancelled_order_waste(wired):
 
     # notify_order_line fired for the sold line only.
     assert forwarded == [item1_id]
+
+
+def test_interval_infinite_when_closed_no_zero_division(wired):
+    """next_order_interval_sim_s returns +inf (not a ZeroDivisionError) when the
+    daypart weight is 0 (closed hours)."""
+    sim, _formatter, bus, session_factory, _ids = wired
+
+    closed_time = 3 * 3600  # 03:00 — shut, weight 0
+    _set_sim_time(session_factory, closed_time)
+    bus.sim_time = closed_time
+
+    assert sim.daypart_weight(closed_time) == 0.0
+    interval = sim.next_order_interval_sim_s()
+    assert interval == float("inf")
+
+
+def test_tick_during_closed_hours_generates_nothing_and_recovers(wired):
+    """Ticking during closed hours creates no orders and never wedges the loop:
+    once the rate is positive again, arrivals resume."""
+    sim, _formatter, bus, session_factory, _ids = wired
+
+    closed_time = 3 * 3600  # 03:00 — shut
+    bus.sim_time = closed_time
+    for _ in range(10):
+        assert sim.tick(closed_time) is None
+
+    session = session_factory()
+    try:
+        assert session.query(Order).count() == 0
+    finally:
+        session.close()
+
+    # next_order_due must stay finite so the loop can recover (not parked at inf).
+    assert sim.next_order_due is not None
+    import math as _math
+    assert _math.isfinite(sim.next_order_due)
+
+    # Reopen: a tick at 12:00 (lunch) now produces an order.
+    open_time = 12 * 3600
+    bus.sim_time = open_time
+    order = sim.tick(open_time)
+    assert order is not None
+
+    session = session_factory()
+    try:
+        assert session.query(Order).count() == 1
+    finally:
+        session.close()
 
 
 def test_daypart_weight_zero_outside_hours(wired):
