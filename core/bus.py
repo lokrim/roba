@@ -84,6 +84,9 @@ class SignalBus:
         self.db_session_factory = db_session_factory
         self._pending_broadcasts: List[Signal] = []
         self._order_line_handlers: List[Callable[[Any], None]] = []
+        # Generic per-type subscribers (§8.2 / §19.4): callbacks invoked
+        # synchronously inside ``_notify`` for every emitted signal of a type.
+        self._subscribers: Dict[str, List[Callable[[Signal], None]]] = {}
         self._sim_time: float = 0.0
 
     # -- clock bridge -------------------------------------------------------
@@ -179,7 +182,12 @@ class SignalBus:
                     session.commit()
                     session.refresh(existing)
                     session.expunge(existing)
-                    self._notify(existing)
+                    # A dedup-refresh updates an existing *live* signal in place
+                    # (same logical event). The frontend still wants the updated
+                    # payload/expiry, so we re-broadcast — but reactor callbacks
+                    # are action triggers and must fire once per genuine emit, so
+                    # they are NOT re-dispatched on a refresh (no double-acting).
+                    self._notify(existing, dispatch_subscribers=False)
                     return existing
 
             signal = Signal(
@@ -267,6 +275,42 @@ class SignalBus:
         finally:
             session.close()
 
+    # -- generic subscriptions (§8.2 / §19.4) ------------------------------
+
+    def subscribe(
+        self,
+        signal_type: SignalTypeArg,
+        callback: Callable[[Signal], None],
+    ) -> None:
+        """Register ``callback`` to be invoked (synchronously) whenever a signal
+        of ``signal_type`` is emitted.
+
+        This is the single dispatch path for in-process reactors that key off a
+        specific signal type — e.g. the call subsystem reacting to
+        ``APPROVAL_RESOLVED`` for ``outbound_call`` (§8.2) and Track B's PO /
+        promo approval handlers (§19.4). Multiple subscribers per type are
+        allowed and fired in registration order. The callback receives the
+        (detached) :class:`Signal` row that was just written.
+
+        Subscribers fire **once per genuine new emit**. A dedup-refresh of an
+        existing live signal (§14.3) does not re-invoke them, so a reactor can
+        never double-act on a logically-duplicate emit — regardless of whether
+        a caller supplies a ``dedup_key``.
+        """
+        key = _coerce_type(signal_type).value
+        self._subscribers.setdefault(key, []).append(callback)
+
+    def _dispatch_subscribers(self, signal: Signal) -> None:
+        """Invoke every subscriber registered for ``signal.type``; a failing
+        subscriber must never break the emit path or sibling subscribers."""
+        for callback in list(self._subscribers.get(signal.type, ())):
+            try:
+                callback(signal)
+            except Exception:  # noqa: BLE001 — isolate subscriber failures.
+                logger.exception(
+                    "Subscriber for %s raised during emit", signal.type
+                )
+
     # -- order-line callback (§10) -----------------------------------------
 
     def register_order_line_handler(self, fn: Callable[[Any], None]) -> None:
@@ -280,9 +324,18 @@ class SignalBus:
 
     # -- WS broadcast queue -------------------------------------------------
 
-    def _notify(self, signal: Signal) -> None:
-        """Queue a signal for WS broadcast; the API tick loop drains this."""
+    def _notify(self, signal: Signal, dispatch_subscribers: bool = True) -> None:
+        """Queue a signal for WS broadcast and (optionally) fire subscribers.
+
+        Called after the ``signals`` row has been written/committed, so both the
+        WS drain and subscribers always observe a persisted signal. The WS
+        broadcast happens on every emit (new insert *and* dedup-refresh).
+        ``dispatch_subscribers`` is ``False`` on the dedup-refresh path so
+        reactor callbacks fire only on genuine new emits, never on a refresh of
+        an existing live signal (§14.3)."""
         self._pending_broadcasts.append(signal)
+        if dispatch_subscribers:
+            self._dispatch_subscribers(signal)
 
     def pending_broadcasts(self) -> List[Signal]:
         """Return the currently queued broadcasts (not cleared)."""
