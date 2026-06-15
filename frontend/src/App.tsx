@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { ControlBar } from "./shell/ControlBar";
 import { ApprovalInbox } from "./shell/ApprovalInbox";
+import { SettingsDrawer } from "./shell/SettingsDrawer";
 import { wsClient } from "./ws";
+import { apiGet } from "./api";
+import { actions } from "./store";
+import type { SimState, Weather } from "./types";
 
 // Track tab groups (00 §23). The real panels are mounted by the two
 // programmers into these slots; here they are empty labelled placeholders.
@@ -64,6 +68,7 @@ function TabButton({
 
 export default function App() {
   const [inboxOpen, setInboxOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<ActiveTab>({
     track: "A",
     name: TRACK_A_TABS[0],
@@ -71,12 +76,22 @@ export default function App() {
 
   useEffect(() => {
     wsClient.connect();
+    // Hydrate from REST so the bar is populated before the first WS tick.
+    apiGet<Partial<SimState>>("/api/sim/state")
+      .then((s) => actions.setSimState(s))
+      .catch(() => undefined);
+    apiGet<Weather>("/api/weather")
+      .then((w) => actions.setWeather(w))
+      .catch(() => undefined);
     return () => wsClient.close();
   }, []);
 
   return (
     <div className="min-h-full bg-primary text-text">
-      <ControlBar onToggleInbox={() => setInboxOpen((open) => !open)} />
+      <ControlBar
+        onToggleInbox={() => setInboxOpen((open) => !open)}
+        onToggleSettings={() => setSettingsOpen((open) => !open)}
+      />
 
       <main className="px-4 py-4">
         <div className="flex flex-col gap-3">
@@ -121,6 +136,7 @@ export default function App() {
       </main>
 
       <ApprovalInbox open={inboxOpen} onClose={() => setInboxOpen(false)} />
+      <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

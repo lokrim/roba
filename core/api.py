@@ -204,7 +204,7 @@ def _bootstrap() -> None:
     approvals = ApprovalsHub(bus, factory)
     calls = CallSubsystem(bus, factory, clock, llm)
     formatter = DataFormatter(bus, factory)
-    pos = POSSimulator(bus, factory, clock, formatter)
+    pos = POSSimulator(bus, factory, clock, formatter, weather=weather)
     scenarios = ScenarioEngine(bus, factory, clock, pos, weather)
 
     # Wire the WS broadcast sinks (§21). order_created flows through the
@@ -309,6 +309,7 @@ class PosBody(BaseModel):
     dish_mix_weights: Optional[Dict[str, Any]] = None
     channel_mix: Optional[Dict[str, Any]] = None
     daypart_curve: Optional[Dict[str, Any]] = None
+    anomaly_injections: Optional[List[Dict[str, Any]]] = None
 
 
 @app.post("/api/sim/play")
@@ -316,7 +317,9 @@ def sim_play() -> Dict[str, Any]:
     state = ctx.clock.current_state()
     if state["status"] == SimClock.RUNNING:
         raise HTTPException(status_code=409, detail="Simulation is already running")
-    return ctx.clock.play()
+    result = ctx.clock.play()
+    ctx.hub.broadcast("sim_state_changed", result)
+    return result
 
 
 @app.post("/api/sim/pause")
@@ -324,12 +327,16 @@ def sim_pause() -> Dict[str, Any]:
     state = ctx.clock.current_state()
     if state["status"] == SimClock.STOPPED:
         raise HTTPException(status_code=409, detail="Cannot pause a stopped simulation")
-    return ctx.clock.pause()
+    result = ctx.clock.pause()
+    ctx.hub.broadcast("sim_state_changed", result)
+    return result
 
 
 @app.post("/api/sim/stop")
 def sim_stop() -> Dict[str, Any]:
-    return ctx.clock.stop()
+    result = ctx.clock.stop()
+    ctx.hub.broadcast("sim_state_changed", result)
+    return result
 
 
 @app.post("/api/sim/restart")
@@ -358,23 +365,31 @@ def sim_restart() -> Dict[str, Any]:
         # The wipe cleared scenarios — re-ship the flagship.
         ctx.scenarios.seed_default_scenario()
 
-    return ctx.clock.restart(_reseed)
+    result = ctx.clock.restart(_reseed)
+    ctx.hub.broadcast("sim_state_changed", result)
+    return result
 
 
 @app.post("/api/sim/step")
 def sim_step() -> Dict[str, Any]:
-    return ctx.clock.step()
+    result = ctx.clock.step()
+    ctx.hub.broadcast("sim_state_changed", result)
+    return result
 
 
 @app.post("/api/sim/jump-next")
 def sim_jump_next() -> Dict[str, Any]:
-    return ctx.clock.jump_to_next_event()
+    result = ctx.clock.jump_to_next_event()
+    ctx.hub.broadcast("sim_state_changed", result)
+    return result
 
 
 @app.post("/api/sim/speed")
 def sim_speed(body: SpeedBody) -> Dict[str, Any]:
     try:
-        return ctx.clock.set_speed(body.speed)
+        result = ctx.clock.set_speed(body.speed)
+        ctx.hub.broadcast("sim_state_changed", result)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -382,6 +397,16 @@ def sim_speed(body: SpeedBody) -> Dict[str, Any]:
 @app.get("/api/sim/state")
 def sim_state() -> Dict[str, Any]:
     return ctx.clock.current_state()
+
+
+@app.get("/api/sim/pos")
+def get_sim_pos() -> Dict[str, Any]:
+    session = db.SessionLocal()
+    try:
+        settings = _ensure_settings_singleton(session)
+        return _row_to_dict(settings)
+    finally:
+        session.close()
 
 
 @app.patch("/api/sim/pos")
@@ -531,6 +556,8 @@ CRUD_RESOURCES = {
     "inventory": models.InventoryLevel,
     "competitors": models.Competitor,
     "reviews": models.Review,
+    # scenario_events get full CRUD here; scenarios use custom GET (nested) below
+    "scenario_events": models.ScenarioEvent,
 }
 
 
@@ -796,6 +823,60 @@ def call_end(call_id: int) -> Dict[str, Any]:
 # ===========================================================================
 # Scenarios (§20)
 # ===========================================================================
+
+
+@app.post("/api/scenarios")
+def create_scenario(
+    body: Dict[str, Any] = Body(...),
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    data = _coerce_columns(models.Scenario, body)
+    if not data:
+        raise HTTPException(status_code=422, detail="No valid fields provided")
+    try:
+        obj = models.Scenario(**data)
+        db_session.add(obj)
+        db_session.commit()
+        db_session.refresh(obj)
+    except Exception as exc:  # noqa: BLE001
+        db_session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _row_to_dict(obj)
+
+
+@app.patch("/api/scenarios/{scenario_id}")
+def update_scenario(
+    scenario_id: int,
+    body: Dict[str, Any] = Body(...),
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    obj = db_session.get(models.Scenario, scenario_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail=f"Scenario {scenario_id} not found")
+    data = _coerce_columns(models.Scenario, body)
+    try:
+        for field, value in data.items():
+            setattr(obj, field, value)
+        db_session.commit()
+        db_session.refresh(obj)
+    except Exception as exc:  # noqa: BLE001
+        db_session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _row_to_dict(obj)
+
+
+@app.delete("/api/scenarios/{scenario_id}")
+def delete_scenario(
+    scenario_id: int,
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    obj = db_session.get(models.Scenario, scenario_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail=f"Scenario {scenario_id} not found")
+    db_session.delete(obj)
+    db_session.commit()
+    return {"deleted": scenario_id}
+
 
 @app.get("/api/scenarios")
 def read_scenarios(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:

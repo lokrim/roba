@@ -103,6 +103,7 @@ export const wsClient = new WsClient();
 // Wire the core shell store to the relevant WS events (00 §21). Track panels
 // register their own handlers via wsClient.on(...) for the events they need.
 wsClient.on("sim_tick", (p) => actions.setSimState(p as Partial<SimState>));
+wsClient.on("sim_state_changed", (p) => actions.setSimState(p as Partial<SimState>));
 wsClient.on("weather_updated", (p) =>
   actions.setWeather((p as { weather: Weather }).weather),
 );

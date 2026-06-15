@@ -7,6 +7,8 @@ Gate (this session):
 - ``bus.notify_order_line`` is called for each non-voided line.
 """
 
+import random
+
 import pytest
 
 from core.clock import SimClock, get_or_create_sim_state
@@ -21,8 +23,29 @@ from core.models import (
     SimSettings,
     Station,
 )
-from core.pos_simulator import POSSimulator
+from core.pos_simulator import WINDOW_SECONDS, POSSimulator, active_injections
 from core.signals import SignalType
+
+
+class _StubWeather:
+    """Minimal weather provider stub: ``current()`` returns a row-like object
+    carrying just the ``condition`` the POS reads for the channel shift."""
+
+    def __init__(self, condition):
+        self._row = type("W", (), {"condition": condition})()
+
+    def current(self):
+        return self._row
+
+
+def _set_anomaly(session_factory, injections):
+    session = session_factory()
+    try:
+        settings = session.get(SimSettings, 1)
+        settings.anomaly_injections = injections
+        session.commit()
+    finally:
+        session.close()
 
 
 def _set_sim_time(session_factory, sim_time):
@@ -234,3 +257,96 @@ def test_daypart_weight_zero_outside_hours(wired):
     assert sim.daypart_weight(3 * 3600) == 0.0
     # 12:00 — lunch daypart, positive weight.
     assert sim.daypart_weight(12 * 3600) > 0.0
+
+
+# -- weather channel shift (§18.5) -----------------------------------------
+
+def test_weather_channel_shift_lookup(bus, session_factory):
+    """``_weather_channel_shift`` maps the current condition to §18.5 factors;
+    clear/clouds (and no provider / no row) yield no shift."""
+    clock = SimClock(session_factory, bus)
+    rain = POSSimulator(bus, session_factory, clock, weather=_StubWeather("rain"))
+    assert rain._weather_channel_shift() == {"dine_in": 0.85, "delivery": 1.20}
+    snow = POSSimulator(bus, session_factory, clock, weather=_StubWeather("snow"))
+    assert snow._weather_channel_shift() == {"dine_in": 0.60, "delivery": 1.10}
+    clear = POSSimulator(bus, session_factory, clock, weather=_StubWeather("clear"))
+    assert clear._weather_channel_shift() == {}
+    none = POSSimulator(bus, session_factory, clock, weather=None)
+    assert none._weather_channel_shift() == {}
+
+
+def test_rain_increases_delivery_share(bus, session_factory):
+    """Over many orders, rain shifts the channel split toward delivery vs clear."""
+    _seed(session_factory)
+    clock = SimClock(session_factory, bus)
+    sim_time = 12 * 3600  # lunch
+    bus.sim_time = sim_time
+
+    def delivery_share(condition):
+        sim = POSSimulator(
+            bus, session_factory, clock,
+            rng=random.Random(123), weather=_StubWeather(condition),
+        )
+        deliveries = total = 0
+        for _ in range(2000):
+            order, _lines = sim.generate_order(sim_time)
+            total += 1
+            if order.channel == "delivery":
+                deliveries += 1
+        return deliveries / total
+
+    assert delivery_share("rain") > delivery_share("clear")
+
+
+# -- anomaly injections (§10) ----------------------------------------------
+
+def test_active_injections_window_bounds():
+    """``active_injections`` filters by ``[start, end)`` with open-ended bounds."""
+    inj = [
+        {"start": 100.0, "end": 200.0, "velocity_mult": 2.0},
+        {"end": 50.0, "velocity_mult": 9.0},          # open start, ends at 50
+        {"start": 300.0, "velocity_mult": 3.0},        # open end, starts at 300
+    ]
+    assert active_injections(inj, 150.0) == [inj[0]]
+    assert active_injections(inj, 25.0) == [inj[1]]
+    assert active_injections(inj, 500.0) == [inj[2]]
+    assert active_injections(inj, 250.0) == []
+    assert active_injections(None, 0.0) == []
+
+
+def test_anomaly_velocity_mult_scales_rate(wired):
+    """An active ``velocity_mult`` injection multiplies the Poisson rate; one
+    outside the current window does not."""
+    sim, _formatter, _bus, session_factory, _ids = wired
+    t = 12 * 3600  # lunch
+
+    base_rate = sim._rate(t, sim._read_settings())
+    assert base_rate > 0.0
+
+    _set_anomaly(session_factory, [{"start": 0.0, "end": 86400.0, "velocity_mult": 2.0}])
+    assert sim._rate(t, sim._read_settings()) == pytest.approx(base_rate * 2.0)
+
+    _set_anomaly(session_factory, [{"start": t + 1, "end": t + 100, "velocity_mult": 2.0}])
+    assert sim._rate(t, sim._read_settings()) == pytest.approx(base_rate)
+
+
+def test_anomaly_dish_skew_raises_item_share(bus, session_factory):
+    """A ``dish_mix_skew`` on one item raises its share of generated lines."""
+    item1_id, item2_id = _seed(session_factory)
+    _set_anomaly(
+        session_factory,
+        [{"start": 0.0, "end": 86400.0, "dish_mix_skew": {str(item1_id): 10.0}}],
+    )
+    clock = SimClock(session_factory, bus)
+    t = 12 * 3600
+    bus.sim_time = t
+    sim = POSSimulator(bus, session_factory, clock, rng=random.Random(7))
+
+    counts = {item1_id: 0, item2_id: 0}
+    for _ in range(2000):
+        _order, lines = sim.generate_order(t)
+        for line in lines:
+            counts[line.menu_item_id] += 1
+
+    # Base weights are uniform (1.0 each); a ×10 skew should dominate.
+    assert counts[item1_id] > counts[item2_id]
