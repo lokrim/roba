@@ -8,6 +8,7 @@ import {
   Play,
   RotateCcw,
   Send,
+  Settings,
   Square,
   StepForward,
   Wifi,
@@ -15,6 +16,7 @@ import {
 } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
 import {
+  actions,
   useActiveCall,
   useApprovals,
   useCallTurns,
@@ -22,7 +24,7 @@ import {
   useWeather,
   useWsConnected,
 } from "../store";
-import type { Scenario, SimState, WeatherCondition } from "../types";
+import type { Scenario, SimState, SimStatus, WeatherCondition } from "../types";
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8];
 const CONDITIONS: WeatherCondition[] = ["clear", "clouds", "rain", "storm", "snow"];
@@ -135,28 +137,95 @@ function TransportButton({
   onClick,
   title,
   active,
+  disabled,
+  pending,
   children,
 }: {
   onClick: () => void;
   title: string;
   active?: boolean;
+  disabled?: boolean;
+  pending?: boolean;
   children: ReactNode;
 }) {
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
       title={title}
       aria-label={title}
       className={
-        "flex h-8 w-8 items-center justify-center rounded-md " +
-        (active
-          ? "bg-accent text-white"
-          : "bg-muted text-text hover:bg-muted/70")
+        "flex h-8 w-8 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed " +
+        (pending
+          ? "animate-pulse bg-accent/70 text-white"
+          : active
+            ? "bg-accent text-white"
+            : disabled
+              ? "bg-muted/40 text-text/20"
+              : "bg-muted text-text hover:bg-muted/70")
       }
     >
       {children}
     </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Status pill — colour-coded with animated dot for running / frozen states
+// ---------------------------------------------------------------------------
+
+const STATUS_CFG: Record<
+  string,
+  { dot: string; label: string; textCls: string }
+> = {
+  running: {
+    dot: "bg-success animate-pulse",
+    label: "running",
+    textCls: "text-success",
+  },
+  paused: {
+    dot: "bg-warning",
+    label: "paused",
+    textCls: "text-warning",
+  },
+  stopped: {
+    dot: "bg-text/30",
+    label: "stopped",
+    textCls: "text-text/40",
+  },
+  call_frozen: {
+    dot: "bg-accent animate-pulse",
+    label: "frozen",
+    textCls: "text-accent",
+  },
+};
+
+function StatusPill({
+  status,
+  pendingAction,
+}: {
+  status: SimStatus | string;
+  pendingAction: string | null;
+}) {
+  if (pendingAction === "restart") {
+    return (
+      <span className="flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1.5 text-xs font-medium">
+        <span className="h-2 w-2 animate-spin rounded-full border border-warning border-t-transparent" />
+        <span className="text-warning">restarting</span>
+      </span>
+    );
+  }
+  const cfg = STATUS_CFG[status] ?? {
+    dot: "bg-text/30",
+    label: status,
+    textCls: "text-text/40",
+  };
+  return (
+    <span className="flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1.5 text-xs font-medium">
+      <span className={`h-2 w-2 rounded-full ${cfg.dot}`} />
+      <span className={cfg.textCls}>{cfg.label}</span>
+    </span>
   );
 }
 
@@ -544,20 +613,59 @@ function VelocitySlider() {
 // Control bar root
 // ---------------------------------------------------------------------------
 
-export function ControlBar({ onToggleInbox }: { onToggleInbox: () => void }) {
+// Status → optimistic state applied immediately on click so the pill reacts
+// before the server confirms (play→running, pause→paused, stop→stopped).
+const OPTIMISTIC: Partial<Record<string, SimStatus>> = {
+  play: "running",
+  pause: "paused",
+  stop: "stopped",
+};
+
+export function ControlBar({
+  onToggleInbox,
+  onToggleSettings,
+}: {
+  onToggleInbox: () => void;
+  onToggleSettings: () => void;
+}) {
   const simState = useSimState();
   const wsConnected = useWsConnected();
   const approvals = useApprovals();
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
 
   const status = simState?.status ?? "stopped";
   const speed = simState?.speed ?? 1;
+  const isBusy = pendingAction !== null;
 
-  function sim(action: string) {
-    apiPost(`/api/sim/${action}`).catch(() => undefined);
+  async function sim(action: string) {
+    if (isBusy) return;
+    setPendingAction(action);
+    const optimistic = OPTIMISTIC[action];
+    if (optimistic) actions.setSimState({ status: optimistic });
+    try {
+      const result = await apiPost<Partial<SimState>>(`/api/sim/${action}`);
+      actions.setSimState(result);
+    } catch {
+      // Revert: re-fetch the authoritative state.
+      apiGet<Partial<SimState>>("/api/sim/state")
+        .then((s) => actions.setSimState(s))
+        .catch(() => undefined);
+    } finally {
+      setPendingAction(null);
+    }
   }
 
-  function setSpeed(value: number) {
-    apiPost("/api/sim/speed", { speed: value }).catch(() => undefined);
+  async function setSpeed(value: number) {
+    // Optimistic: update speed immediately so buttons feel instant.
+    actions.setSimState({ speed: value });
+    try {
+      const result = await apiPost<Partial<SimState>>("/api/sim/speed", {
+        speed: value,
+      });
+      actions.setSimState(result);
+    } catch {
+      /* WS reconciles on next tick */
+    }
   }
 
   return (
@@ -565,26 +673,50 @@ export function ControlBar({ onToggleInbox }: { onToggleInbox: () => void }) {
       <div className="flex min-h-18 flex-wrap items-end gap-4 px-4 py-2">
         <Section label="Transport">
           <TransportButton
-            onClick={() => sim("play")}
+            onClick={() => void sim("play")}
             title="Play"
-            active={status === "running"}
+            active={status === "running" && !pendingAction}
+            disabled={isBusy || status === "running"}
+            pending={pendingAction === "play"}
           >
             <Play size={16} />
           </TransportButton>
           <TransportButton
-            onClick={() => sim("pause")}
+            onClick={() => void sim("pause")}
             title="Pause"
-            active={status === "paused"}
+            active={status === "paused" && !pendingAction}
+            disabled={isBusy || status === "stopped"}
+            pending={pendingAction === "pause"}
           >
             <Pause size={16} />
           </TransportButton>
-          <TransportButton onClick={() => sim("stop")} title="Stop">
+          <TransportButton
+            onClick={() => void sim("stop")}
+            title="Stop"
+            disabled={isBusy || status === "stopped"}
+            pending={pendingAction === "stop"}
+          >
             <Square size={16} />
           </TransportButton>
-          <TransportButton onClick={() => sim("restart")} title="Restart">
-            <RotateCcw size={16} />
+          <TransportButton
+            onClick={() => void sim("restart")}
+            title="Restart"
+            disabled={isBusy}
+            pending={pendingAction === "restart"}
+          >
+            <RotateCcw
+              size={16}
+              className={
+                pendingAction === "restart" ? "animate-spin" : undefined
+              }
+            />
           </TransportButton>
-          <TransportButton onClick={() => sim("step")} title="Step">
+          <TransportButton
+            onClick={() => void sim("step")}
+            title="Step"
+            disabled={isBusy || status === "running"}
+            pending={pendingAction === "step"}
+          >
             <StepForward size={16} />
           </TransportButton>
         </Section>
@@ -594,9 +726,9 @@ export function ControlBar({ onToggleInbox }: { onToggleInbox: () => void }) {
             <button
               key={s}
               type="button"
-              onClick={() => setSpeed(s)}
+              onClick={() => void setSpeed(s)}
               className={
-                "rounded-md px-2 py-1.5 text-xs font-medium " +
+                "rounded-md px-2 py-1.5 text-xs font-medium transition-colors " +
                 (speed === s
                   ? "bg-accent text-white"
                   : "bg-muted text-text hover:bg-muted/70")
@@ -609,11 +741,9 @@ export function ControlBar({ onToggleInbox }: { onToggleInbox: () => void }) {
 
         <Section label="Sim time">
           <span className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium tabular-nums text-text">
-            {formatSimTime(simState)}
+            {pendingAction === "restart" ? "Restarting…" : formatSimTime(simState)}
           </span>
-          <span className="ml-1 rounded-md bg-primary px-2 py-1.5 text-xs uppercase text-text/60">
-            {status}
-          </span>
+          <StatusPill status={status} pendingAction={pendingAction} />
         </Section>
 
         <Section label="Velocity">
@@ -651,6 +781,16 @@ export function ControlBar({ onToggleInbox }: { onToggleInbox: () => void }) {
               {wsConnected ? "connected" : "offline"}
             </span>
           </Section>
+
+          <button
+            type="button"
+            onClick={onToggleSettings}
+            className="flex h-9 w-9 items-center justify-center rounded-md bg-muted text-text hover:bg-muted/70"
+            aria-label="Toggle settings"
+            title="Settings"
+          >
+            <Settings size={18} />
+          </button>
 
           <button
             type="button"

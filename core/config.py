@@ -68,5 +68,15 @@ LLM_INTER_CALL_SLEEP_S = 2
 # weather
 WEATHER_FETCH_SIM_S = 10800                # every 3 sim-h
 
+# weather → channel-mix shift (§18.5; applied by the POS simulator). Per
+# condition, a multiplier on each channel's sampling weight; channels absent
+# from a condition default to 1.0. (The item-level hot/cold factors in §18.5
+# are the Forecaster's job, not the POS — only the channel shift lives here.)
+WEATHER_CHANNEL_SHIFT = {
+    "rain":  {"dine_in": 0.85, "delivery": 1.20},
+    "storm": {"dine_in": 0.85, "delivery": 1.20},
+    "snow":  {"dine_in": 0.60, "delivery": 1.10},
+}
+
 # database
 DB_PATH = os.getenv("DB_PATH", "demo.db")

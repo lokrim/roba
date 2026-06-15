@@ -30,6 +30,29 @@ def _hhmm_to_seconds(hhmm: str) -> int:
     return int(hours) * 3600 + int(minutes) * 60
 
 
+def active_injections(injections: Any, sim_time: float) -> List[dict]:
+    """Return the ``anomaly_injections`` windows active at ``sim_time`` (§10).
+
+    An injection is a dict ``{start?, end?, velocity_mult?, dish_mix_skew?}``
+    with bounds in absolute sim-seconds; a missing ``start``/``end`` is treated
+    as open on that side. Anything that is not a list of dicts yields ``[]``.
+    """
+    if not isinstance(injections, list):
+        return []
+    out: List[dict] = []
+    for inj in injections:
+        if not isinstance(inj, dict):
+            continue
+        start = inj.get("start")
+        end = inj.get("end")
+        if start is not None and sim_time < float(start):
+            continue
+        if end is not None and sim_time >= float(end):
+            continue
+        out.append(inj)
+    return out
+
+
 class _Settings:
     """A detached snapshot of the live, editable POS settings (§10).
 
@@ -52,6 +75,15 @@ class _Settings:
         self.channel_mix = (
             (row.channel_mix if row is not None else None) or dict(config.CHANNEL_MIX)
         )
+        self.anomaly_injections = (
+            (row.anomaly_injections if row is not None else None) or []
+        )
+        # Optional weight overrides keyed by daypart name {name: weight}.
+        # Time windows are always taken from config.DAYPARTS; only the weight
+        # is overridden.  An absent or empty dict means "use config defaults".
+        self.daypart_curve: dict = (
+            (row.daypart_curve if row is not None else None) or {}
+        )
 
 
 class POSSimulator:
@@ -64,11 +96,15 @@ class POSSimulator:
         clock: Any,
         formatter: Any = None,
         rng: Any = None,
+        weather: Any = None,
     ):
         self.bus = bus
         self.db_session_factory = db_session_factory
         self.clock = clock
         self.formatter = formatter
+        # Weather provider (§18.5): the POS applies the *channel* shift from the
+        # current condition. Optional — when absent the channel mix is unshifted.
+        self.weather = weather
         # ``random`` (the module) and ``random.Random()`` share the same API
         # surface used here (random / choices); default to the module so the
         # spec's ``random()`` call is literal and seedable in tests.
@@ -85,28 +121,63 @@ class POSSimulator:
 
     # -- daypart curve (§10 / §22) -----------------------------------------
 
-    def daypart_weight(self, sim_time: float) -> float:
-        """Daypart weight for ``sim_time`` from ``config.DAYPARTS``.
+    def daypart_weight(
+        self, sim_time: float, settings: Optional["_Settings"] = None
+    ) -> float:
+        """Daypart weight for ``sim_time``.
 
         Maps the current time-of-day to the matching daypart's weight; outside
         operating hours the weight is ``0`` (the restaurant is shut, no orders).
+        When ``settings`` carries a ``daypart_curve`` override, the stored
+        weight for that daypart name replaces the ``config.DAYPARTS`` default.
         """
         tod = sim_time % 86400
+        curve: dict = (settings.daypart_curve if settings is not None else {}) or {}
         for _name, (start, end, weight) in config.DAYPARTS.items():
             if _hhmm_to_seconds(start) <= tod < _hhmm_to_seconds(end):
-                return float(weight)
+                return float(curve.get(_name, weight))
         return 0.0
+
+    # -- weather channel shift (§18.5) -------------------------------------
+
+    def _weather_channel_shift(self) -> dict:
+        """Per-channel multipliers for the current weather condition (§18.5).
+
+        Reads the latest ``weather_log`` row via the wired weather provider and
+        looks the condition up in :data:`config.WEATHER_CHANNEL_SHIFT`. Returns
+        an empty dict (no shift) when no provider is wired, there is no current
+        weather, or the condition has no defined shift (e.g. clear/clouds).
+        """
+        if self.weather is None:
+            return {}
+        try:
+            current = self.weather.current()
+        except Exception:  # weather is best-effort; never break order generation
+            return {}
+        if current is None:
+            return {}
+        return config.WEATHER_CHANNEL_SHIFT.get(current.condition, {})
 
     # -- arrival rate / inter-arrival (§10) --------------------------------
 
     def _rate(self, sim_time: float, settings: _Settings) -> float:
-        """Poisson arrival rate at ``sim_time`` (orders per sim-second)."""
-        return (
+        """Poisson arrival rate at ``sim_time`` (orders per sim-second).
+
+        Scaled by the product of ``velocity_mult`` over any ``anomaly_injections``
+        active at ``sim_time`` (§10) — this is how scenario velocity surges spike
+        and then subside at their window's end.
+        """
+        rate = (
             settings.base_orders_per_day
             * settings.velocity
-            * self.daypart_weight(sim_time)
+            * self.daypart_weight(sim_time, settings)
             / WINDOW_SECONDS
         )
+        for inj in active_injections(settings.anomaly_injections, sim_time):
+            mult = inj.get("velocity_mult")
+            if mult is not None:
+                rate *= float(mult)
+        return rate
 
     def _interval(self, sim_time: float, settings: Optional[_Settings] = None) -> float:
         """Exponential inter-arrival for ``sim_time`` (``inf`` when rate≤0)."""
@@ -177,9 +248,28 @@ class POSSimulator:
             population = [it.id for it in items]
             weights = [1.0] * len(population)
 
-        # Channel sampling population.
+        # Anomaly dish-mix skew (§10): multiply each item's weight by any
+        # matching ``dish_mix_skew`` from injections active at ``sim_time``.
+        injections = active_injections(settings.anomaly_injections, sim_time)
+        for inj in injections:
+            skew = inj.get("dish_mix_skew")
+            if not isinstance(skew, dict):
+                continue
+            for idx, iid in enumerate(population):
+                factor = skew.get(str(iid))
+                if factor is not None:
+                    weights[idx] *= float(factor)
+
+        # Channel sampling population, shifted by the current weather condition
+        # (§18.5): ``random.choices`` does not require normalised weights, so a
+        # plain per-channel multiply suffices.
         channels = list(settings.channel_mix.keys())
         channel_weights = [float(settings.channel_mix[c]) for c in channels]
+        shift = self._weather_channel_shift()
+        if shift:
+            channel_weights = [
+                w * float(shift.get(c, 1.0)) for c, w in zip(channels, channel_weights)
+            ]
         channel = self._rng.choices(channels, weights=channel_weights, k=1)[0]
 
         # n_lines ~ LINES_PER_ORDER.

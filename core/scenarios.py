@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import config
 from .clock import DAY_OPEN_OFFSET, SECONDS_PER_DAY
 from .events import log_event
 from .models import (
@@ -394,20 +395,42 @@ class ScenarioEngine:
         self._log(sim_time, "scenario", "Set weather", payload)
 
     def _velocity_mult(self, payload: Dict[str, Any], sim_time: float) -> None:
-        """Multiply ``sim_settings.velocity`` (takes effect next tick, §10)."""
+        """Apply a velocity surge as a time-windowed ``anomaly_injections`` entry
+        (§10 / §18.9) rather than mutating ``sim_settings.velocity``.
+
+        The surge runs from ``sim_time`` until the end of the daypart it fires
+        in, after which the POS rate reverts on its own — so successive surges
+        never compound and the user's velocity slider is left untouched. The
+        window length is overridable via ``payload['duration']`` (sim-seconds)
+        or an explicit ``payload['until']`` (absolute sim-time).
+        """
         mult = float(payload.get("mult", 1.0))
+        if payload.get("until") is not None:
+            end = float(payload["until"])
+        elif payload.get("duration") is not None:
+            end = sim_time + float(payload["duration"])
+        else:
+            end = _daypart_end_sim_time(sim_time)
+        injection = {
+            "label": payload.get("label", "velocity surge"),
+            "start": sim_time,
+            "end": end,
+            "velocity_mult": mult,
+        }
+
         session = self.db_session_factory()
         try:
             settings = self._get_or_create_settings(session)
-            current = settings.velocity if settings.velocity is not None else 1.0
-            settings.velocity = current * mult
+            existing = list(settings.anomaly_injections or [])
+            existing.append(injection)
+            # Reassign (not mutate) so SQLAlchemy flags the JSON column dirty.
+            settings.anomaly_injections = existing
             session.commit()
-            new_velocity = settings.velocity
         finally:
             session.close()
         self._log(
             sim_time, "scenario",
-            f"Velocity ×{mult} → {new_velocity:.3f}", payload,
+            f"Velocity ×{mult} until {end:.0f} (windowed surge)", payload,
         )
 
     # -- resolution helpers -------------------------------------------------
@@ -503,3 +526,27 @@ class ScenarioEngine:
             return scenario.id
         finally:
             session.close()
+
+
+# ---------------------------------------------------------------------------
+# Daypart helpers (used to bound velocity surges, §18.9).
+# ---------------------------------------------------------------------------
+
+def _hhmm(hhmm: str) -> int:
+    """Convert an ``"HH:MM"`` clock string to seconds-into-day."""
+    h, m = hhmm.split(":")
+    return int(h) * 3600 + int(m) * 60
+
+
+def _daypart_end_sim_time(sim_time: float) -> float:
+    """Absolute sim-time at which the daypart containing ``sim_time`` ends.
+
+    Scans ``config.DAYPARTS`` for the bucket whose ``[start, end)`` covers the
+    time-of-day; falls back to the end of the operating window when ``sim_time``
+    sits outside every daypart (e.g. closed hours)."""
+    day_base = sim_time - (sim_time % SECONDS_PER_DAY)
+    tod = sim_time % SECONDS_PER_DAY
+    for _name, (start, end, _w) in config.DAYPARTS.items():
+        if _hhmm(start) <= tod < _hhmm(end):
+            return day_base + _hhmm(end)
+    return day_base + _hhmm(config.OPERATING_WINDOW[1])

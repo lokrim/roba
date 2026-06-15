@@ -88,5 +88,66 @@ export interface Scenario {
   name: string;
   description: string | null;
   is_active: number;
-  events?: unknown[];
+  events?: ScenarioEvent[];
 }
+
+/** A single timed event within a scenario. */
+export interface ScenarioEvent {
+  id: number;
+  scenario_id: number;
+  at_sim_time: number;
+  event_type: string;
+  payload: unknown;
+  fired: number;
+}
+
+/** Valid event_type values the scenario engine dispatches. */
+export const SCENARIO_EVENT_TYPES = [
+  "inject_signal",
+  "change_setting",
+  "inject_review",
+  "set_competitor",
+  "call_in_sick",
+  "supplier_change",
+  "weather_set",
+  "velocity_mult",
+] as const;
+
+export type ScenarioEventType = (typeof SCENARIO_EVENT_TYPES)[number];
+
+/** sim_settings singleton row (GET/PATCH /api/sim/pos). */
+export interface SimSettings {
+  id: number;
+  base_orders_per_day: number | null;
+  velocity: number | null;
+  dish_mix_weights: Record<string, number> | null;
+  daypart_curve: Record<string, number> | null;
+  channel_mix: Record<string, number> | null;
+  anomaly_injections: AnomalyInjection[] | null;
+}
+
+/** One windowed POS anomaly injection (§10). */
+export interface AnomalyInjection {
+  start?: number;
+  end?: number;
+  velocity_mult?: number;
+  dish_mix_skew?: Record<string, number>;
+}
+
+/** menu_items row (GET /api/menu). */
+export interface MenuItem {
+  id: number;
+  name: string;
+  category: string | null;
+  station_id: number | null;
+  dine_in_price: number | null;
+  online_price: number | null;
+  prep_time_min: number | null;
+  is_batchable: number;
+  active: number;
+  weather_tags: unknown;
+  description: string | null;
+}
+
+/** Generic entity row for the entity editor (columns vary per resource). */
+export type EntityRow = Record<string, unknown>;
