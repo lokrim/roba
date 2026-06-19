@@ -100,8 +100,9 @@ Env vars: `GEMINI_API_KEY`, `GEMINI_MODEL` (default `gemini-3.1-flash-lite`), `G
 /Makefile                      # seed | demo-a | demo-b | demo | reset | test | up | down
 /.env.example
 /requirements.txt
-/docker-compose.yml            # backend + frontend services (§26)
-/Dockerfile.backend            # python app image (uvicorn core.api:app)
+/docker-compose.yml            # base + backend + frontend services (§26)
+/Dockerfile.base               # pip-install base image (roba-base:latest); rebuilt only when requirements.txt changes
+/Dockerfile.backend            # python app image, FROM roba-base:latest (uvicorn core.api:app)
 /frontend/Dockerfile           # node/vite image
 /.dockerignore
 /core/
@@ -613,6 +614,10 @@ The whole demo runs with one command on any machine via Docker Compose: a **back
 ### 26.1 docker-compose.yml
 ```yaml
 services:
+  base:
+    build: { context: ., dockerfile: Dockerfile.base }
+    image: roba-base:latest
+    profiles: ["build-only"]   # never started; produces the pip-install layer backend builds FROM
   backend:
     build: { context: ., dockerfile: Dockerfile.backend }
     ports: ["8000:8000"]
@@ -627,12 +632,19 @@ services:
 volumes: { dbdata: {} }
 ```
 
-### 26.2 Dockerfile.backend
+### 26.2 Dockerfile.base + Dockerfile.backend
+`requirements.txt` rarely changes, but every prior setup re-ran `pip install` on each `docker compose up --build`. The pip layer now lives in its own base image (`roba-base:latest`) that `Dockerfile.backend` builds `FROM` — Docker only re-runs `pip install` when `requirements.txt` changes, not on every restart.
 ```dockerfile
+# Dockerfile.base
 FROM python:3.14-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+```
+```dockerfile
+# Dockerfile.backend
+FROM roba-base:latest
+WORKDIR /app
 COPY core ./core
 COPY track_a ./track_a
 COPY track_b ./track_b
@@ -641,7 +653,7 @@ RUN mkdir -p /app/dbdata
 EXPOSE 8000
 CMD ["uvicorn", "core.api:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
-The backend imports both tracks; `DEMO_MODE` selects which mocks run. `DB_PATH` points SQLite at the mounted volume (`db.py` reads it); `docker compose down -v` wipes it, `make reset` re-seeds.
+The backend imports both tracks; `DEMO_MODE` selects which mocks run. `DB_PATH` points SQLite at the mounted volume (`db.py` reads it); `docker compose down -v` wipes it, `make reset` re-seeds. The `base` image must be built (`make base`, or any Makefile target that depends on it) before `backend` can build, since `roba-base:latest` is resolved locally rather than from a registry.
 
 ### 26.3 frontend/Dockerfile
 ```dockerfile
@@ -674,7 +686,7 @@ docker compose down           # make down   (down -v also wipes the DB)
 For non-Docker dev: `uvicorn core.api:app --reload` + `npm run dev` in `/frontend` (the proxy falls back to `localhost:8000`). The two paths are interchangeable; demos use Docker.
 
 ### 26.6 Makefile targets
-`up` = `docker compose up --build`; `down` = `docker compose down`; `reset` = `down -v` then `up` (re-seeds); `seed` = POST default preset; `demo-a|demo-b|demo` = set `DEMO_MODE` and `up`; `test` = pytest (backend) + vitest (frontend).
+`base` = `docker compose build base` (builds/refreshes the pip-install image, cached unless `requirements.txt` changes); `up`/`reset`/`demo-a`/`demo-b`/`demo` all depend on `base` so it's always current before the app images build `FROM` it. `up` = `docker compose up --build`; `down` = `docker compose down`; `reset` = `down -v` then `up` (re-seeds); `seed` = POST default preset; `demo-a|demo-b|demo` = set `DEMO_MODE` and `up`; `test` = pytest (backend) + vitest (frontend).
 
 ---
 

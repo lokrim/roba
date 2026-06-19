@@ -1,4 +1,8 @@
 services:
+  base:
+    build: { context: ., dockerfile: Dockerfile.base }
+    image: roba-base:latest
+    profiles: ["build-only"]   # never started; just produces the pip-install layer for backend to build FROM
   backend:
     build: { context: ., dockerfile: Dockerfile.backend }
     ports: ["8000:8000"]
