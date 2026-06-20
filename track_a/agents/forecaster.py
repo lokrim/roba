@@ -26,6 +26,9 @@ from core.models import (
     BatchDefinition,
     DemandForecasterMemory,
     Forecast,
+    ForecastAdjustment,
+    ForecastOverride,
+    ForecastTrace,
     MenuItem,
     OrderLine,
     Signal,
@@ -36,7 +39,7 @@ from core.models import (
     Station,
     WeatherLog,
 )
-from core.pos_simulator import active_injections
+from core.pos_simulator import WINDOW_SECONDS, active_injections
 from core.signals import SignalType
 
 
@@ -144,6 +147,7 @@ class DemandForecaster(BaseAgent):
         rows: List[Forecast] = []
         row_summaries: List[Dict[str, Any]] = []
         after_commit: List[Tuple[str, Any]] = []
+        run_id = forecast_run_id(now, daypart, window, trigger_reason)
 
         session = self.db_session_factory()
         try:
@@ -172,11 +176,22 @@ class DemandForecaster(BaseAgent):
                 if llm_adjustment:
                     hard_override = self._apply_llm_adjustment(
                         item.id,
+                        daypart,
+                        window,
                         multipliers,
                         explanations,
                         hard_override,
                         llm_adjustment,
                         after_commit,
+                        persist_override=bool(optimize and trigger_reason == "manual"),
+                    )
+                active_override = self._active_override(session, item.id, daypart, window, now)
+                if active_override is not None:
+                    hard_override = self._apply_forecast_override(
+                        active_override,
+                        multipliers,
+                        explanations,
+                        hard_override,
                     )
 
                 raw_qty = baseline
@@ -184,11 +199,28 @@ class DemandForecaster(BaseAgent):
                     raw_qty *= float(value)
                 qty = int(hard_override) if hard_override is not None else nearest_int(raw_qty)
                 qty = max(0, qty)
+                latent_qty = self._latent_demand_qty(baseline, multipliers, hard_override)
 
                 confidence = confidence_from(multipliers)
                 if llm_adjustment:
                     confidence = min(confidence, float(llm_adjustment.get("confidence") or 0.85))
 
+                trace = self._forecast_trace(
+                    run_id=run_id,
+                    item=item,
+                    daypart=daypart,
+                    window=window,
+                    baseline=baseline,
+                    multipliers=multipliers,
+                    explanations=explanations,
+                    raw_qty=raw_qty,
+                    latent_qty=latent_qty,
+                    forecast_qty=qty,
+                    confidence=confidence,
+                    hard_override=hard_override,
+                    optimized=bool(optimize),
+                    trigger_reason=trigger_reason,
+                )
                 forecast = Forecast(
                     menu_item_id=item.id,
                     window=window,
@@ -203,6 +235,7 @@ class DemandForecaster(BaseAgent):
                 session.add(forecast)
                 session.flush()
                 session.refresh(forecast)
+                self._write_trace_ledger(session, forecast, run_id, item, daypart, window, trace, now)
                 rows.append(forecast)
                 row_summaries.append({"id": forecast.id, "qty": qty})
 
@@ -214,8 +247,11 @@ class DemandForecaster(BaseAgent):
                     "baseline": round(baseline, 2),
                     "multipliers": multipliers,
                     "confidence": round(confidence, 3),
+                    "run_id": run_id,
+                    "trace": trace,
                 }
                 log_detail = {
+                    "run_id": run_id,
                     "forecast_id": forecast.id,
                     "menu_item_id": item.id,
                     "item_name": item.name,
@@ -227,6 +263,7 @@ class DemandForecaster(BaseAgent):
                     "hard_override": hard_override,
                     "optimized": bool(optimize),
                     "trigger": trigger_reason,
+                    "trace": trace,
                 }
                 after_commit.extend(
                     [
@@ -301,8 +338,10 @@ class DemandForecaster(BaseAgent):
                     session.query(Forecast)
                     .filter(Forecast.menu_item_id == item.id)
                     .order_by(Forecast.generated_at.desc(), Forecast.id.desc())
-                    .first()
+                    .limit(24)
+                    .all()
                 )
+                forecast = self._current_window_forecast(forecast, daypart, window, now)
                 f_qty = int(round(float(forecast.forecast_qty if forecast is not None else 0.0)))
                 reasons: List[str] = []
                 available = not self._is_blocked_for_batch(item.id, definition.station_id, live, reasons)
@@ -319,6 +358,8 @@ class DemandForecaster(BaseAgent):
 
                 if f_qty < int(definition.batch_size_min or 0):
                     reasons.append(f"forecast {f_qty:d} below min {int(definition.batch_size_min or 0):d}")
+                if forecast is None:
+                    reasons.append("no current-window forecast")
                 if not available and not reasons:
                     reasons.append("operational constraint")
                 if not reasons and decision == "cook":
@@ -355,6 +396,7 @@ class DemandForecaster(BaseAgent):
                     "batch_id": row.id,
                     "menu_item_id": item.id,
                     "batch_definition_id": definition.id,
+                    "forecast_id": forecast.id if forecast is not None else None,
                     "forecast_qty": f_qty,
                     "decision": decision,
                     "planned_qty": int(planned),
@@ -566,7 +608,10 @@ class DemandForecaster(BaseAgent):
         velocity = float(getattr(settings, "velocity", None) or 1.0)
         daypart_weight = self._settings_daypart_weight(settings, daypart)
         _current_daypart, window = current_window(now)
-        window_fraction = _window_fraction(daypart, window)
+        window_duration = max(
+            0.0,
+            float(window.get("end", 0.0)) - float(window.get("start", 0.0)),
+        )
 
         weights = self._settings_item_weights(session, settings, now)
         total_weight = sum(weights.values())
@@ -578,7 +623,13 @@ class DemandForecaster(BaseAgent):
             if mult is not None:
                 velocity *= float(mult)
 
-        return max(0.0, base * velocity * share * daypart_weight * window_fraction)
+        expected_orders = base * velocity * daypart_weight * (window_duration / WINDOW_SECONDS)
+        expected_lines_per_order = sum(
+            float(qty) * float(weight)
+            for qty, weight in config.LINES_PER_ORDER.items()
+        )
+        cancel_factor = 1.0 - float(config.CANCEL_RATE)
+        return max(0.0, expected_orders * expected_lines_per_order * cancel_factor * share)
 
     @staticmethod
     def _settings_daypart_weight(settings: Optional[SimSettings], daypart: str) -> float:
@@ -1002,6 +1053,105 @@ class DemandForecaster(BaseAgent):
                 blocked = True
         return blocked
 
+    def _active_override(
+        self,
+        session: Any,
+        item_id: int,
+        daypart: str,
+        window: Dict[str, float],
+        now: float,
+    ) -> Optional[ForecastOverride]:
+        rows = (
+            session.query(ForecastOverride)
+            .filter(
+                ForecastOverride.menu_item_id == item_id,
+                ForecastOverride.daypart == daypart,
+                ForecastOverride.status == "active",
+            )
+            .order_by(ForecastOverride.created_at.desc(), ForecastOverride.id.desc())
+            .all()
+        )
+        for row in rows:
+            if float(row.valid_until or 0.0) <= now:
+                row.status = "expired"
+                continue
+            if forecast_window_matches(row.window or {}, window):
+                return row
+        return None
+
+    @staticmethod
+    def _apply_forecast_override(
+        override: ForecastOverride,
+        multipliers: Dict[str, float],
+        explanations: Dict[str, str],
+        hard_override: Optional[int],
+    ) -> Optional[int]:
+        reason = str(override.reason or "Forecast override is active.")
+        operation = str(override.operation or "")
+        value = override.value or {}
+        if operation == "hard_zero_production":
+            multipliers["authority_override"] = 0.0
+            explanations["authority_override"] = reason
+            return 0
+        if operation == "set_target":
+            try:
+                qty = nearest_int(float(value.get("qty")))
+            except (TypeError, ValueError, AttributeError):
+                return hard_override
+            multipliers["authority_override"] = 1.0
+            explanations["authority_override"] = reason
+            return max(0, qty)
+        return hard_override
+
+    def _persist_override(
+        self,
+        item_id: int,
+        daypart: str,
+        window: Dict[str, float],
+        operation: str,
+        value: Dict[str, Any],
+        reason: str,
+        source: str,
+        authority: str,
+        evidence: Dict[str, Any],
+    ) -> ForecastOverride:
+        now = float(self.bus.sim_time)
+        session = self.db_session_factory()
+        try:
+            active = (
+                session.query(ForecastOverride)
+                .filter(
+                    ForecastOverride.menu_item_id == item_id,
+                    ForecastOverride.daypart == daypart,
+                    ForecastOverride.status == "active",
+                )
+                .all()
+            )
+            for row in active:
+                if forecast_window_matches(row.window or {}, window):
+                    row.status = "superseded"
+            row = ForecastOverride(
+                menu_item_id=item_id,
+                daypart=daypart,
+                window=window,
+                operation=operation,
+                value=value,
+                reason=reason,
+                source=source,
+                authority=authority,
+                status="active",
+                created_at=now,
+                valid_until=float(window.get("end", now)),
+                evidence=evidence,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            session.expunge(row)
+            return row
+        finally:
+            session.close()
+
     # ------------------------------------------------------------------
     # LLM optimization
     # ------------------------------------------------------------------
@@ -1038,10 +1188,16 @@ class DemandForecaster(BaseAgent):
                 "role": "system",
                 "content": (
                     "You optimize restaurant demand forecasts. Return compact JSON only. "
-                    "You may adjust existing multipliers between 0.0 and 2.0, set "
+                    "Treat the provided baseline and deterministic multipliers as already applied math. "
+                    "Do not double-count weather, events, staffing, reviews, competitor signals, "
+                    "recent velocity, or simulation settings unless the live context shows an "
+                    "explicit interaction not represented by those multipliers. You may adjust "
+                    "existing multipliers between 0.0 and 2.0, set "
                     "hard_override_qty only to 0 when an item cannot operationally be made, "
                     "or set target_forecast_qty when a direct integer forecast is safer than "
-                    "a multiplier. Provide concise user-facing reasons. Do not reveal hidden reasoning."
+                    "a multiplier. Keep each adjustment small and evidence-bound; leave an item "
+                    "unchanged when the deterministic stack is sufficient. Provide concise "
+                    "user-facing reasons. Do not reveal hidden reasoning."
                 ),
             },
             {"role": "user", "content": str(context)},
@@ -1061,6 +1217,7 @@ class DemandForecaster(BaseAgent):
             json_schema=schema,
             max_tokens=900,
             use_site="forecaster_optimization",
+            temperature=0.2,
         )
         if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
             return {}
@@ -1113,10 +1270,28 @@ class DemandForecaster(BaseAgent):
             json_schema=schema,
             max_tokens=600,
             use_site="forecaster_optimization",
+            temperature=0.2,
         )
         if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
             return {}
         return result
+
+    @staticmethod
+    def _current_window_forecast(
+        forecasts: Iterable[Forecast],
+        daypart: str,
+        window: Dict[str, float],
+        now: float,
+    ) -> Optional[Forecast]:
+        for forecast in forecasts:
+            if float(forecast.generated_at or 0.0) > now:
+                continue
+            if forecast.daypart != daypart:
+                continue
+            if not forecast_window_matches(forecast.window or {}, window):
+                continue
+            return forecast
+        return None
 
     @staticmethod
     def _adjustment_for(plan: Dict[str, Any], item_id: int) -> Dict[str, Any]:
@@ -1133,11 +1308,14 @@ class DemandForecaster(BaseAgent):
     def _apply_llm_adjustment(
         self,
         item_id: int,
+        daypart: str,
+        window: Dict[str, float],
         multipliers: Dict[str, float],
         explanations: Dict[str, str],
         hard_override: Optional[int],
         adjustment: Dict[str, Any],
         after_commit: List[Tuple[str, Any]],
+        persist_override: bool = False,
     ) -> Optional[int]:
         reason = str(adjustment.get("reason") or "LLM optimizer adjusted forecast.")
         raw_multipliers = adjustment.get("multipliers") or {}
@@ -1187,12 +1365,46 @@ class DemandForecaster(BaseAgent):
                 hard_override = 0
                 multipliers["llm_override"] = 0.0
                 explanations["llm_override"] = reason
+                if persist_override:
+                    after_commit.append(
+                        (
+                            "forecast_override",
+                            (
+                                item_id,
+                                daypart,
+                                window,
+                                "hard_zero_production",
+                                {"qty": 0},
+                                reason,
+                                "llm",
+                                "approved_llm",
+                                {"adjustment": adjustment, "trigger": "manual_optimization"},
+                            ),
+                        )
+                    )
         else:
             target_qty = self._target_qty_from_adjustment(adjustment)
             if target_qty is not None:
                 hard_override = max(0, target_qty)
                 multipliers["llm_target"] = 1.0
                 explanations["llm_target"] = reason
+                if persist_override:
+                    after_commit.append(
+                        (
+                            "forecast_override",
+                            (
+                                item_id,
+                                daypart,
+                                window,
+                                "set_target",
+                                {"qty": max(0, target_qty)},
+                                reason,
+                                "llm",
+                                "approved_llm",
+                                {"adjustment": adjustment, "trigger": "manual_optimization"},
+                            ),
+                        )
+                    )
         after_commit.append(
             (
                 "remember",
@@ -1454,6 +1666,211 @@ class DemandForecaster(BaseAgent):
     def _weather_to_dict(row: WeatherLog) -> Dict[str, Any]:
         return {col.key: getattr(row, col.key) for col in row.__table__.columns}
 
+    @staticmethod
+    def _write_trace_ledger(
+        session: Any,
+        forecast: Forecast,
+        run_id: str,
+        item: MenuItem,
+        daypart: str,
+        window: Dict[str, float],
+        trace: Dict[str, Any],
+        now: float,
+    ) -> None:
+        session.add(
+            ForecastTrace(
+                forecast_id=forecast.id,
+                run_id=run_id,
+                menu_item_id=item.id,
+                daypart=daypart,
+                window=window,
+                trace=trace,
+                summary=str(trace.get("summary") or ""),
+                created_at=now,
+            )
+        )
+        for entry in trace.get("adjustments") or []:
+            if not isinstance(entry, dict):
+                continue
+            session.add(
+                ForecastAdjustment(
+                    forecast_id=forecast.id,
+                    run_id=run_id,
+                    menu_item_id=item.id,
+                    stage=str(entry.get("stage") or ""),
+                    source=str(entry.get("source") or ""),
+                    modifier_key=str(entry.get("key") or ""),
+                    operation=str(entry.get("operation") or ""),
+                    value={"value": entry.get("value")},
+                    reason=str(entry.get("reason") or ""),
+                    evidence={"trace_version": trace.get("version", 1)},
+                    created_at=now,
+                )
+            )
+
+    def _forecast_trace(
+        self,
+        *,
+        run_id: str,
+        item: MenuItem,
+        daypart: str,
+        window: Dict[str, float],
+        baseline: float,
+        multipliers: Dict[str, float],
+        explanations: Dict[str, str],
+        raw_qty: float,
+        latent_qty: float,
+        forecast_qty: int,
+        confidence: float,
+        hard_override: Optional[int],
+        optimized: bool,
+        trigger_reason: str,
+    ) -> Dict[str, Any]:
+        adjustments = [
+            {
+                "source": self._modifier_source(key),
+                "stage": self._modifier_stage(key),
+                "key": key,
+                "operation": self._modifier_operation(key, value),
+                "value": round(float(value), 3),
+                "reason": explanations.get(key, key),
+            }
+            for key, value in multipliers.items()
+        ]
+        constraints = [
+            entry for entry in adjustments
+            if entry["operation"].startswith("hard_zero") or entry["stage"] == "feasibility"
+        ]
+        zero_reason = self._zero_reason(hard_override, multipliers)
+        return {
+            "run_id": run_id,
+            "version": 1,
+            "scope": {
+                "menu_item_id": int(item.id),
+                "item_name": item.name,
+                "daypart": daypart,
+                "window": window,
+            },
+            "baseline": {"qty": round(float(baseline), 2), "source": "historical_or_settings"},
+            "adjustments": adjustments,
+            "constraints": constraints,
+            "final": {
+                "constrained_raw_qty": round(float(raw_qty), 3),
+                "latent_demand_qty": round(float(latent_qty), 3),
+                "servable_demand_qty": int(forecast_qty),
+                "production_recommendation_qty": int(forecast_qty),
+                "confidence": round(float(confidence), 3),
+                "hard_override": hard_override,
+                "zero_reason": zero_reason,
+            },
+            "summary": self._top_trace_reason(adjustments, zero_reason),
+            "optimized": bool(optimized),
+            "trigger": trigger_reason,
+        }
+
+    @staticmethod
+    def _modifier_source(key: str) -> str:
+        if key == "authority_override":
+            return "authority_resolver"
+        if key.startswith("llm"):
+            return "llm"
+        if key in {"availability", "staff_coverage"}:
+            return "operational_constraint"
+        return "deterministic"
+
+    @staticmethod
+    def _modifier_stage(key: str) -> str:
+        if key == "authority_override":
+            return "authority"
+        if key in {"availability", "staff_coverage"}:
+            return "feasibility"
+        if key.startswith("llm"):
+            return "llm_proposal"
+        return "demand_modifier"
+
+    @staticmethod
+    def _modifier_operation(key: str, value: float) -> str:
+        if float(value) <= 0 and key in {"availability", "staff_coverage", "llm_override", "authority_override"}:
+            return "hard_zero_production"
+        if key == "llm_target":
+            return "set_target"
+        return "multiply"
+
+    @staticmethod
+    def _zero_reason(hard_override: Optional[int], multipliers: Dict[str, float]) -> Optional[str]:
+        if hard_override != 0:
+            return None
+        if float(multipliers.get("availability", 1.0)) <= 0:
+            return "availability_blocked"
+        if float(multipliers.get("staff_coverage", 1.0)) <= 0:
+            return "staff_unavailable"
+        if float(multipliers.get("llm_override", 1.0)) <= 0:
+            return "llm_override"
+        if float(multipliers.get("authority_override", 1.0)) <= 0:
+            return "forecast_override"
+        return "hard_override"
+
+    @staticmethod
+    def _top_trace_reason(adjustments: List[Dict[str, Any]], zero_reason: Optional[str]) -> str:
+        authority = next(
+            (
+                entry for entry in adjustments
+                if entry.get("key") == "authority_override"
+            ),
+            None,
+        )
+        if authority:
+            return str(authority.get("reason") or "Forecast override is active.")
+        if zero_reason:
+            constraint = next(
+                (
+                    entry for entry in adjustments
+                    if entry.get("operation") == "hard_zero_production"
+                ),
+                None,
+            )
+            if constraint:
+                return str(constraint.get("reason") or zero_reason)
+            return zero_reason
+        ranked = sorted(
+            adjustments,
+            key=lambda entry: abs(float(entry.get("value") or 1.0) - 1.0),
+            reverse=True,
+        )
+        for entry in ranked:
+            if abs(float(entry.get("value") or 1.0) - 1.0) >= 0.03:
+                return str(entry.get("reason") or entry.get("key") or "Forecast adjusted.")
+        return "Forecast generated with no major active demand driver."
+
+    def _latent_demand_qty(
+        self,
+        baseline: float,
+        multipliers: Dict[str, float],
+        hard_override: Optional[int],
+    ) -> float:
+        if hard_override is not None and self._is_target_override(multipliers):
+            return float(max(0, hard_override))
+        qty = float(baseline)
+        for key, value in multipliers.items():
+            if not self._counts_toward_latent_demand(key, float(value)):
+                continue
+            qty *= float(value)
+        return max(0.0, qty)
+
+    @staticmethod
+    def _is_target_override(multipliers: Dict[str, float]) -> bool:
+        return "llm_target" in multipliers or (
+            "authority_override" in multipliers and float(multipliers.get("authority_override", 0.0)) > 0
+        )
+
+    @staticmethod
+    def _counts_toward_latent_demand(key: str, value: float) -> bool:
+        if key in {"availability", "staff_coverage"}:
+            return False
+        if key in {"llm_override", "authority_override"} and value <= 0:
+            return False
+        return True
+
 
 def current_daypart(now: float) -> str:
     tod = now % SECONDS_PER_DAY
@@ -1479,6 +1896,21 @@ def _window_fraction(daypart: str, window: Dict[str, float]) -> float:
     daypart_len = max(float(end - start), 1.0)
     window_len = max(float(window.get("end", 0.0)) - float(window.get("start", 0.0)), 0.0)
     return min(1.0, max(0.0, window_len / daypart_len))
+
+
+def forecast_run_id(now: float, daypart: str, window: Dict[str, float], trigger_reason: str) -> str:
+    clean_trigger = re.sub(r"[^a-zA-Z0-9_:-]+", "_", trigger_reason or "manual")[:40]
+    return f"fr:{int(now)}:{daypart}:{int(float(window['start']))}:{clean_trigger}"
+
+
+def forecast_window_matches(candidate: Dict[str, Any], window: Dict[str, float]) -> bool:
+    try:
+        return (
+            math.isclose(float(candidate.get("start")), float(window.get("start")), abs_tol=0.001)
+            and math.isclose(float(candidate.get("end")), float(window.get("end")), abs_tol=0.001)
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def nearest_int(value: float) -> int:

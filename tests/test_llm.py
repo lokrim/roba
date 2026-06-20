@@ -108,6 +108,27 @@ def test_gemini_json_config_carries_schema(monkeypatch):
     assert schema == SCHEMA
 
 
+def test_gemini_config_carries_generation_controls(monkeypatch):
+    llm, calls = _gemini_llm(monkeypatch, ["steady"])
+
+    result = llm.complete(
+        [{"role": "user", "content": "forecast"}],
+        use_site="forecaster_optimization",
+        temperature=0.2,
+        top_p=0.8,
+    )
+
+    cfg = calls["configs"][0]
+    temperature = getattr(cfg, "temperature", None)
+    top_p = getattr(cfg, "top_p", None)
+    if isinstance(cfg, dict):
+        temperature = cfg.get("temperature")
+        top_p = cfg.get("top_p")
+    assert result == "steady"
+    assert temperature == 0.2
+    assert top_p == 0.8
+
+
 def test_generation_use_site_never_cached(monkeypatch):
     llm, calls = _gemini_llm(monkeypatch, ["fresh"])
 

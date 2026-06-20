@@ -101,6 +101,9 @@ class BaseAgent(ABC):
             elif kind == "remember":
                 remember = getattr(self, "_remember")
                 remember(*payload)
+            elif kind == "forecast_override":
+                persist_override = getattr(self, "_persist_override")
+                persist_override(*payload)
 
     # -- clock --------------------------------------------------------------
 

@@ -865,6 +865,7 @@ def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
     forecaster = ctx.track_a.get("forecaster")
     return {
         "demo_mode": os.getenv("DEMO_MODE", "combined"),
+        "sim_state": ctx.clock.current_state(),
         "menu_items": _read_rows(db_session, models.MenuItem, models.MenuItem.id.asc()),
         "forecasts": _read_rows(db_session, models.Forecast, models.Forecast.generated_at.desc(), 100),
         "batches": _read_rows(db_session, models.Batch, models.Batch.decided_at.desc(), 50),
@@ -873,6 +874,24 @@ def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
             models.DemandForecasterMemory,
             models.DemandForecasterMemory.last_seen_at.desc(),
             40,
+        ),
+        "forecast_overrides": _read_rows(
+            db_session,
+            models.ForecastOverride,
+            models.ForecastOverride.created_at.desc(),
+            50,
+        ),
+        "forecast_traces": _read_rows(
+            db_session,
+            models.ForecastTrace,
+            models.ForecastTrace.created_at.desc(),
+            100,
+        ),
+        "forecast_adjustments": _read_rows(
+            db_session,
+            models.ForecastAdjustment,
+            models.ForecastAdjustment.created_at.desc(),
+            300,
         ),
         "forecast_reasoning": _read_rows(
             db_session,

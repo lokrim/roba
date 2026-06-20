@@ -411,6 +411,67 @@ class Forecast(Base):
                 f"daypart={self.daypart!r} forecast_qty={self.forecast_qty}>")
 
 
+class ForecastOverride(Base):
+    __tablename__ = "forecast_overrides"
+
+    id = _pk()
+    menu_item_id = mapped_column(ForeignKey("menu_items.id"))
+    daypart = mapped_column(String)
+    window = mapped_column(JSON)
+    operation = mapped_column(String)             # set_target | hard_zero_production
+    value = mapped_column(JSON)
+    reason = mapped_column(Text)
+    source = mapped_column(String)                # human | llm
+    authority = mapped_column(String)             # human_locked | approved_llm
+    status = mapped_column(String)                # active | superseded | expired
+    created_at = mapped_column(Float)
+    valid_until = mapped_column(Float)
+    evidence = mapped_column(JSON)
+
+    def __repr__(self):
+        return (f"<ForecastOverride id={self.id} menu_item_id={self.menu_item_id} "
+                f"operation={self.operation!r} status={self.status!r}>")
+
+
+class ForecastTrace(Base):
+    __tablename__ = "forecast_traces"
+
+    id = _pk()
+    forecast_id = mapped_column(ForeignKey("forecasts.id"))
+    run_id = mapped_column(String)
+    menu_item_id = mapped_column(ForeignKey("menu_items.id"))
+    daypart = mapped_column(String)
+    window = mapped_column(JSON)
+    trace = mapped_column(JSON)
+    summary = mapped_column(Text)
+    created_at = mapped_column(Float)
+
+    def __repr__(self):
+        return (f"<ForecastTrace id={self.id} forecast_id={self.forecast_id} "
+                f"run_id={self.run_id!r}>")
+
+
+class ForecastAdjustment(Base):
+    __tablename__ = "forecast_adjustments"
+
+    id = _pk()
+    forecast_id = mapped_column(ForeignKey("forecasts.id"))
+    run_id = mapped_column(String)
+    menu_item_id = mapped_column(ForeignKey("menu_items.id"))
+    stage = mapped_column(String)
+    source = mapped_column(String)
+    modifier_key = mapped_column(String)
+    operation = mapped_column(String)
+    value = mapped_column(JSON)
+    reason = mapped_column(Text)
+    evidence = mapped_column(JSON)
+    created_at = mapped_column(Float)
+
+    def __repr__(self):
+        return (f"<ForecastAdjustment id={self.id} forecast_id={self.forecast_id} "
+                f"modifier_key={self.modifier_key!r}>")
+
+
 class DemandForecasterMemory(Base):
     __tablename__ = "demand_forecaster_memory"
 
@@ -765,8 +826,9 @@ TRANSACTIONAL_MODELS = [
 ]
 
 INTELLIGENCE_MODELS = [
-    Forecast, DemandForecasterMemory, Signal, CompetitorIntel,
-    Review, ReviewInsight, SupplierPriceHistory, Negotiation,
+    Forecast, ForecastOverride, ForecastTrace, ForecastAdjustment,
+    DemandForecasterMemory, Signal, CompetitorIntel, Review, ReviewInsight,
+    SupplierPriceHistory, Negotiation,
     ApprovalRequest, Promotion, UserFact, WeatherLog, Call,
 ]
 

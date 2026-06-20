@@ -18,6 +18,21 @@ export interface Forecast {
   confidence: number;
   generated_at: number;
   trigger_reason: string;
+  run_id?: string | null;
+  trace?: ForecastTrace | null;
+}
+
+export interface ForecastTrace {
+  run_id?: string;
+  version?: number;
+  scope?: Record<string, unknown>;
+  baseline?: Record<string, unknown>;
+  adjustments?: Array<Record<string, unknown>>;
+  constraints?: Array<Record<string, unknown>>;
+  final?: Record<string, unknown>;
+  summary?: string;
+  optimized?: boolean;
+  trigger?: string;
 }
 
 export interface DemandMemory {
@@ -35,6 +50,49 @@ export interface DemandMemory {
   last_seen_at: number;
   valid_until: number;
   source: string;
+}
+
+export interface ForecastOverride {
+  id: number;
+  menu_item_id: number;
+  daypart: string;
+  window: { start: number; end: number };
+  operation: string;
+  value: Record<string, unknown>;
+  reason: string;
+  source: string;
+  authority: string;
+  status: string;
+  created_at: number;
+  valid_until: number;
+  evidence: Record<string, unknown>;
+}
+
+export interface ForecastTraceRow {
+  id: number;
+  forecast_id: number;
+  run_id: string;
+  menu_item_id: number;
+  daypart: string;
+  window: { start: number; end: number };
+  trace: ForecastTrace;
+  summary: string;
+  created_at: number;
+}
+
+export interface ForecastAdjustment {
+  id: number;
+  forecast_id: number;
+  run_id: string;
+  menu_item_id: number;
+  stage: string;
+  source: string;
+  modifier_key: string;
+  operation: string;
+  value: Record<string, unknown>;
+  reason: string;
+  evidence: Record<string, unknown>;
+  created_at: number;
 }
 
 export interface Batch {
@@ -153,6 +211,14 @@ export interface EventLog {
 
 export interface TrackASnapshot {
   demo_mode: string;
+  sim_state?: {
+    sim_time: number;
+    day_number: number;
+    day_of_week: number;
+    speed: number;
+    status: string;
+    call_mode: string;
+  };
   forecast_agent?: {
     llm_auto_mode: boolean;
   };
@@ -160,6 +226,9 @@ export interface TrackASnapshot {
   forecasts: Forecast[];
   batches: Batch[];
   demand_memory: DemandMemory[];
+  forecast_overrides: ForecastOverride[];
+  forecast_traces: ForecastTraceRow[];
+  forecast_adjustments: ForecastAdjustment[];
   forecast_reasoning: EventLog[];
   competitors: Competitor[];
   competitor_offers: CompetitorOffer[];

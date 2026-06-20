@@ -207,12 +207,13 @@ class VoiceProcessor:
         # add_event: "there's a parade ... Monday"
         if any(w in low for w in ("parade", "festival", "event", "concert", "match", "holiday")):
             window = self._window_from_text(low)
+            attendance = self._attendance_from_text(low)
             return {
                 "intent": "add_event",
                 "entity_type": "event",
                 "entity_ref": self._event_label(low),
-                "attribute": "demand_multiplier",
-                "value": EVENT_MULT,
+                "attribute": "expected_attendance" if attendance is not None else "demand_multiplier",
+                "value": attendance if attendance is not None else EVENT_MULT,
                 "effective_window": window,
                 "confidence": 0.6,
             }
@@ -298,6 +299,20 @@ class VoiceProcessor:
                 return w
         return "event"
 
+    @staticmethod
+    def _attendance_from_text(low: str) -> Optional[float]:
+        match = re.search(
+            _NUMBER_RE + r"\s*(?:people|person|guests?|attendees?|pax|crowd)",
+            low,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        try:
+            return float(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
     def _window_from_text(self, low: str) -> Optional[Dict[str, float]]:
         """Map common phrases ("next week", "this Monday", "today") to a
         sim-second window using the current sim day geometry (§6.1)."""
@@ -310,6 +325,18 @@ class VoiceProcessor:
 
         def day_end(d: int) -> float:
             return d * SECONDS_PER_DAY + DAY_CLOSE_OFFSET
+
+        def with_time_range(window: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+            time_range = self._time_range_from_text(low)
+            if time_range is None:
+                return window
+            base_day = int(((window or {}).get("start", day_start(day_number))) // SECONDS_PER_DAY)
+            start_s, end_s = time_range
+            start = base_day * SECONDS_PER_DAY + start_s
+            end = base_day * SECONDS_PER_DAY + end_s
+            if end <= start:
+                end += SECONDS_PER_DAY
+            return {"start": float(start), "end": float(end)}
 
         if "next week" in low:
             days_to_mon = (7 - dow) if dow != 0 else 7
@@ -331,14 +358,61 @@ class VoiceProcessor:
                 if "next" in low or delta == 0:
                     delta = delta or 7
                 target = day_number + delta
-                return {"start": day_start(target), "end": day_end(target)}
+                return with_time_range({"start": day_start(target), "end": day_end(target)})
 
         if "tomorrow" in low:
-            return {"start": day_start(day_number + 1), "end": day_end(day_number + 1)}
+            return with_time_range({"start": day_start(day_number + 1), "end": day_end(day_number + 1)})
         if "today" in low:
-            return {"start": day_start(day_number), "end": day_end(day_number)}
+            return with_time_range({"start": day_start(day_number), "end": day_end(day_number)})
+
+        time_window = with_time_range(None)
+        if time_window is not None:
+            return time_window
 
         return None
+
+    @staticmethod
+    def _time_range_from_text(low: str) -> Optional[tuple[float, float]]:
+        time_pattern = r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+        range_match = re.search(
+            r"(?:from|between)\s+" + time_pattern + r"\s*(?:to|and|-)\s*" + time_pattern,
+            low,
+            re.IGNORECASE,
+        )
+        if range_match:
+            start = VoiceProcessor._parse_time_match(range_match, 1)
+            end = VoiceProcessor._parse_time_match(range_match, 4)
+            if start is not None and end is not None:
+                return start, end
+
+        start_match = re.search(
+            r"(?:from|at|around)\s+" + time_pattern,
+            low,
+            re.IGNORECASE,
+        )
+        if start_match:
+            start = VoiceProcessor._parse_time_match(start_match, 1)
+            if start is not None:
+                return start, float(DAY_CLOSE_OFFSET)
+        return None
+
+    @staticmethod
+    def _parse_time_match(match: re.Match[str], offset: int) -> Optional[float]:
+        try:
+            hour = int(match.group(offset))
+            minute = int(match.group(offset + 1) or 0)
+        except (TypeError, ValueError):
+            return None
+        suffix = (match.group(offset + 2) or "").lower()
+        if suffix == "pm" and hour < 12:
+            hour += 12
+        elif suffix == "am" and hour == 12:
+            hour = 0
+        if not suffix and hour < 8:
+            hour += 12
+        if hour > 23 or minute > 59:
+            return None
+        return float(hour * 3600 + minute * 60)
 
     def _parse_receipt(self, text: str, low: str) -> Optional[Dict[str, Any]]:
         m = re.search(

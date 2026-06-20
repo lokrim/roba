@@ -23,6 +23,7 @@ class CompetitorAgent(BaseAgent):
         super().__init__(bus, db_session_factory, "track_a.competitor")
         self.calls = calls
         self.ws_broadcast = ws_broadcast
+        self._last_offers: Dict[int, str] = {}
         self.subscribe(["sensing", "forecasting"])
 
     def register(self, orchestrator: Any) -> None:
@@ -47,13 +48,18 @@ class CompetitorAgent(BaseAgent):
                 offers = (
                     session.query(CompetitorOffer)
                     .filter(CompetitorOffer.competitor_id == competitor.id)
+                    .order_by(CompetitorOffer.id.asc())
                     .all()
                 )
                 summary = ", ".join(o.dish_or_combo for o in offers[:3]) or "No tracked offers"
+                serialized = self._serialize_offers(offers)
+                previous = self._last_offers.get(int(competitor.id))
+                offers_changed = previous is not None and serialized != previous
+                self._last_offers[int(competitor.id)] = serialized
                 payload = {
                     "competitor_id": competitor.id,
                     "is_open": bool(competitor.is_open),
-                    "offers_changed": False,
+                    "offers_changed": offers_changed,
                     "summary": summary,
                 }
                 after_commit.append(
@@ -178,6 +184,23 @@ class CompetitorAgent(BaseAgent):
         finally:
             session.close()
         return None
+
+    @staticmethod
+    def _serialize_offers(offers: List[CompetitorOffer]) -> str:
+        parts = []
+        for offer in offers:
+            parts.append(
+                "|".join(
+                    [
+                        str(offer.id),
+                        str(offer.dish_or_combo or ""),
+                        str(float(offer.price or 0.0)),
+                        str(offer.description or ""),
+                        str(float(offer.updated_at or 0.0)),
+                    ]
+                )
+            )
+        return "\n".join(parts)
 
     @staticmethod
     def _competitor_to_dict(row: Competitor) -> Dict[str, Any]:

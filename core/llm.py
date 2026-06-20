@@ -244,6 +244,8 @@ class LLMProvider:
         json_schema: Optional[dict] = None,
         max_tokens: int = 800,
         use_site: str = "",
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Union[str, dict]:
         """Run the fallback chain and return a parsed dict (when ``json_schema``
         is given) or a raw string. Never raises on provider failure — the chain
@@ -254,6 +256,8 @@ class LLMProvider:
                     "model": GEMINI_MODEL,
                     "messages": messages,
                     "json_schema": json_schema,
+                    "temperature": temperature,
+                    "top_p": top_p,
                 },
                 sort_keys=True,
                 default=str,
@@ -277,7 +281,7 @@ class LLMProvider:
 
             try:
                 raw = self._attempt_provider(
-                    provider, messages, json_schema, max_tokens, want_json
+                    provider, messages, json_schema, max_tokens, want_json, temperature, top_p
                 )
             except _SkipProvider:
                 continue
@@ -296,6 +300,8 @@ class LLMProvider:
                         json_schema,
                         max_tokens,
                         want_json,
+                        temperature,
+                        top_p,
                     )
                     parsed = self._try_parse(raw2, json_schema)
                 except _SkipProvider:
@@ -321,6 +327,8 @@ class LLMProvider:
         json_schema: Optional[dict],
         max_tokens: int,
         want_json: bool,
+        temperature: Optional[float],
+        top_p: Optional[float],
     ) -> str:
         """Call one provider with exponential backoff over retryable errors.
 
@@ -331,7 +339,7 @@ class LLMProvider:
         for attempt in range(self.retries):
             try:
                 return self._call_provider(
-                    provider, messages, json_schema, max_tokens, want_json
+                    provider, messages, json_schema, max_tokens, want_json, temperature, top_p
                 )
             except _RetryableError as exc:
                 last_error = exc
@@ -353,9 +361,11 @@ class LLMProvider:
         json_schema: Optional[dict],
         max_tokens: int,
         want_json: bool,
+        temperature: Optional[float],
+        top_p: Optional[float],
     ) -> str:
         if provider == "gemini":
-            return self._gemini(messages, json_schema, max_tokens, want_json)
+            return self._gemini(messages, json_schema, max_tokens, want_json, temperature, top_p)
         raise _SkipProvider()
 
     # -- concrete providers -------------------------------------------------
@@ -366,6 +376,8 @@ class LLMProvider:
         json_schema: Optional[dict],
         max_tokens: int,
         want_json: bool,
+        temperature: Optional[float],
+        top_p: Optional[float],
     ) -> str:
         """Gemini via the official Google GenAI SDK."""
         system_parts: List[str] = []
@@ -388,6 +400,8 @@ class LLMProvider:
             json_schema=json_schema,
             max_tokens=max_tokens,
             want_json=want_json,
+            temperature=temperature,
+            top_p=top_p,
         )
 
         try:
@@ -431,8 +445,14 @@ class LLMProvider:
         json_schema: Optional[dict],
         max_tokens: int,
         want_json: bool,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Any:
         kwargs: Dict[str, Any] = {"max_output_tokens": max_tokens}
+        if temperature is not None:
+            kwargs["temperature"] = float(temperature)
+        if top_p is not None:
+            kwargs["top_p"] = float(top_p)
         if system_instruction:
             kwargs["system_instruction"] = system_instruction
         if want_json:

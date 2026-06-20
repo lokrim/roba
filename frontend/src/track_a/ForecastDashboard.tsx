@@ -33,6 +33,7 @@ import { useTrackAData } from "./useTrackAData";
 
 type ReasonDetail = {
   forecast_id?: number;
+  run_id?: string;
   menu_item_id?: number;
   item_name?: string;
   forecast_qty?: number;
@@ -41,6 +42,7 @@ type ReasonDetail = {
   multipliers?: Record<string, number>;
   optimized?: boolean;
   hard_override?: number | null;
+  trace?: Forecast["trace"];
 };
 
 export function ForecastDashboard() {
@@ -72,7 +74,7 @@ export function ForecastDashboard() {
     setBusyAction("auto");
     try {
       await apiPost("/api/track-a/forecast/auto-mode", {
-        enabled: !Boolean(data.forecast_agent?.llm_auto_mode),
+        enabled: !data.forecast_agent?.llm_auto_mode,
       });
       await refresh();
     } finally {
@@ -350,6 +352,8 @@ function latestAgentEvents(data: TrackASnapshot): EventLog[] {
 }
 
 function reasonSummary(reason: ReasonDetail | undefined, forecast: Forecast) {
+  const traceSummary = reason?.trace?.summary ?? forecast.trace?.summary;
+  if (traceSummary) return traceSummary;
   if (!reason?.explanations) {
     return forecast.trigger_reason === "llm_manual"
       ? "Optimized forecast emitted through the LLM stack."

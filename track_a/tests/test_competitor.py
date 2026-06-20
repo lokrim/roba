@@ -1,4 +1,4 @@
-from core.models import Call, CompetitorIntel
+from core.models import Call, CompetitorIntel, CompetitorOffer
 from core.signals import SignalType
 from track_a.agents.competitor import CompetitorAgent
 
@@ -31,3 +31,23 @@ def test_discovery_selection_and_call_outcome_write(bus, session_factory, seeded
         assert session.query(CompetitorIntel).count() == 1
     finally:
         session.close()
+
+
+def test_passive_monitor_flags_offer_changes(bus, session_factory, seeded):
+    agent = CompetitorAgent(bus, session_factory)
+
+    first = agent.passive_monitor()
+    assert first[0]["offers_changed"] is False
+
+    session = session_factory()
+    try:
+        offer = session.get(CompetitorOffer, 1)
+        offer.price = 9.99
+        offer.updated_at = 123.0
+        session.commit()
+    finally:
+        session.close()
+
+    second = agent.passive_monitor()
+    mario = next(row for row in second if row["competitor_id"] == 1)
+    assert mario["offers_changed"] is True

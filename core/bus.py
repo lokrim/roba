@@ -60,7 +60,7 @@ def _validate_payload(sig_type: SignalType, payload: PayloadArg) -> Dict[str, An
             f"({exc.error_count()} error(s))"
         ) from exc
     # mode="json" guarantees the stored dict is JSON-native for the JSON column.
-    return validated.model_dump(mode="json")
+    return validated.model_dump(mode="json", exclude_unset=True)
 
 
 def _cascade_depth(correlation_id: Optional[str]) -> int:

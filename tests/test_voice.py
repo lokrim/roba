@@ -143,3 +143,14 @@ def test_event_attendance_is_not_stored_as_raw_multiplier(seeded):
     assert result["extracted"]["intent"] == "add_event"
     assert result["extracted"]["attribute"] == "expected_attendance"
     assert result["extracted"]["value"] == 800.0
+
+
+def test_event_fallback_preserves_attendance_and_hour_range(seeded):
+    voice, _session_factory = seeded
+
+    result = voice.process("There is a food festival today for 800 people from 9 AM to 11 AM")
+
+    assert result["extracted"]["intent"] == "add_event"
+    assert result["extracted"]["attribute"] == "expected_attendance"
+    assert result["extracted"]["value"] == 800.0
+    assert result["extracted"]["effective_window"] == {"start": 32400.0, "end": 39600.0}

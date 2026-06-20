@@ -176,6 +176,8 @@ class DemandForecastPayload(BaseModel):
     baseline: float
     multipliers: Dict[str, float] = {}
     confidence: float
+    run_id: Optional[str] = None
+    trace: Optional[Dict[str, Any]] = None
 
 
 class BatchDecisionPayload(BaseModel):
