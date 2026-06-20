@@ -81,6 +81,7 @@ class DemandForecaster(BaseAgent):
         self.ws_broadcast = ws_broadcast
         self.llm = llm
         self.llm_auto_mode = bool(config.LLM_FORECAST_AUTO_MODE)
+        self.forecast_job_enqueue: Optional[Callable[[str, str], Any]] = None
         self.subscribe(["forecasting"])
 
     # ------------------------------------------------------------------
@@ -90,7 +91,7 @@ class DemandForecaster(BaseAgent):
     def register(self, orchestrator: Any) -> None:
         orchestrator.register(
             "interval",
-            lambda: self.run_forecast("interval", optimize=self.llm_auto_mode),
+            lambda: self._enqueue_or_run_forecast("deterministic_forecast", "interval"),
             interval_sim_s=config.FORECAST_INTERVAL_SIM_S,
             name="track_a_forecast_interval",
         )
@@ -113,10 +114,19 @@ class DemandForecaster(BaseAgent):
             SignalType.MENU_TOGGLE.value,
             SignalType.STOCKOUT_RISK.value,
         }:
-            self.run_forecast(
-                f"signal:{signal.type}",
-                optimize=self.llm_auto_mode,
-            )
+            if signal.type == SignalType.USER_FACT.value:
+                self._persist_user_forecast_overrides(signal)
+            self._enqueue_or_run_forecast("deterministic_forecast", f"signal:{signal.type}")
+
+    def set_forecast_job_enqueue(self, fn: Callable[[str, str], Any]) -> None:
+        self.forecast_job_enqueue = fn
+
+    def _enqueue_or_run_forecast(self, kind: str, trigger_reason: str) -> Any:
+        if self.forecast_job_enqueue is not None:
+            return self.forecast_job_enqueue(kind, trigger_reason)
+        if kind == "llm_finalizer":
+            return self.optimize_forecast(trigger_reason)
+        return self.run_forecast(trigger_reason, optimize=False)
 
     def set_auto_mode(self, enabled: bool) -> Dict[str, Any]:
         self.llm_auto_mode = bool(enabled)
@@ -161,6 +171,9 @@ class DemandForecaster(BaseAgent):
                 self._prepare_item(session, item, daypart, window, live)
                 for item in items
             ]
+            for prepared_item in prepared:
+                self._finalize_deterministic_recommendation(session, prepared_item, daypart, window, now)
+
             llm_plan = self._llm_plan(session, prepared, live, daypart, window) if optimize else {}
             if llm_plan:
                 self._queue_llm_plan_memory(llm_plan, after_commit)
@@ -171,9 +184,25 @@ class DemandForecaster(BaseAgent):
                 multipliers = dict(prepared_item["multipliers"])
                 explanations = dict(prepared_item["explanations"])
                 hard_override = prepared_item.get("hard_override")
-                llm_adjustment = self._adjustment_for(llm_plan, item.id)
+                deterministic_recommendation = dict(prepared_item["deterministic_recommendation"])
+                llm_decision = self._final_decision_for(llm_plan, item.id)
+                llm_adjustment = {} if llm_decision else self._adjustment_for(llm_plan, item.id)
+                used_llm_decision = bool(llm_decision or llm_adjustment)
 
-                if llm_adjustment:
+                if llm_decision:
+                    hard_override = self._apply_llm_final_decision(
+                        item.id,
+                        daypart,
+                        window,
+                        multipliers,
+                        explanations,
+                        hard_override,
+                        deterministic_recommendation,
+                        llm_decision,
+                        after_commit,
+                        persist_override=bool(optimize and trigger_reason == "manual"),
+                    )
+                elif llm_adjustment:
                     hard_override = self._apply_llm_adjustment(
                         item.id,
                         daypart,
@@ -185,25 +214,16 @@ class DemandForecaster(BaseAgent):
                         after_commit,
                         persist_override=bool(optimize and trigger_reason == "manual"),
                     )
-                active_override = self._active_override(session, item.id, daypart, window, now)
-                if active_override is not None:
-                    hard_override = self._apply_forecast_override(
-                        active_override,
-                        multipliers,
-                        explanations,
-                        hard_override,
-                    )
 
-                raw_qty = baseline
-                for value in multipliers.values():
-                    raw_qty *= float(value)
+                raw_qty = self._raw_qty(baseline, multipliers)
                 qty = int(hard_override) if hard_override is not None else nearest_int(raw_qty)
                 qty = max(0, qty)
                 latent_qty = self._latent_demand_qty(baseline, multipliers, hard_override)
 
                 confidence = confidence_from(multipliers)
-                if llm_adjustment:
-                    confidence = min(confidence, float(llm_adjustment.get("confidence") or 0.85))
+                final_confidence = (llm_decision or llm_adjustment or {}).get("confidence")
+                if final_confidence is not None:
+                    confidence = min(confidence, float(final_confidence or 0.85))
 
                 trace = self._forecast_trace(
                     run_id=run_id,
@@ -218,8 +238,10 @@ class DemandForecaster(BaseAgent):
                     forecast_qty=qty,
                     confidence=confidence,
                     hard_override=hard_override,
-                    optimized=bool(optimize),
+                    optimized=used_llm_decision,
                     trigger_reason=trigger_reason,
+                    deterministic_recommendation=deterministic_recommendation,
+                    finalizer_decision=llm_decision or llm_adjustment or None,
                 )
                 forecast = Forecast(
                     menu_item_id=item.id,
@@ -230,7 +252,11 @@ class DemandForecaster(BaseAgent):
                     multipliers=multipliers,
                     confidence=round(confidence, 3),
                     generated_at=now,
-                    trigger_reason="llm_manual" if optimize and trigger_reason == "manual" else trigger_reason,
+                    trigger_reason=(
+                        "llm_manual"
+                        if used_llm_decision and trigger_reason == "manual"
+                        else trigger_reason
+                    ),
                 )
                 session.add(forecast)
                 session.flush()
@@ -261,7 +287,7 @@ class DemandForecaster(BaseAgent):
                     "multipliers": multipliers,
                     "explanations": explanations,
                     "hard_override": hard_override,
-                    "optimized": bool(optimize),
+                    "optimized": used_llm_decision,
                     "trigger": trigger_reason,
                     "trace": trace,
                 }
@@ -311,6 +337,101 @@ class DemandForecaster(BaseAgent):
 
     def optimize_forecast(self, trigger_reason: str = "manual") -> List[Forecast]:
         return self.run_forecast(trigger_reason, optimize=True)
+
+    def propose_llm_forecast_overrides(self, source_job_id: str) -> Dict[str, Any]:
+        """Run the LLM finalizer as a reviewer and return approval proposals.
+
+        This deliberately does not write forecast rows or overrides. The normal
+        deterministic path stays authoritative until an operator approves a
+        proposed durable change.
+        """
+        now = float(self.bus.sim_time)
+        daypart, window = current_window(now)
+        live = self.bus.live()
+        run_id = forecast_run_id(now, daypart, window, f"llm_finalizer:{source_job_id}")
+        after_commit: List[Tuple[str, Any]] = []
+        proposals: List[Dict[str, Any]] = []
+        accepted: List[Dict[str, Any]] = []
+
+        session = self.db_session_factory()
+        try:
+            items = (
+                session.query(MenuItem)
+                .filter(MenuItem.active == 1)
+                .order_by(MenuItem.id.asc())
+                .all()
+            )
+            prepared = [
+                self._prepare_item(session, item, daypart, window, live)
+                for item in items
+            ]
+            for prepared_item in prepared:
+                self._finalize_deterministic_recommendation(
+                    session, prepared_item, daypart, window, now
+                )
+
+            llm_plan = self._llm_plan(session, prepared, live, daypart, window)
+            if llm_plan:
+                self._queue_llm_plan_memory(llm_plan, after_commit)
+
+            for prepared_item in prepared:
+                item = prepared_item["item"]
+                deterministic = dict(prepared_item.get("deterministic_recommendation") or {})
+                deterministic_qty = int(deterministic.get("forecast_qty") or 0)
+                multipliers = dict(prepared_item.get("multipliers") or {})
+                hard_override = prepared_item.get("hard_override")
+                decision = self._final_decision_for(llm_plan, item.id)
+                adjustment = {} if decision else self._adjustment_for(llm_plan, item.id)
+                source_decision = decision or adjustment
+                final_qty = self._proposed_final_qty(
+                    source_decision,
+                    deterministic_qty,
+                    multipliers,
+                    hard_override,
+                    from_finalizer=bool(decision),
+                )
+                if final_qty is None or final_qty == deterministic_qty:
+                    accepted.append(
+                        {
+                            "menu_item_id": int(item.id),
+                            "item_name": item.name,
+                            "deterministic_qty": deterministic_qty,
+                            "decision": source_decision or {"decision": "accept_deterministic"},
+                        }
+                    )
+                    continue
+
+                proposals.append(
+                    {
+                        "menu_item_id": int(item.id),
+                        "item_name": item.name,
+                        "operation": "hard_zero_production" if final_qty == 0 else "set_target",
+                        "qty": max(0, int(final_qty)),
+                        "daypart": daypart,
+                        "window": dict(window),
+                        "reason": str(
+                            source_decision.get("reason")
+                            or "LLM finalizer proposed a durable forecast override."
+                        ),
+                        "evidence": source_decision.get("evidence") or source_decision,
+                        "confidence": float(source_decision.get("confidence") or llm_plan.get("confidence") or 0.75),
+                        "source_job_id": source_job_id,
+                        "source_run_id": run_id,
+                        "deterministic_qty": deterministic_qty,
+                    }
+                )
+        finally:
+            session.close()
+
+        self._run_after_commit(after_commit)
+        return {
+            "run_id": run_id,
+            "daypart": daypart,
+            "window": window,
+            "llm_plan": llm_plan if "llm_plan" in locals() else {},
+            "accepted_deterministic": accepted,
+            "proposals": proposals,
+        }
 
     def decide_batches(
         self,
@@ -489,7 +610,15 @@ class DemandForecaster(BaseAgent):
         baseline = self.baseline_qty(session, item.id, daypart, float(self.bus.sim_time))
         multipliers = self._deterministic_multipliers(session, item, baseline, daypart, window, live)
         explanations = self._base_explanations(multipliers, item, window, live)
-        hard_override = self._apply_hard_constraints(session, item, multipliers, explanations, live)
+        hard_override = self._apply_hard_constraints(
+            session,
+            item,
+            daypart,
+            window,
+            multipliers,
+            explanations,
+            live,
+        )
         return {
             "item": item,
             "baseline": baseline,
@@ -497,6 +626,65 @@ class DemandForecaster(BaseAgent):
             "explanations": explanations,
             "hard_override": hard_override,
         }
+
+    def _finalize_deterministic_recommendation(
+        self,
+        session: Any,
+        prepared_item: Dict[str, Any],
+        daypart: str,
+        window: Dict[str, float],
+        now: float,
+    ) -> None:
+        item = prepared_item["item"]
+        baseline = float(prepared_item["baseline"])
+        multipliers = dict(prepared_item["multipliers"])
+        explanations = dict(prepared_item["explanations"])
+        hard_override = prepared_item.get("hard_override")
+
+        active_override = self._active_override(session, item.id, daypart, window, now)
+        if active_override is not None:
+            hard_override = self._apply_forecast_override(
+                active_override,
+                multipliers,
+                explanations,
+                hard_override,
+            )
+
+        raw_qty = self._raw_qty(baseline, multipliers)
+        qty = int(hard_override) if hard_override is not None else nearest_int(raw_qty)
+        qty = max(0, qty)
+        latent_qty = self._latent_demand_qty(baseline, multipliers, hard_override)
+        confidence = confidence_from(multipliers)
+
+        prepared_item["multipliers"] = multipliers
+        prepared_item["explanations"] = explanations
+        prepared_item["hard_override"] = hard_override
+        prepared_item["deterministic_recommendation"] = {
+            "raw_qty": round(raw_qty, 3),
+            "forecast_qty": int(qty),
+            "latent_demand_qty": round(latent_qty, 3),
+            "confidence": round(confidence, 3),
+            "hard_override": hard_override,
+            "summary": self._top_trace_reason(
+                [
+                    {
+                        "key": key,
+                        "operation": self._modifier_operation(key, value),
+                        "value": float(value),
+                        "reason": explanations.get(key, key),
+                    }
+                    for key, value in multipliers.items()
+                ],
+                self._zero_reason(hard_override, multipliers),
+            ),
+        }
+
+    @staticmethod
+    def _raw_qty(baseline: float, multipliers: Dict[str, float]) -> float:
+        raw_qty = float(baseline)
+        for value in multipliers.values():
+            raw_qty *= float(value)
+        return raw_qty
 
     def baseline_qty(self, session: Any, item_id: int, daypart: str, now: float) -> float:
         _current_daypart, window = current_window(now)
@@ -856,11 +1044,26 @@ class DemandForecaster(BaseAgent):
         self,
         session: Any,
         item: MenuItem,
+        daypart: str,
+        window: Dict[str, float],
         multipliers: Dict[str, float],
         explanations: Dict[str, str],
         live: Iterable[Signal],
     ) -> Optional[int]:
         hard_override: Optional[int] = None
+        voice_override = self._active_voice_constraint_override(
+            session,
+            int(item.id),
+            daypart,
+            window,
+            float(self.bus.sim_time),
+        )
+        if voice_override is not None:
+            hard_override = 0
+            multipliers["voice_constraint"] = 0.0
+            explanations["voice_constraint"] = str(
+                voice_override.reason or "Voice instruction blocks production for this item."
+            )
         for sig in live:
             payload = sig.payload or {}
             if sig.type == SignalType.MENU_TOGGLE.value and payload.get("menu_item_id") == item.id:
@@ -891,6 +1094,53 @@ class DemandForecaster(BaseAgent):
                 )
             explanations["staff_coverage"] = vague["reason"]
         return hard_override
+
+    def _active_voice_constraint_override(
+        self,
+        session: Any,
+        item_id: int,
+        daypart: str,
+        window: Dict[str, float],
+        now: float,
+    ) -> Optional[ForecastOverride]:
+        rows = (
+            session.query(ForecastOverride)
+            .filter(
+                ForecastOverride.menu_item_id == item_id,
+                ForecastOverride.daypart == daypart,
+                ForecastOverride.status == "active",
+                ForecastOverride.source == "voice",
+                ForecastOverride.authority == "user_instruction",
+                ForecastOverride.operation == "hard_zero_production",
+            )
+            .order_by(ForecastOverride.created_at.desc(), ForecastOverride.id.desc())
+            .all()
+        )
+        candidates: List[ForecastOverride] = []
+        for row in rows:
+            if float(row.valid_until or 0.0) <= now:
+                row.status = "expired"
+                continue
+            if forecast_window_matches(row.window or {}, window):
+                candidates.append(row)
+        if not candidates:
+            return None
+        for row in candidates:
+            if (
+                row.source == "voice"
+                and row.authority == "user_instruction"
+                and row.operation == "hard_zero_production"
+            ):
+                return row
+        return sorted(candidates, key=self._override_priority, reverse=True)[0]
+
+    @staticmethod
+    def _override_priority(row: ForecastOverride) -> Tuple[int, float, int]:
+        authority_rank = 3 if row.authority == "user_instruction" else 2 if row.authority else 1
+        voice_rank = 2 if row.source == "voice" else 1
+        hard_zero_rank = 1 if row.operation == "hard_zero_production" else 0
+        created = float(row.created_at or 0.0)
+        return (authority_rank + voice_rank + hard_zero_rank, created, int(row.id or 0))
 
     def _vague_capacity_constraint(
         self,
@@ -937,7 +1187,14 @@ class DemandForecaster(BaseAgent):
     @staticmethod
     def _is_absence_fact(payload: Dict[str, Any], raw: str) -> bool:
         if payload.get("intent") == "set_operational_constraint":
-            return True
+            attribute = str(payload.get("attribute") or "").lower()
+            value = payload.get("value")
+            value_blob = str(value or "").lower()
+            return (
+                attribute == "capacity_absence"
+                or any(w in raw for w in ("absent", "unavailable", "missing", "off sick", "sick"))
+                or any(w in value_blob for w in ("absent", "unavailable", "missing", "off sick", "sick"))
+            )
         return any(w in raw for w in ("absent", "unavailable", "missing", "off sick", "sick")) and any(
             w in raw for w in ("station", "worker", "cook", "chef", "staff", "making")
         )
@@ -1053,6 +1310,119 @@ class DemandForecaster(BaseAgent):
                 blocked = True
         return blocked
 
+    def _persist_user_forecast_overrides(self, signal: Signal) -> None:
+        payload = signal.payload or {}
+        if not self._is_user_forecast_constraint(payload):
+            return
+
+        now = float(self.bus.sim_time)
+        daypart, window = current_window(now)
+        fact_window = payload.get("effective_window")
+        if isinstance(fact_window, dict) and fact_window.get("end") is not None:
+            if not windows_overlap(window, fact_window):
+                return
+            window = {
+                "start": max(float(window["start"]), float(fact_window.get("start", window["start"]))),
+                "end": min(float(window["end"]), float(fact_window["end"])),
+            }
+
+        session = self.db_session_factory()
+        try:
+            items = self._items_for_user_fact(session, payload)
+        finally:
+            session.close()
+
+        reason = self._user_forecast_override_reason(payload)
+        for item in items:
+            self._persist_override(
+                int(item.id),
+                daypart,
+                window,
+                "hard_zero_production",
+                {"qty": 0},
+                reason,
+                "voice",
+                "user_instruction",
+                {
+                    "signal_id": signal.signal_id,
+                    "raw_text": payload.get("raw_text"),
+                    "payload": payload,
+                },
+            )
+
+    @staticmethod
+    def _is_user_forecast_constraint(payload: Dict[str, Any]) -> bool:
+        if payload.get("intent") != "set_operational_constraint":
+            return False
+        attribute = str(payload.get("attribute") or "").lower()
+        if attribute == "capacity_absence":
+            return False
+        value_text = str(payload.get("value") or "").lower()
+        if attribute in {"availability", "available", "production_available"} and value_text in {
+            "false",
+            "0",
+            "no",
+            "none",
+            "unavailable",
+            "not available",
+        }:
+            return True
+        blob = " ".join(
+            str(value or "")
+            for value in (
+                attribute,
+                payload.get("entity_ref"),
+                payload.get("raw_text"),
+                payload.get("value"),
+            )
+        ).lower()
+        return any(
+            word in blob
+            for word in (
+                "overstock", "over-stock", "over stocked", "overstocked",
+                "too much", "too many", "excess", "surplus", "overproduced",
+                "over-produced", "reduce_forecast", "production_unavailable",
+                "halt_production", "no more", "not possible", "impossible",
+                "not available", "unavailable", "cannot make", "can't make",
+            )
+        )
+
+    def _items_for_user_fact(self, session: Any, payload: Dict[str, Any]) -> List[MenuItem]:
+        target = str(payload.get("entity_ref") or payload.get("raw_text") or "").lower()
+        tokens = self._target_tokens(target)
+        if not tokens:
+            return []
+        items = session.query(MenuItem).filter(MenuItem.active == 1).all()
+        matched = [
+            item for item in items
+            if self._item_matches_tokens(item, tokens)
+        ]
+        return matched
+
+    @staticmethod
+    def _item_matches_tokens(item: MenuItem, tokens: List[str]) -> bool:
+        singular_tokens = {singularize_token(token) for token in tokens}
+        haystacks = [
+            item.name or "",
+            item.category or "",
+            item.description or "",
+        ]
+        joined = " ".join(haystacks).lower()
+        joined_tokens = {singularize_token(token) for token in re.findall(r"[a-z0-9]+", joined)}
+        return bool(singular_tokens.intersection(joined_tokens))
+
+    @staticmethod
+    def _user_forecast_override_reason(payload: Dict[str, Any]) -> str:
+        target = payload.get("entity_ref") or "item"
+        attribute = str(payload.get("attribute") or "").lower()
+        value_text = str(payload.get("value") or "").lower()
+        if attribute == "production_unavailable" or (
+            attribute in {"availability", "available", "production_available"}
+            and value_text in {"false", "0", "no", "none", "unavailable", "not available"}
+        ):
+            return f"Voice instruction marks {target} as unavailable; production forecast locked to zero for this window."
+        return f"Voice instruction marks {target} as overstocked; production forecast locked to zero for this window."
+
     def _active_override(
         self,
         session: Any,
@@ -1071,13 +1441,33 @@ class DemandForecaster(BaseAgent):
             .order_by(ForecastOverride.created_at.desc(), ForecastOverride.id.desc())
             .all()
         )
+        active_rows: List[ForecastOverride] = []
         for row in rows:
             if float(row.valid_until or 0.0) <= now:
                 row.status = "expired"
                 continue
             if forecast_window_matches(row.window or {}, window):
-                return row
-        return None
+                active_rows.append(row)
+        if not active_rows:
+            return None
+        return sorted(active_rows, key=self._override_priority)[0]
+
+    @staticmethod
+    def _override_priority(override: ForecastOverride) -> Tuple[int, float, int]:
+        operation = str(override.operation or "")
+        source = str(override.source or "")
+        authority = str(override.authority or "")
+        if operation == "hard_zero_production" and source == "voice":
+            priority = 0
+        elif operation == "hard_zero_production":
+            priority = 1
+        elif authority == "user_instruction":
+            priority = 2
+        elif source == "llm":
+            priority = 4
+        else:
+            priority = 3
+        return (priority, -float(override.created_at or 0.0), -int(override.id or 0))
 
     @staticmethod
     def _apply_forecast_override(
@@ -1088,12 +1478,18 @@ class DemandForecaster(BaseAgent):
     ) -> Optional[int]:
         reason = str(override.reason or "Forecast override is active.")
         operation = str(override.operation or "")
+        source = str(override.source or "")
         value = override.value or {}
         if operation == "hard_zero_production":
+            if source == "voice":
+                multipliers["voice_constraint"] = 0.0
+                explanations["voice_constraint"] = reason
             multipliers["authority_override"] = 0.0
             explanations["authority_override"] = reason
             return 0
         if operation == "set_target":
+            if hard_override == 0 and float(multipliers.get("voice_constraint", 1.0)) <= 0:
+                return hard_override
             try:
                 qty = nearest_int(float(value.get("qty")))
             except (TypeError, ValueError, AttributeError):
@@ -1129,6 +1525,8 @@ class DemandForecaster(BaseAgent):
             )
             for row in active:
                 if forecast_window_matches(row.window or {}, window):
+                    if row.authority == "user_instruction" and authority != "user_instruction":
+                        continue
                     row.status = "superseded"
             row = ForecastOverride(
                 menu_item_id=item_id,
@@ -1152,6 +1550,33 @@ class DemandForecaster(BaseAgent):
         finally:
             session.close()
 
+    def persist_approved_llm_override(self, proposal: Dict[str, Any]) -> ForecastOverride:
+        """Persist one operator-approved LLM forecast proposal."""
+        item_id = int(proposal["menu_item_id"])
+        operation = str(proposal.get("operation") or "set_target")
+        qty = max(0, nearest_int(float(proposal.get("qty") or 0)))
+        if operation not in {"set_target", "hard_zero_production"}:
+            operation = "hard_zero_production" if qty == 0 else "set_target"
+        value = {"qty": 0 if operation == "hard_zero_production" else qty}
+        return self._persist_override(
+            item_id,
+            str(proposal.get("daypart") or current_daypart(float(self.bus.sim_time))),
+            dict(proposal.get("window") or current_window(float(self.bus.sim_time))[1]),
+            operation,
+            value,
+            str(proposal.get("reason") or "Approved LLM forecast proposal."),
+            "llm",
+            "approved_llm",
+            {
+                "approval_type": "forecast_override_proposal",
+                "source_job_id": proposal.get("source_job_id"),
+                "source_run_id": proposal.get("source_run_id"),
+                "confidence": proposal.get("confidence"),
+                "evidence": proposal.get("evidence"),
+                "deterministic_qty": proposal.get("deterministic_qty"),
+            },
+        )
+
     # ------------------------------------------------------------------
     # LLM optimization
     # ------------------------------------------------------------------
@@ -1166,10 +1591,16 @@ class DemandForecaster(BaseAgent):
     ) -> Dict[str, Any]:
         if self.llm is None:
             return {}
+        material_context = self._material_forecast_context(prepared, live)
         context = {
             "sim_time": float(self.bus.sim_time),
             "daypart": daypart,
             "window": window,
+            "instruction": (
+                "For most items, accept deterministic_recommendation.forecast_qty exactly. "
+                "Only change final_qty when material_context is true for that item or an "
+                "active signal/constraint explicitly justifies it."
+            ),
             "weather": self._weather_context(session),
             "temperature_thresholds_c": {
                 "cold_lte": config.COLD_TEMP_C,
@@ -1179,6 +1610,13 @@ class DemandForecaster(BaseAgent):
                 "min": config.LLM_MULTIPLIER_CLAMP[0],
                 "max": config.LLM_MULTIPLIER_CLAMP[1],
             },
+            "final_qty_guardrails": {
+                "copy_deterministic_by_default": True,
+                "never_override_zero_feasibility_constraints": True,
+                "require_explicit_signal_for_material_changes": True,
+                "large_change_without_material_context_is_invalid": True,
+            },
+            "material_context": material_context,
             "items": [self._prepared_context(entry) for entry in prepared],
             "live_signals": [self._signal_context(sig) for sig in live],
             "memory": self._memory_context(session),
@@ -1187,17 +1625,21 @@ class DemandForecaster(BaseAgent):
             {
                 "role": "system",
                 "content": (
-                    "You optimize restaurant demand forecasts. Return compact JSON only. "
-                    "Treat the provided baseline and deterministic multipliers as already applied math. "
-                    "Do not double-count weather, events, staffing, reviews, competitor signals, "
-                    "recent velocity, or simulation settings unless the live context shows an "
-                    "explicit interaction not represented by those multipliers. You may adjust "
-                    "existing multipliers between 0.0 and 2.0, set "
-                    "hard_override_qty only to 0 when an item cannot operationally be made, "
-                    "or set target_forecast_qty when a direct integer forecast is safer than "
-                    "a multiplier. Keep each adjustment small and evidence-bound; leave an item "
-                    "unchanged when the deterministic stack is sufficient. Provide concise "
-                    "user-facing reasons. Do not reveal hidden reasoning."
+                    "You are the final forecast decision layer for a restaurant simulation. "
+                    "The deterministic model is usually accurate and should be treated as the "
+                    "default expert recommendation. Your main job is to return the final forecast "
+                    "in the required JSON format. For each item, copy "
+                    "deterministic_recommendation.forecast_qty unless there is explicit evidence "
+                    "from active constraints, voice instructions, menu/stockout/staff signals, "
+                    "events, competitor/review signals, weather, recent velocity, or memory that "
+                    "requires a change. Do not recalculate baseline math. Do not double-count "
+                    "multipliers already present in deterministic_recommendation. Hard feasibility "
+                    "zeros from voice, menu disable, stockout, or staff coverage are guardrails: "
+                    "the final_qty must remain 0. If changing a non-zero forecast, keep the change "
+                    "bounded and evidence-bound. Return JSON only with item_final_forecasts, "
+                    "global_notes, memory_updates, and confidence. item_final_forecasts must contain "
+                    "{menu_item_id, final_qty, confidence, decision, changed, reason, evidence}. "
+                    "Use decision='accept_deterministic' when copying the recommendation."
                 ),
             },
             {"role": "user", "content": str(context)},
@@ -1205,19 +1647,20 @@ class DemandForecaster(BaseAgent):
         schema = {
             "type": "object",
             "properties": {
+                "item_final_forecasts": {"type": "array"},
                 "item_adjustments": {"type": "array"},
                 "global_notes": {"type": "array"},
                 "memory_updates": {"type": "array"},
                 "confidence": {"type": "number"},
             },
-            "required": ["item_adjustments", "global_notes", "memory_updates"],
+            "required": ["global_notes", "memory_updates"],
         }
         result = self.llm.complete(
             messages,
             json_schema=schema,
-            max_tokens=900,
+            max_tokens=1200,
             use_site="forecaster_optimization",
-            temperature=0.2,
+            temperature=0.1,
         )
         if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
             return {}
@@ -1305,6 +1748,148 @@ class DemandForecaster(BaseAgent):
                 continue
         return {}
 
+    @staticmethod
+    def _final_decision_for(plan: Dict[str, Any], item_id: int) -> Dict[str, Any]:
+        for entry in plan.get("item_final_forecasts") or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                if int(entry.get("menu_item_id")) == int(item_id):
+                    return entry
+            except (TypeError, ValueError):
+                continue
+        return {}
+
+    def _apply_llm_final_decision(
+        self,
+        item_id: int,
+        daypart: str,
+        window: Dict[str, float],
+        multipliers: Dict[str, float],
+        explanations: Dict[str, str],
+        hard_override: Optional[int],
+        deterministic_recommendation: Dict[str, Any],
+        decision: Dict[str, Any],
+        after_commit: List[Tuple[str, Any]],
+        persist_override: bool = False,
+    ) -> Optional[int]:
+        deterministic_qty = int(deterministic_recommendation.get("forecast_qty") or 0)
+        reason = str(decision.get("reason") or "LLM finalizer accepted the deterministic forecast.")
+        final_qty = self._validated_llm_final_qty(
+            decision,
+            deterministic_qty,
+            multipliers,
+            hard_override,
+        )
+        changed = final_qty != deterministic_qty
+
+        if changed:
+            hard_override = final_qty
+            multipliers["llm_final"] = 1.0
+            explanations["llm_final"] = reason
+            if persist_override:
+                operation = "hard_zero_production" if final_qty == 0 else "set_target"
+                after_commit.append(
+                    (
+                        "forecast_override",
+                        (
+                            item_id,
+                            daypart,
+                            window,
+                            operation,
+                            {"qty": max(0, final_qty)},
+                            reason,
+                            "llm",
+                            "approved_llm",
+                            {"decision": decision, "trigger": "manual_finalizer"},
+                        ),
+                    )
+                )
+        else:
+            multipliers["llm_finalizer"] = 1.0
+            explanations["llm_finalizer"] = (
+                reason
+                if str(decision.get("decision") or "") != "accept_deterministic"
+                else "LLM finalizer accepted the deterministic recommendation."
+            )
+
+        after_commit.append(
+            (
+                "remember",
+                (
+                    "menu_item",
+                    str(item_id),
+                    {
+                        "title": "LLM final forecast decision",
+                        "summary": explanations.get("llm_final", explanations.get("llm_finalizer", reason)),
+                        "decision": decision,
+                        "deterministic_recommendation": deterministic_recommendation,
+                    },
+                    {"menu_item_id": item_id},
+                    float(decision.get("confidence") or deterministic_recommendation.get("confidence") or 0.8),
+                    "llm",
+                    SECONDS_PER_DAY,
+                ),
+            )
+        )
+        return hard_override
+
+    def _validated_llm_final_qty(
+        self,
+        decision: Dict[str, Any],
+        deterministic_qty: int,
+        multipliers: Dict[str, float],
+        hard_override: Optional[int],
+    ) -> int:
+        if hard_override == 0 and self._has_zero_feasibility_constraint(multipliers):
+            return 0
+        if (
+            decision.get("changed") is False
+            or str(decision.get("decision") or "") == "accept_deterministic"
+        ):
+            return max(0, deterministic_qty)
+        try:
+            proposed = nearest_int(float(decision.get("final_qty")))
+        except (TypeError, ValueError):
+            return max(0, deterministic_qty)
+        proposed = max(0, proposed)
+        if proposed == deterministic_qty:
+            return proposed
+        evidence = decision.get("evidence")
+        if not evidence:
+            return max(0, deterministic_qty)
+        if not self._has_material_change_evidence(multipliers):
+            return max(0, deterministic_qty)
+        maximum = max(20, deterministic_qty + 8, nearest_int(max(deterministic_qty, 1) * 2.0))
+        return min(proposed, maximum)
+
+    @staticmethod
+    def _has_zero_feasibility_constraint(multipliers: Dict[str, float]) -> bool:
+        return any(
+            float(multipliers.get(key, 1.0)) <= 0
+            for key in ("voice_constraint", "availability", "staff_coverage", "authority_override", "llm_override")
+        )
+
+    @staticmethod
+    def _has_material_change_evidence(multipliers: Dict[str, float]) -> bool:
+        material_keys = {
+            "voice_constraint",
+            "availability",
+            "staff_coverage",
+            "event",
+            "competitor",
+            "review",
+            "weather",
+            "recent_velocity",
+            "authority_override",
+        }
+        for key, value in multipliers.items():
+            if key in material_keys and abs(float(value) - 1.0) >= 0.03:
+                return True
+            if key.startswith("llm"):
+                return True
+        return False
+
     def _apply_llm_adjustment(
         self,
         item_id: int,
@@ -1385,6 +1970,8 @@ class DemandForecaster(BaseAgent):
         else:
             target_qty = self._target_qty_from_adjustment(adjustment)
             if target_qty is not None:
+                if hard_override == 0 and float(multipliers.get("voice_constraint", 1.0)) <= 0:
+                    return hard_override
                 hard_override = max(0, target_qty)
                 multipliers["llm_target"] = 1.0
                 explanations["llm_target"] = reason
@@ -1431,6 +2018,39 @@ class DemandForecaster(BaseAgent):
             except (TypeError, ValueError):
                 continue
         return None
+
+    def _proposed_final_qty(
+        self,
+        decision: Dict[str, Any],
+        deterministic_qty: int,
+        multipliers: Dict[str, float],
+        hard_override: Optional[int],
+        *,
+        from_finalizer: bool,
+    ) -> Optional[int]:
+        if not decision:
+            return None
+        if hard_override == 0 and self._has_zero_feasibility_constraint(multipliers):
+            return 0
+        if from_finalizer:
+            return self._validated_llm_final_qty(
+                decision,
+                deterministic_qty,
+                multipliers,
+                hard_override,
+            )
+        if decision.get("hard_override_qty") is not None:
+            try:
+                override = nearest_int(float(decision.get("hard_override_qty")))
+            except (TypeError, ValueError):
+                return None
+            return max(0, override)
+        target_qty = self._target_qty_from_adjustment(decision)
+        if target_qty is None:
+            return None
+        if not self._has_material_change_evidence(multipliers):
+            return None
+        return max(0, target_qty)
 
     @staticmethod
     def _queue_llm_plan_memory(plan: Dict[str, Any], after_commit: List[Tuple[str, Any]]) -> None:
@@ -1621,7 +2241,10 @@ class DemandForecaster(BaseAgent):
             "description": item.description,
             "baseline": entry["baseline"],
             "multipliers": entry["multipliers"],
+            "explanations": entry.get("explanations") or {},
             "hard_override": entry.get("hard_override"),
+            "deterministic_recommendation": entry.get("deterministic_recommendation") or {},
+            "material_context": DemandForecaster._has_material_change_evidence(entry.get("multipliers") or {}),
         }
 
     @staticmethod
@@ -1632,6 +2255,41 @@ class DemandForecaster(BaseAgent):
             "payload": signal.payload,
             "created_at": signal.created_at,
             "expires_at": signal.expires_at,
+        }
+
+    @staticmethod
+    def _material_forecast_context(
+        prepared: Iterable[Dict[str, Any]],
+        live: Iterable[Signal],
+    ) -> Dict[str, Any]:
+        active_signals = []
+        for signal in live:
+            if signal.type in {
+                SignalType.USER_FACT.value,
+                SignalType.STAFF_COVERAGE.value,
+                SignalType.MENU_TOGGLE.value,
+                SignalType.STOCKOUT_RISK.value,
+                SignalType.COMPETITOR_UPDATE.value,
+                SignalType.COMPETITOR_INTEL.value,
+                SignalType.REVIEW_INSIGHT.value,
+                SignalType.WEATHER_UPDATE.value,
+            }:
+                active_signals.append(
+                    {
+                        "type": signal.type,
+                        "source": signal.source,
+                        "payload": signal.payload,
+                        "expires_at": signal.expires_at,
+                    }
+                )
+        return {
+            "has_active_signals": bool(active_signals),
+            "active_signals": active_signals[:20],
+            "items_with_material_multipliers": [
+                int(entry["item"].id)
+                for entry in prepared
+                if DemandForecaster._has_material_change_evidence(entry.get("multipliers") or {})
+            ],
         }
 
     @staticmethod
@@ -1725,6 +2383,8 @@ class DemandForecaster(BaseAgent):
         hard_override: Optional[int],
         optimized: bool,
         trigger_reason: str,
+        deterministic_recommendation: Optional[Dict[str, Any]] = None,
+        finalizer_decision: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         adjustments = [
             {
@@ -1752,6 +2412,8 @@ class DemandForecaster(BaseAgent):
                 "window": window,
             },
             "baseline": {"qty": round(float(baseline), 2), "source": "historical_or_settings"},
+            "deterministic_recommendation": deterministic_recommendation or {},
+            "llm_final_decision": finalizer_decision or {},
             "adjustments": adjustments,
             "constraints": constraints,
             "final": {
@@ -1770,6 +2432,8 @@ class DemandForecaster(BaseAgent):
 
     @staticmethod
     def _modifier_source(key: str) -> str:
+        if key == "voice_constraint":
+            return "voice"
         if key == "authority_override":
             return "authority_resolver"
         if key.startswith("llm"):
@@ -1780,6 +2444,8 @@ class DemandForecaster(BaseAgent):
 
     @staticmethod
     def _modifier_stage(key: str) -> str:
+        if key == "voice_constraint":
+            return "feasibility"
         if key == "authority_override":
             return "authority"
         if key in {"availability", "staff_coverage"}:
@@ -1790,7 +2456,13 @@ class DemandForecaster(BaseAgent):
 
     @staticmethod
     def _modifier_operation(key: str, value: float) -> str:
-        if float(value) <= 0 and key in {"availability", "staff_coverage", "llm_override", "authority_override"}:
+        if float(value) <= 0 and key in {
+            "availability",
+            "staff_coverage",
+            "voice_constraint",
+            "llm_override",
+            "authority_override",
+        }:
             return "hard_zero_production"
         if key == "llm_target":
             return "set_target"
@@ -1800,6 +2472,8 @@ class DemandForecaster(BaseAgent):
     def _zero_reason(hard_override: Optional[int], multipliers: Dict[str, float]) -> Optional[str]:
         if hard_override != 0:
             return None
+        if float(multipliers.get("voice_constraint", 1.0)) <= 0:
+            return "voice_constraint"
         if float(multipliers.get("availability", 1.0)) <= 0:
             return "availability_blocked"
         if float(multipliers.get("staff_coverage", 1.0)) <= 0:
@@ -1865,7 +2539,7 @@ class DemandForecaster(BaseAgent):
 
     @staticmethod
     def _counts_toward_latent_demand(key: str, value: float) -> bool:
-        if key in {"availability", "staff_coverage"}:
+        if key in {"availability", "staff_coverage", "voice_constraint"}:
             return False
         if key in {"llm_override", "authority_override"} and value <= 0:
             return False
@@ -1911,6 +2585,19 @@ def forecast_window_matches(candidate: Dict[str, Any], window: Dict[str, float])
         )
     except (TypeError, ValueError):
         return False
+
+
+def singularize_token(value: str) -> str:
+    token = value.strip().lower()
+    if token in {"desert", "deserts"}:
+        return "dessert"
+    if token.endswith("ies"):
+        return token[:-3] + "y"
+    if token.endswith("ses"):
+        return token[:-2]
+    if token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
 
 
 def nearest_int(value: float) -> int:

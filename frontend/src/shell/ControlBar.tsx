@@ -1,7 +1,9 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   Bell,
+  CheckCircle2,
   Mic,
   Pause,
   PhoneOff,
@@ -35,6 +37,7 @@ import type {
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8];
 const CONDITIONS: WeatherCondition[] = ["clear", "clouds", "rain", "storm", "snow"];
 const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const VOICE_TIMEOUT_MS = 15000;
 
 // ---------------------------------------------------------------------------
 // Display helpers (pure formatting of server state — not business logic)
@@ -54,6 +57,123 @@ function formatSimTime(sim: SimState | null): string {
   const tod = sim.time_of_day ?? secondsToHHMM(t % 86400);
   const dow = DOW[(sim.day_of_week ?? day % 7) % 7];
   return `Day ${day} · ${dow} · ${tod}`;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        window.clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type VoiceExtraction = {
+  intent?: string;
+  entity_type?: string;
+  entity_ref?: string | number | null;
+  attribute?: string;
+  value?: unknown;
+  effective_window?: { start?: number; end?: number } | null;
+  confidence?: number;
+};
+
+type VoiceResponse = {
+  extracted?: VoiceExtraction;
+  resulting_writes?: string[];
+  signal_id?: string | null;
+  error?: string;
+};
+
+function voiceResponse(result: unknown): VoiceResponse | null {
+  if (!isRecord(result)) return null;
+  return result as VoiceResponse;
+}
+
+function voiceActionLabel(extracted: VoiceExtraction | undefined): string {
+  if (!extracted) return "Awaiting interpretation";
+  const attribute = String(extracted.attribute ?? "");
+  const value = extracted.value;
+  const action = isRecord(value) ? String(value.action ?? "") : String(value ?? "");
+  if (attribute === "production_unavailable" || action === "halt_production") {
+    return "Production locked to zero";
+  }
+  if (attribute === "overstock" || action === "reduce_forecast") {
+    return "Forecast locked to zero";
+  }
+  if (extracted.intent === "add_event") return "Demand event added";
+  if (extracted.intent === "set_operational_constraint") return "Operational constraint stored";
+  return String(extracted.intent ?? "Stored");
+}
+
+function voiceTargetLabel(extracted: VoiceExtraction | undefined): string {
+  const target = extracted?.entity_ref;
+  return target == null || target === "" ? "restaurant operation" : String(target);
+}
+
+function voiceWindowLabel(window: VoiceExtraction["effective_window"]): string {
+  if (!window || window.start == null || window.end == null) return "No active window";
+  return `${secondsToHHMM(window.start)}–${secondsToHHMM(window.end)}`;
+}
+
+function VoiceResultCard({ result }: { result: unknown }) {
+  const response = voiceResponse(result);
+  if (!response) return null;
+  if (response.error) {
+    return (
+      <div className="flex min-h-7 items-center gap-2 rounded-md border border-danger/40 bg-danger/10 px-2 py-1 text-xs text-danger">
+        <div className="flex items-center gap-1.5 font-medium">
+          <AlertTriangle size={14} />
+          Voice request failed
+        </div>
+        <div className="truncate text-danger/80">{response.error}</div>
+      </div>
+    );
+  }
+
+  const extracted = response.extracted;
+  const confidence = Math.round(Number(extracted?.confidence ?? 0) * 100);
+  const writes = response.resulting_writes ?? [];
+  const intent = extracted?.intent ? String(extracted.intent).replaceAll("_", " ") : null;
+
+  return (
+    <div className="flex min-h-8 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-accent/30 bg-primary/70 px-2 py-1 text-xs">
+      <div className="flex min-w-0 items-center gap-1.5 font-medium text-text">
+        <CheckCircle2 size={14} className="shrink-0 text-success" />
+        <span className="truncate">{voiceActionLabel(extracted)}</span>
+      </div>
+      {intent && (
+        <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-semibold uppercase text-white">
+          {intent}
+        </span>
+      )}
+      <span className="truncate text-text/65">
+        {voiceTargetLabel(extracted)} · {voiceWindowLabel(extracted?.effective_window)}
+      </span>
+      <span className="text-text/45">{confidence}%</span>
+      <span className="truncate text-text/45">{writes.length ? writes.join(", ") : "stored"}</span>
+      {response.signal_id && (
+        <span className="hidden truncate text-[10px] text-text/35 xl:inline">{response.signal_id}</span>
+      )}
+      <details className="relative ml-auto text-text/45">
+        <summary className="cursor-pointer text-[10px] uppercase">Details</summary>
+        <pre className="absolute right-0 z-40 mt-1 max-h-44 w-[min(34rem,80vw)] overflow-auto rounded-md border border-muted bg-surface p-2 text-[10px] shadow-xl">
+          {JSON.stringify(result, null, 2)}
+        </pre>
+      </details>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +250,7 @@ function MicButton({ onResult }: { onResult: (text: string) => void }) {
 
 function Section({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-0.5">
       <span className="text-[10px] font-semibold uppercase tracking-wide text-text/40">
         {label}
       </span>
@@ -283,7 +403,7 @@ function VoiceConsole() {
       <div className="flex min-w-[22rem] flex-col gap-1 rounded-md border border-accent bg-surface p-2">
         <div className="flex items-center justify-between">
           <span className="text-sm font-semibold text-accent">
-            🎭 You are playing: {counterparty}
+            You are playing: {counterparty}
             {activeCall.counterparty_id != null
               ? ` #${activeCall.counterparty_id}`
               : ""}
@@ -347,31 +467,28 @@ function VoiceConsole() {
     if (!value || busy) return;
     setBusy(true);
     try {
-      const res = await apiPost<unknown>("/api/voice/transcript", { text: value });
+      const res = await withTimeout(
+        apiPost<unknown>("/api/voice/transcript", { text: value }),
+        VOICE_TIMEOUT_MS,
+        "Voice request timed out",
+      );
       setResult(res);
-    } catch {
-      setResult({ error: "Voice request failed" });
+    } catch (err) {
+      setResult({ error: err instanceof Error ? err.message : "Voice request failed" });
     } finally {
       setBusy(false);
     }
   }
 
-  const intent =
-    result != null &&
-    typeof result === "object" &&
-    "extracted" in (result as Record<string, unknown>)
-      ? ((result as { extracted?: { intent?: string } }).extracted?.intent ?? null)
-      : null;
-
   return (
-    <div className="flex min-w-[20rem] flex-col gap-1">
+    <div className="flex min-w-[22rem] max-w-[42rem] flex-1 flex-col gap-1">
       <div className="flex items-start gap-1">
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
           rows={1}
           placeholder={`e.g. "There's a parade on our street this Monday"`}
-          className="h-8 flex-1 resize-y rounded-md border border-muted bg-primary px-2 py-1 text-sm text-text outline-none focus:border-accent"
+          className="h-8 flex-1 resize-none rounded-md border border-muted bg-primary px-2 py-1 text-sm text-text outline-none focus:border-accent"
         />
         <MicButton onResult={(t) => setText(t)} />
         <button
@@ -384,21 +501,7 @@ function VoiceConsole() {
           <Send size={16} />
         </button>
       </div>
-      {result != null && (
-        <div className="rounded bg-primary/60 p-2 text-xs">
-          {intent && (
-            <div className="mb-1 text-text">
-              Intent:{" "}
-              <span className="rounded bg-accent px-1.5 py-0.5 font-medium text-white">
-                {intent}
-              </span>
-            </div>
-          )}
-          <pre className="max-h-24 overflow-auto text-text/60">
-            {JSON.stringify(result, null, 2)}
-          </pre>
-        </div>
-      )}
+      {result != null && <VoiceResultCard result={result} />}
     </div>
   );
 }
@@ -687,103 +790,85 @@ export function ControlBar({
 
   return (
     <header className="sticky top-0 z-30 border-b border-muted bg-surface">
-      <div className="flex min-h-18 flex-wrap items-end gap-4 px-4 py-2">
-        <Section label="Transport">
-          <TransportButton
-            onClick={() => void sim("play")}
-            title="Play"
-            active={status === "running" && !pendingAction}
-            disabled={isBusy || status === "running"}
-            pending={pendingAction === "play"}
-          >
-            <Play size={16} />
-          </TransportButton>
-          <TransportButton
-            onClick={() => void sim("pause")}
-            title="Pause"
-            active={status === "paused" && !pendingAction}
-            disabled={isBusy || status === "stopped"}
-            pending={pendingAction === "pause"}
-          >
-            <Pause size={16} />
-          </TransportButton>
-          <TransportButton
-            onClick={() => void sim("stop")}
-            title="Stop"
-            disabled={isBusy || status === "stopped"}
-            pending={pendingAction === "stop"}
-          >
-            <Square size={16} />
-          </TransportButton>
-          <TransportButton
-            onClick={() => void sim("restart")}
-            title="Restart"
-            disabled={isBusy}
-            pending={pendingAction === "restart"}
-          >
-            <RotateCcw
-              size={16}
-              className={
-                pendingAction === "restart" ? "animate-spin" : undefined
-              }
-            />
-          </TransportButton>
-          <TransportButton
-            onClick={() => void sim("step")}
-            title="Step"
-            disabled={isBusy || status === "running"}
-            pending={pendingAction === "step"}
-          >
-            <StepForward size={16} />
-          </TransportButton>
-        </Section>
-
-        <Section label="Speed">
-          {SPEEDS.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => void setSpeed(s)}
-              className={
-                "rounded-md px-2 py-1.5 text-xs font-medium transition-colors " +
-                (speed === s
-                  ? "bg-accent text-white"
-                  : "bg-muted text-text hover:bg-muted/70")
-              }
+      <div className="flex flex-col gap-2 px-3 py-2">
+        <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+          <Section label="Transport">
+            <TransportButton
+              onClick={() => void sim("play")}
+              title="Play"
+              active={status === "running" && !pendingAction}
+              disabled={isBusy || status === "running"}
+              pending={pendingAction === "play"}
             >
-              {s}×
-            </button>
-          ))}
-        </Section>
+              <Play size={16} />
+            </TransportButton>
+            <TransportButton
+              onClick={() => void sim("pause")}
+              title="Pause"
+              active={status === "paused" && !pendingAction}
+              disabled={isBusy || status === "stopped"}
+              pending={pendingAction === "pause"}
+            >
+              <Pause size={16} />
+            </TransportButton>
+            <TransportButton
+              onClick={() => void sim("stop")}
+              title="Stop"
+              disabled={isBusy || status === "stopped"}
+              pending={pendingAction === "stop"}
+            >
+              <Square size={16} />
+            </TransportButton>
+            <TransportButton
+              onClick={() => void sim("restart")}
+              title="Restart"
+              disabled={isBusy}
+              pending={pendingAction === "restart"}
+            >
+              <RotateCcw
+                size={16}
+                className={
+                  pendingAction === "restart" ? "animate-spin" : undefined
+                }
+              />
+            </TransportButton>
+            <TransportButton
+              onClick={() => void sim("step")}
+              title="Step"
+              disabled={isBusy || status === "running"}
+              pending={pendingAction === "step"}
+            >
+              <StepForward size={16} />
+            </TransportButton>
+          </Section>
 
-        <Section label="Sim time">
-          <span className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium tabular-nums text-text">
-            {pendingAction === "restart" ? "Restarting…" : formatSimTime(simState)}
-          </span>
-          <StatusPill status={status} pendingAction={pendingAction} />
-        </Section>
+          <Section label="Speed">
+            <select
+              value={speed}
+              onChange={(event) => void setSpeed(Number(event.target.value))}
+              className="h-8 rounded-md border border-muted bg-primary px-2 text-sm font-medium text-text outline-none focus:border-accent"
+            >
+              {SPEEDS.map((s) => (
+                <option key={s} value={s}>
+                  {s}×
+                </option>
+              ))}
+            </select>
+          </Section>
 
-        <Section label="Velocity">
-          <VelocitySlider />
-        </Section>
+          <Section label="Sim time">
+            <span className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium tabular-nums text-text">
+              {pendingAction === "restart" ? "Restarting…" : formatSimTime(simState)}
+            </span>
+            <StatusPill status={status} pendingAction={pendingAction} />
+          </Section>
 
-        <Section label="Scenario">
-          <ScenarioPicker />
-        </Section>
+          <div className="min-w-[22rem] flex-1">
+            <Section label="Voice console">
+              <VoiceConsole />
+            </Section>
+          </div>
 
-        <Section label="Seed preset">
-          <SeedPicker />
-        </Section>
-
-        <Section label="Weather override">
-          <WeatherOverride />
-        </Section>
-
-        <Section label="Voice console">
-          <VoiceConsole />
-        </Section>
-
-        <div className="ml-auto flex items-end gap-3">
           <Section label="WS">
             <span
               className={
@@ -821,6 +906,23 @@ export function ControlBar({
               {approvals.length}
             </span>
           </button>
+        </div>
+
+        <div className="flex flex-wrap items-end gap-x-4 gap-y-2 border-t border-muted/60 pt-2">
+          <div className="min-w-[24rem] flex-1">
+            <Section label="Weather override">
+              <WeatherOverride />
+            </Section>
+          </div>
+          <Section label="Velocity">
+            <VelocitySlider />
+          </Section>
+          <Section label="Scenario">
+            <ScenarioPicker />
+          </Section>
+          <Section label="Seed preset">
+            <SeedPicker />
+          </Section>
         </div>
       </div>
     </header>

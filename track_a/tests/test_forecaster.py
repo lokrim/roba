@@ -1,18 +1,23 @@
 import pytest
 
 from core.models import (
+    ApprovalRequest,
     Batch,
     DemandForecasterMemory,
     EventLog,
     Forecast,
     ForecastAdjustment,
+    ForecastJob,
     ForecastOverride,
     ForecastTrace,
+    MenuItem,
     Signal,
     SimSettings,
 )
+from core.approvals import ApprovalsHub
 from core.signals import SignalType
 from track_a.agents.forecaster import DemandForecaster
+from track_a.forecast_jobs import DETERMINISTIC_FORECAST, LLM_FINALIZER, ForecastJobRunner
 
 
 class FakeSuggestionLLM:
@@ -64,6 +69,68 @@ class FakeTargetForecastLLM:
             "memory_updates": ["Cold storm pattern lowered demand for this run."],
             "confidence": 0.82,
         }
+
+
+class FakeDessertTargetForecastLLM:
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **_kwargs):
+        return {
+            "item_adjustments": [
+                {
+                    "menu_item_id": 3,
+                    "forecast": 9,
+                    "reason": "Dessert demand is normally strong.",
+                    "confidence": 0.86,
+                }
+            ],
+            "global_notes": [],
+            "memory_updates": [],
+            "confidence": 0.86,
+        }
+
+
+class FakeFinalizerAcceptLLM:
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **_kwargs):
+        return {
+            "item_final_forecasts": [
+                {
+                    "menu_item_id": 1,
+                    "final_qty": 4,
+                    "confidence": 0.91,
+                    "decision": "accept_deterministic",
+                    "changed": False,
+                    "reason": "Deterministic recommendation is well supported.",
+                    "evidence": ["stable deterministic context"],
+                }
+            ],
+            "global_notes": [],
+            "memory_updates": [],
+            "confidence": 0.91,
+        }
+
+
+class FakeFinalizerUnjustifiedChangeLLM:
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **_kwargs):
+        return {
+            "item_final_forecasts": [
+                {
+                    "menu_item_id": 1,
+                    "final_qty": 99,
+                    "confidence": 0.95,
+                    "decision": "adjust",
+                    "changed": True,
+                    "reason": "Unexplained demand surge.",
+                    "evidence": [],
+                }
+            ],
+            "global_notes": [],
+            "memory_updates": [],
+            "confidence": 0.95,
+        }
+
+
+class FailingForecastLLM:
+    def complete(self, *_args, **_kwargs):
+        raise AssertionError("regular forecasts must not call the remote LLM")
 
 
 def test_forecast_applies_multipliers_and_explains(bus, session_factory, seeded):
@@ -331,6 +398,48 @@ def test_forecaster_suggestions_use_llm(bus, session_factory, seeded):
     assert result["suggestions"][0]["action"] == "resize"
 
 
+def test_llm_finalizer_accepts_deterministic_recommendation(bus, session_factory, seeded):
+    agent = DemandForecaster(bus, session_factory, llm=FakeFinalizerAcceptLLM())
+    agent.run_forecast("manual", optimize=True)
+
+    session = session_factory()
+    try:
+        stored = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        assert stored.forecast_qty == 5
+        assert stored.multipliers["llm_finalizer"] == 1.0
+        trace = session.query(ForecastTrace).filter(ForecastTrace.forecast_id == stored.id).one()
+        assert trace.trace["deterministic_recommendation"]["forecast_qty"] == 5
+        assert trace.trace["llm_final_decision"]["decision"] == "accept_deterministic"
+    finally:
+        session.close()
+
+
+def test_llm_finalizer_rejects_unjustified_material_change(bus, session_factory, seeded):
+    agent = DemandForecaster(bus, session_factory, llm=FakeFinalizerUnjustifiedChangeLLM())
+    agent.run_forecast("manual", optimize=True)
+
+    session = session_factory()
+    try:
+        stored = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        assert stored.forecast_qty == 5
+        assert stored.multipliers["llm_finalizer"] == 1.0
+    finally:
+        session.close()
+
+
+def test_regular_forecast_skips_llm_finalizer(bus, session_factory, seeded):
+    agent = DemandForecaster(bus, session_factory, llm=FailingForecastLLM())
+    agent.run_forecast("manual")
+
+    session = session_factory()
+    try:
+        stored = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        assert stored is not None
+        assert "llm_finalizer" not in stored.multipliers
+    finally:
+        session.close()
+
+
 def test_manual_llm_optimization_writes_memory(bus, session_factory, seeded):
     agent = DemandForecaster(bus, session_factory, llm=FakeOptimizerLLM())
     agent.optimize_forecast("test")
@@ -394,5 +503,286 @@ def test_manual_llm_target_persists_as_active_override(bus, session_factory, see
         )
         assert log.detail["multipliers"]["authority_override"] == 1.0
         assert log.detail["trace"]["summary"] == "Storm conditions soften dine-in demand."
+    finally:
+        session.close()
+
+
+def test_voice_overstock_constraint_persists_as_user_override(bus, session_factory, seeded):
+    session = session_factory()
+    try:
+        session.add(
+            MenuItem(
+                id=3,
+                name="Tiramisu",
+                category="dessert",
+                station_id=1,
+                dine_in_price=8.0,
+                online_price=9.0,
+                prep_time_min=4.0,
+                is_batchable=0,
+                active=1,
+                weather_tags=["cold"],
+                description="Mascarpone dessert",
+            )
+        )
+        settings = session.get(SimSettings, 1)
+        settings.dish_mix_weights = {"1": 2.0, "2": 1.0, "3": 2.0}
+        session.commit()
+    finally:
+        session.close()
+
+    signal = bus.emit(
+        SignalType.USER_FACT,
+        {
+            "intent": "set_operational_constraint",
+            "entity_type": "menu_item_or_category",
+            "entity_ref": "desserts",
+            "attribute": "overstock",
+            "value": {"action": "reduce_forecast", "target_qty": 0},
+            "effective_window": {"start": 28800.0, "end": 39600.0},
+            "raw_text": "Desserts are overstocked today",
+        },
+        source="voice",
+        ttl=10800.0,
+    )
+
+    agent = DemandForecaster(bus, session_factory)
+    agent.on_signal(signal)
+    agent.run_forecast("manual")
+
+    session = session_factory()
+    try:
+        override = session.query(ForecastOverride).filter(ForecastOverride.menu_item_id == 3).one()
+        assert override.source == "voice"
+        assert override.authority == "user_instruction"
+        assert "overstocked" in override.reason
+
+        latest = (
+            session.query(Forecast)
+            .filter(Forecast.menu_item_id == 3)
+            .order_by(Forecast.generated_at.desc(), Forecast.id.desc())
+            .first()
+        )
+        assert latest.trigger_reason == "manual"
+        assert latest.forecast_qty == 0
+    finally:
+        session.close()
+
+
+def test_voice_no_more_deserts_possible_persists_as_user_override(bus, session_factory, seeded):
+    session = session_factory()
+    try:
+        session.add(
+            MenuItem(
+                id=3,
+                name="Tiramisu",
+                category="dessert",
+                station_id=1,
+                dine_in_price=8.0,
+                online_price=9.0,
+                prep_time_min=4.0,
+                is_batchable=0,
+                active=1,
+                weather_tags=["cold"],
+                description="Mascarpone dessert",
+            )
+        )
+        settings = session.get(SimSettings, 1)
+        settings.dish_mix_weights = {"1": 2.0, "2": 1.0, "3": 2.0}
+        session.commit()
+    finally:
+        session.close()
+
+    signal = bus.emit(
+        SignalType.USER_FACT,
+        {
+            "intent": "set_operational_constraint",
+            "entity_type": "menu_item_or_category",
+            "entity_ref": "deserts",
+            "attribute": "production_unavailable",
+            "value": {"action": "halt_production", "target_qty": 0},
+            "effective_window": {"start": 28800.0, "end": 39600.0},
+            "raw_text": "No more deserts possible",
+        },
+        source="voice",
+        ttl=10800.0,
+    )
+
+    agent = DemandForecaster(bus, session_factory)
+    agent.on_signal(signal)
+    agent.run_forecast("manual")
+
+    session = session_factory()
+    try:
+        override = session.query(ForecastOverride).filter(ForecastOverride.menu_item_id == 3).one()
+        assert override.source == "voice"
+        assert override.authority == "user_instruction"
+        assert "unavailable" in override.reason
+
+        latest = (
+            session.query(Forecast)
+            .filter(Forecast.menu_item_id == 3)
+            .order_by(Forecast.generated_at.desc(), Forecast.id.desc())
+            .first()
+        )
+        assert latest.trigger_reason == "manual"
+        assert latest.forecast_qty == 0
+        assert latest.multipliers["voice_constraint"] == 0.0
+        assert latest.multipliers["authority_override"] == 0.0
+
+        log = next(
+            row for row in session.query(EventLog).filter(EventLog.category == "forecast").all()
+            if row.detail.get("forecast_id") == latest.id
+        )
+        assert log.detail["trace"]["final"]["zero_reason"] == "voice_constraint"
+        assert "unavailable" in log.detail["trace"]["summary"]
+    finally:
+        session.close()
+
+
+def test_voice_constraint_survives_later_llm_target_override(bus, session_factory, seeded):
+    session = session_factory()
+    try:
+        session.add(
+            MenuItem(
+                id=3,
+                name="Tiramisu",
+                category="dessert",
+                station_id=1,
+                dine_in_price=8.0,
+                online_price=9.0,
+                prep_time_min=4.0,
+                is_batchable=0,
+                active=1,
+                weather_tags=["cold"],
+                description="Mascarpone dessert",
+            )
+        )
+        settings = session.get(SimSettings, 1)
+        settings.dish_mix_weights = {"1": 2.0, "2": 1.0, "3": 2.0}
+        session.commit()
+    finally:
+        session.close()
+
+    signal = bus.emit(
+        SignalType.USER_FACT,
+        {
+            "intent": "set_operational_constraint",
+            "entity_type": "menu_item_or_category",
+            "entity_ref": "desserts",
+            "attribute": "production_unavailable",
+            "value": {"action": "halt_production", "target_qty": 0},
+            "effective_window": {"start": 28800.0, "end": 39600.0},
+            "raw_text": "No desserts possible",
+        },
+        source="voice",
+        ttl=10800.0,
+    )
+
+    agent = DemandForecaster(bus, session_factory, llm=FakeDessertTargetForecastLLM())
+    agent.on_signal(signal)
+    agent.optimize_forecast("manual")
+    agent.run_forecast("manual")
+
+    session = session_factory()
+    try:
+        voice_override = (
+            session.query(ForecastOverride)
+            .filter(
+                ForecastOverride.menu_item_id == 3,
+                ForecastOverride.source == "voice",
+                ForecastOverride.authority == "user_instruction",
+            )
+            .one()
+        )
+        assert voice_override.status == "active"
+
+        latest = (
+            session.query(Forecast)
+            .filter(Forecast.menu_item_id == 3)
+            .order_by(Forecast.generated_at.desc(), Forecast.id.desc())
+            .first()
+        )
+        assert latest.forecast_qty == 0
+        assert latest.multipliers["voice_constraint"] == 0.0
+        assert latest.multipliers.get("llm_target") is None
+    finally:
+        session.close()
+
+
+def test_llm_finalizer_job_creates_approval_not_override(bus, session_factory, seeded):
+    agent = DemandForecaster(bus, session_factory, llm=FakeTargetForecastLLM())
+    approvals = ApprovalsHub(bus, session_factory)
+    runner = ForecastJobRunner(bus, session_factory, agent, approvals)
+
+    job = runner.enqueue(LLM_FINALIZER, trigger_reason="manual_llm_review", requested_by="user")
+    runner._run_job(job["job_id"])
+
+    session = session_factory()
+    try:
+        approvals_rows = session.query(ApprovalRequest).filter(
+            ApprovalRequest.type == "forecast_override_proposal"
+        ).all()
+        assert len(approvals_rows) == 1
+        assert approvals_rows[0].payload["menu_item_id"] == 1
+        assert approvals_rows[0].payload["operation"] == "set_target"
+        assert session.query(ForecastOverride).count() == 0
+        assert session.query(Forecast).count() == 0
+
+        stored_job = session.query(ForecastJob).filter(ForecastJob.job_id == job["job_id"]).one()
+        assert stored_job.status == "succeeded"
+        assert stored_job.result["needs_approval"] is True
+    finally:
+        session.close()
+
+
+def test_approved_llm_proposal_persists_override_and_reforecasts(bus, session_factory, seeded):
+    agent = DemandForecaster(bus, session_factory, llm=FakeTargetForecastLLM())
+    approvals = ApprovalsHub(bus, session_factory)
+    runner = ForecastJobRunner(bus, session_factory, agent, approvals)
+    bus.subscribe(SignalType.APPROVAL_RESOLVED, runner.on_approval_resolved)
+
+    job = runner.enqueue(LLM_FINALIZER, trigger_reason="manual_llm_review", requested_by="user")
+    runner._run_job(job["job_id"])
+
+    session = session_factory()
+    try:
+        approval = session.query(ApprovalRequest).filter(
+            ApprovalRequest.type == "forecast_override_proposal"
+        ).one()
+        approval_id = approval.id
+    finally:
+        session.close()
+
+    approvals.approve(approval_id)
+
+    session = session_factory()
+    try:
+        override = session.query(ForecastOverride).filter(ForecastOverride.menu_item_id == 1).one()
+        assert override.source == "llm"
+        assert override.authority == "approved_llm"
+        assert override.operation == "set_target"
+        assert override.value == {"qty": 4}
+        deterministic_job = (
+            session.query(ForecastJob)
+            .filter(ForecastJob.kind == DETERMINISTIC_FORECAST, ForecastJob.status == "queued")
+            .one()
+        )
+        deterministic_job_id = deterministic_job.job_id
+    finally:
+        session.close()
+
+    runner._run_job(deterministic_job_id)
+
+    session = session_factory()
+    try:
+        latest = (
+            session.query(Forecast)
+            .filter(Forecast.menu_item_id == 1)
+            .order_by(Forecast.generated_at.desc(), Forecast.id.desc())
+            .first()
+        )
+        assert latest.forecast_qty == 4
+        assert latest.multipliers["authority_override"] == 1.0
     finally:
         session.close()

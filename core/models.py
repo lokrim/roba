@@ -650,6 +650,29 @@ class ApprovalRequest(Base):
                 f"status={self.status!r} title={self.title!r}>")
 
 
+class ForecastJob(Base):
+    __tablename__ = "forecast_jobs"
+
+    id = _pk()
+    job_id = mapped_column(String, unique=True, index=True)
+    kind = mapped_column(String)               # deterministic_forecast | llm_finalizer
+    status = mapped_column(String)             # queued | running | succeeded | failed | superseded | stale
+    sim_time = mapped_column(Float)
+    daypart = mapped_column(String)
+    window = mapped_column(JSON)
+    requested_by = mapped_column(String)
+    trigger_reason = mapped_column(String)
+    created_at = mapped_column(Float)
+    started_at = mapped_column(Float, nullable=True)
+    finished_at = mapped_column(Float, nullable=True)
+    error = mapped_column(Text, nullable=True)
+    result = mapped_column(JSON)
+
+    def __repr__(self):
+        return (f"<ForecastJob id={self.id} job_id={self.job_id!r} "
+                f"kind={self.kind!r} status={self.status!r}>")
+
+
 class Promotion(Base):
     __tablename__ = "promotions"
 
@@ -829,7 +852,7 @@ INTELLIGENCE_MODELS = [
     Forecast, ForecastOverride, ForecastTrace, ForecastAdjustment,
     DemandForecasterMemory, Signal, CompetitorIntel, Review, ReviewInsight,
     SupplierPriceHistory, Negotiation,
-    ApprovalRequest, Promotion, UserFact, WeatherLog, Call,
+    ApprovalRequest, ForecastJob, Promotion, UserFact, WeatherLog, Call,
 ]
 
 CONTROL_MODELS = [

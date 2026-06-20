@@ -6,6 +6,9 @@ import type { TrackASnapshot } from "./types";
 const REFRESH_EVENTS = [
   "signal_emitted",
   "forecast_updated",
+  "forecast_job_updated",
+  "approval_created",
+  "approval_resolved",
   "batch_decided",
   "competitor_update",
   "competitor_intel",

@@ -31,6 +31,7 @@ export type ApprovalType =
   | "menu_change"
   | "promo"
   | "outbound_call"
+  | "forecast_override_proposal"
   | "other";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";

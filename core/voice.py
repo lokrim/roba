@@ -153,7 +153,34 @@ class VoiceProcessor:
             "effective_window": extracted.get("effective_window"),
             "confidence": float(extracted.get("confidence") or 0.0),
         }
+        if out["intent"] == "set_operational_constraint" and not out["effective_window"]:
+            low = raw_text.lower()
+            out["effective_window"] = self._window_from_text(low) or self._default_constraint_window()
+        if self._is_unavailable_constraint_shape(out):
+            out["attribute"] = "production_unavailable"
+            out["value"] = {
+                "action": "halt_production",
+                "target_qty": 0,
+                "raw_value": out.get("value"),
+                "raw_text": raw_text,
+            }
         return out
+
+    @staticmethod
+    def _is_unavailable_constraint_shape(extracted: Dict[str, Any]) -> bool:
+        if extracted.get("intent") != "set_operational_constraint":
+            return False
+        attribute = str(extracted.get("attribute") or "").lower()
+        value = extracted.get("value")
+        value_text = str(value).strip().lower()
+        return attribute in {"availability", "available", "production_available"} and value_text in {
+            "false",
+            "0",
+            "no",
+            "none",
+            "unavailable",
+            "not available",
+        }
 
     # -- regex fallback (§11 — best-effort for obvious intents) ------------
 
@@ -218,6 +245,40 @@ class VoiceProcessor:
                 "confidence": 0.6,
             }
 
+        # set_operational_constraint: "no desserts possible" / "we cannot make tiramisu"
+        if self._looks_like_unavailable_menu_constraint(low):
+            target = self._unavailable_target(text, low)
+            return {
+                "intent": "set_operational_constraint",
+                "entity_type": "menu_item_or_category",
+                "entity_ref": target,
+                "attribute": "production_unavailable",
+                "value": {
+                    "action": "halt_production",
+                    "target_qty": 0,
+                    "raw_text": text,
+                },
+                "effective_window": self._window_from_text(low) or self._default_constraint_window(),
+                "confidence": 0.7,
+            }
+
+        # set_operational_constraint: "desserts are overstocked" / "too much tiramisu"
+        if self._looks_like_overstock_constraint(low):
+            target = self._overstock_target(text, low)
+            return {
+                "intent": "set_operational_constraint",
+                "entity_type": "menu_item_or_category",
+                "entity_ref": target,
+                "attribute": "overstock",
+                "value": {
+                    "action": "reduce_forecast",
+                    "target_qty": 0,
+                    "raw_text": text,
+                },
+                "effective_window": self._window_from_text(low) or self._default_constraint_window(),
+                "confidence": 0.65,
+            }
+
         # add_inventory_count: "we have 12 kg of flour left" / "count ..."
         if "count" in low or ("we have" in low and " of " in low) or "stock of" in low:
             count = self._parse_count(text, low)
@@ -280,6 +341,72 @@ class VoiceProcessor:
             target = m.group(1).strip(" .,'\"")
             if target and target.lower() not in {"the", "all", "possible", "station"}:
                 return target
+        return low
+
+    @staticmethod
+    def _looks_like_unavailable_menu_constraint(low: str) -> bool:
+        unavailable = (
+            "no more", "not possible", "impossible", "can't make", "cannot make",
+            "cant make", "unable to make", "not available", "unavailable",
+            "stop making", "halt", "pause",
+        )
+        food_context = (
+            "dessert", "desert", "pizza", "pasta", "salad", "beverage",
+            "dish", "item", "menu", "tiramisu",
+        )
+        no_possible = re.search(r"\bno\s+(?:more\s+)?[a-z0-9 '&-]+\s+possible\b", low) is not None
+        return (no_possible or any(word in low for word in unavailable)) and any(
+            word in low for word in food_context
+        )
+
+    @staticmethod
+    def _unavailable_target(text: str, low: str) -> str:
+        patterns = [
+            r"no\s+(?:more\s+)?([A-Za-z0-9 '&-]+?)(?:\s+(?:possible|available|today|tonight|now|$)|$)",
+            r"([A-Za-z0-9 '&-]+?)\s+(?:is|are|was|were)?\s*(?:not possible|impossible|unavailable|not available)",
+            r"(?:can't|cannot|cant|unable to|stop|halt|pause)\s+(?:make|making|serve|serving|prep|prepping)?\s*([A-Za-z0-9 '&-]+)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if not m:
+                continue
+            target = m.group(1).strip(" .,'\"")
+            if target and target.lower() not in {"we", "have", "the", "our", "make", "making"}:
+                return target
+        for category in ("desserts", "deserts", "dessert", "desert", "pizza", "pasta", "salad", "beverage", "beverages"):
+            if category in low:
+                return category
+        return low
+
+    @staticmethod
+    def _looks_like_overstock_constraint(low: str) -> bool:
+        overstock_words = (
+            "overstock", "over-stock", "over stocked", "overstocked",
+            "too much", "too many", "excess", "surplus", "overproduced",
+            "over-produced",
+        )
+        production_words = ("forecast", "prep", "prepare", "make", "produce", "stock", "inventory")
+        return any(word in low for word in overstock_words) and any(
+            word in low for word in production_words
+        )
+
+    @staticmethod
+    def _overstock_target(text: str, low: str) -> str:
+        patterns = [
+            r"(?:too much|too many|excess|surplus)\s+([A-Za-z0-9 '&-]+?)(?:\s+(?:stock|inventory|prep|prepared|today|for|$)|$)",
+            r"([A-Za-z0-9 '&-]+?)\s+(?:is|are|was|were)\s+(?:overstocked|over-stocked|over stocked|overproduced|over-produced)",
+            r"(?:overstocked|over-stocked|over stocked|overproduced|over-produced)\s+([A-Za-z0-9 '&-]+)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if not m:
+                continue
+            target = m.group(1).strip(" .,'\"")
+            if target and target.lower() not in {"we", "have", "the", "our"}:
+                return target
+        for category in ("desserts", "dessert", "pizza", "pasta", "salad", "beverage", "beverages"):
+            if category in low:
+                return category
         return low
 
     # -- regex helpers ------------------------------------------------------
@@ -370,6 +497,14 @@ class VoiceProcessor:
             return time_window
 
         return None
+
+    def _default_constraint_window(self) -> Dict[str, float]:
+        now = float(self.bus.sim_time)
+        day_number = int(now // SECONDS_PER_DAY)
+        end = float(day_number * SECONDS_PER_DAY + DAY_CLOSE_OFFSET)
+        if end <= now:
+            end = float((day_number + 1) * SECONDS_PER_DAY + DAY_CLOSE_OFFSET)
+        return {"start": now, "end": end}
 
     @staticmethod
     def _time_range_from_text(low: str) -> Optional[tuple[float, float]]:

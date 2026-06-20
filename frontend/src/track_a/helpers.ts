@@ -10,7 +10,7 @@ export function stationName(data: TrackASnapshot, id: number) {
 
 export function latestForecasts(data: TrackASnapshot) {
   const now = data.sim_state?.sim_time;
-  const liveForecasts = forecastsFromLiveSignals(data);
+  const liveForecasts = forecastsFromLiveSignals(data, now);
   const source =
     liveForecasts.length > 0
       ? liveForecasts
@@ -25,9 +25,15 @@ export function latestForecasts(data: TrackASnapshot) {
   return Array.from(byItem.values()).sort((a, b) => a.menu_item_id - b.menu_item_id);
 }
 
-function forecastsFromLiveSignals(data: TrackASnapshot): Forecast[] {
+function forecastsFromLiveSignals(data: TrackASnapshot, now?: number): Forecast[] {
   return data.signals
-    .filter((signal) => signal.type === "DEMAND_FORECAST" && signal.status === "live")
+    .filter((signal) => {
+      if (signal.type !== "DEMAND_FORECAST" || signal.status !== "live") return false;
+      if (now == null) return true;
+      const createdAt = Number(signal.created_at ?? 0);
+      const expiresAt = signal.expires_at == null ? null : Number(signal.expires_at);
+      return createdAt <= now && (expiresAt == null || expiresAt > now);
+    })
     .map((signal, index) => {
       const payload = signal.payload;
       const menuItemId = Number(payload.menu_item_id);

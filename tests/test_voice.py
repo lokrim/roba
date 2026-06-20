@@ -27,6 +27,19 @@ class FakeEventLLM:
         }
 
 
+class FakeAvailabilityLLM:
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site=""):
+        return {
+            "intent": "set_operational_constraint",
+            "entity_type": "menu_category",
+            "entity_ref": "desserts",
+            "attribute": "availability",
+            "value": False,
+            "effective_window": {},
+            "confidence": 0.95,
+        }
+
+
 @pytest.fixture
 def seeded(bus, session_factory, monkeypatch):
     """An in-memory DB loaded with the Bella's Kitchen preset + a voice
@@ -131,6 +144,46 @@ def test_station_absence_is_stored_as_operational_constraint(seeded):
 
     assert result["extracted"]["intent"] == "set_operational_constraint"
     assert result["extracted"]["value"]["all_qualified_staff"] is True
+    assert result["signal_id"] is not None
+
+
+def test_overstock_voice_note_is_operational_forecast_constraint(seeded):
+    voice, _session_factory = seeded
+    result = voice.process("Desserts are overstocked today")
+
+    assert result["extracted"]["intent"] == "set_operational_constraint"
+    assert result["extracted"]["entity_ref"] == "Desserts"
+    assert result["extracted"]["attribute"] == "overstock"
+    assert result["extracted"]["value"]["action"] == "reduce_forecast"
+    assert result["signal_id"] is not None
+
+
+def test_no_more_desserts_gets_default_unavailable_window(seeded):
+    voice, _session_factory = seeded
+    voice.bus.sim_time = 38100.0
+
+    result = voice.process("No desserts possible.")
+
+    assert result["extracted"]["intent"] == "set_operational_constraint"
+    assert result["extracted"]["entity_ref"] == "desserts"
+    assert result["extracted"]["attribute"] == "production_unavailable"
+    assert result["extracted"]["value"]["action"] == "halt_production"
+    assert result["extracted"]["effective_window"] == {"start": 38100.0, "end": 82800.0}
+    assert result["signal_id"] is not None
+
+
+def test_llm_availability_false_normalises_to_production_unavailable(seeded):
+    voice, _session_factory = seeded
+    voice.llm = FakeAvailabilityLLM()
+    voice.bus.sim_time = 29880.0
+
+    result = voice.process("No desserts possible.")
+
+    assert result["extracted"]["intent"] == "set_operational_constraint"
+    assert result["extracted"]["entity_ref"] == "desserts"
+    assert result["extracted"]["attribute"] == "production_unavailable"
+    assert result["extracted"]["value"]["action"] == "halt_production"
+    assert result["extracted"]["effective_window"] == {"start": 29880.0, "end": 82800.0}
     assert result["signal_id"] is not None
 
 

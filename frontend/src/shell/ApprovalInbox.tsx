@@ -24,6 +24,30 @@ function PayloadPreview({ payload }: { payload: unknown }) {
   );
 }
 
+function ForecastProposalPreview({ payload }: { payload: unknown }) {
+  if (!payload || typeof payload !== "object") return <PayloadPreview payload={payload} />;
+  const proposal = payload as Record<string, unknown>;
+  return (
+    <div className="mt-2 rounded-md border border-muted bg-primary/50 p-2 text-xs text-text/70">
+      <div className="grid grid-cols-2 gap-2">
+        <span className="text-text/45">Item</span>
+        <span className="font-medium text-text">{String(proposal.item_name ?? proposal.menu_item_id ?? "Unknown")}</span>
+        <span className="text-text/45">Operation</span>
+        <span>{String(proposal.operation ?? "set_target").replaceAll("_", " ")}</span>
+        <span className="text-text/45">Final qty</span>
+        <span>{String(proposal.qty ?? "0")}</span>
+        <span className="text-text/45">Confidence</span>
+        <span>{Math.round(Number(proposal.confidence ?? 0) * 100)}%</span>
+      </div>
+      {proposal.evidence ? (
+        <pre className="mt-2 max-h-20 overflow-auto rounded bg-primary/60 p-2 text-[11px] text-text/60">
+          {JSON.stringify(proposal.evidence, null, 2)}
+        </pre>
+      ) : null}
+    </div>
+  );
+}
+
 function ApprovalCard({ approval }: { approval: ApprovalRequest }) {
   const [busy, setBusy] = useState(false);
 
@@ -49,7 +73,11 @@ function ApprovalCard({ approval }: { approval: ApprovalRequest }) {
         </div>
       </div>
       <p className="mt-1 text-sm text-text/70">{approval.summary}</p>
-      <PayloadPreview payload={approval.payload} />
+      {approval.type === "forecast_override_proposal" ? (
+        <ForecastProposalPreview payload={approval.payload} />
+      ) : (
+        <PayloadPreview payload={approval.payload} />
+      )}
       <div className="mt-3 flex gap-2">
         <button
           type="button"

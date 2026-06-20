@@ -212,7 +212,13 @@ def test_restart_reseeds_active_preset_and_clears_runtime_rows():
 
         forecast = client.post("/api/track-a/forecast/run")
         assert forecast.status_code == 200, forecast.text
-        assert client.get("/api/forecasts").json()
+        forecasts = []
+        for _ in range(40):
+            forecasts = client.get("/api/forecasts").json()
+            if forecasts:
+                break
+            time.sleep(0.05)
+        assert forecasts
 
         restart = client.post("/api/sim/restart")
         assert restart.status_code == 200, restart.text

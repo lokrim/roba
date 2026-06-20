@@ -44,6 +44,7 @@ from .seeding import Seeder
 from .signals import SignalType
 from .voice import VoiceProcessor
 from .weather import WeatherProvider
+from track_a.forecast_jobs import DETERMINISTIC_FORECAST, LLM_FINALIZER, ForecastJobRunner
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,7 @@ class AppContext:
         self.formatter: Optional[DataFormatter] = None
         self.pos: Optional[POSSimulator] = None
         self.scenarios: Optional[ScenarioEngine] = None
+        self.forecast_jobs: Optional[ForecastJobRunner] = None
         self.hub: WebSocketHub = WebSocketHub()
         self.loop_task: Optional[asyncio.Task] = None
         self.track_a: Dict[str, Any] = {}
@@ -261,6 +263,27 @@ def _bootstrap() -> None:
         logger.exception("Track A failed to bootstrap")
         ctx.track_a = {}
 
+    forecaster = ctx.track_a.get("forecaster")
+    if forecaster is not None:
+        forecast_jobs = ForecastJobRunner(
+            bus=bus,
+            db_session_factory=factory,
+            forecaster=forecaster,
+            approvals=approvals,
+            ws_broadcast=sink,
+        )
+        forecaster.set_forecast_job_enqueue(
+            lambda kind, reason: forecast_jobs.enqueue(
+                kind,
+                trigger_reason=reason,
+                requested_by="signal" if reason.startswith("signal:") else "interval",
+            )
+        )
+        bus.subscribe(SignalType.APPROVAL_RESOLVED, forecast_jobs.on_approval_resolved)
+        ctx.forecast_jobs = forecast_jobs
+    else:
+        ctx.forecast_jobs = None
+
     ctx.bus = bus
     ctx.clock = clock
     ctx.orchestrator = orchestrator
@@ -280,6 +303,8 @@ async def lifespan(app: FastAPI):
     """Bootstrap on startup; start the tick loop; clean up on shutdown."""
     _bootstrap()
     await ctx.hub.start()
+    if ctx.forecast_jobs is not None:
+        ctx.forecast_jobs.start()
     assert ctx.orchestrator is not None
     ctx.loop_task = asyncio.create_task(
         ctx.orchestrator.run_loop(ctx.hub.broadcast_events)
@@ -287,6 +312,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if ctx.forecast_jobs is not None:
+            ctx.forecast_jobs.stop()
         if ctx.orchestrator is not None:
             ctx.orchestrator.stop_loop()
         if ctx.loop_task is not None:
@@ -562,6 +589,14 @@ def _apply_bundle_singletons(data: Dict[str, Any], preset_id: Optional[str]) -> 
                 setattr(settings, field, bundle_settings[field])
 
 
+def _sync_bus_to_clock() -> Dict[str, Any]:
+    """Keep SignalBus time aligned with the authoritative sim_state row."""
+    state = ctx.clock.current_state()
+    if ctx.bus is not None:
+        ctx.bus.sim_time = float(state.get("sim_time") or 0.0)
+    return state
+
+
 def _bundle_summary(data: Dict[str, Any]) -> Dict[str, Any]:
     """Return a per-table row count for an inserted seed bundle."""
     return {
@@ -591,7 +626,9 @@ def seed_preset(preset_id: str) -> Dict[str, Any]:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         _apply_bundle_singletons(data, preset_id)
         ctx.scenarios.seed_default_scenario()
-    return {"preset_id": preset_id, "inserted": _bundle_summary(data)}
+        state = _sync_bus_to_clock()
+    ctx.hub.broadcast("sim_state_changed", state)
+    return {"preset_id": preset_id, "inserted": _bundle_summary(data), "sim_state": state}
 
 
 @app.post("/api/seed/generate")
@@ -602,7 +639,9 @@ def seed_generate(body: GenerateBody) -> Dict[str, Any]:
         data = ctx.seeder.generate(body.cuisine, body.size_params)
         _apply_bundle_singletons(data, None)
         ctx.scenarios.seed_default_scenario()
-    return {"cuisine": body.cuisine, "inserted": _bundle_summary(data)}
+        state = _sync_bus_to_clock()
+    ctx.hub.broadcast("sim_state_changed", state)
+    return {"cuisine": body.cuisine, "inserted": _bundle_summary(data), "sim_state": state}
 
 
 # ===========================================================================
@@ -893,6 +932,12 @@ def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
             models.ForecastAdjustment.created_at.desc(),
             300,
         ),
+        "forecast_jobs": _read_rows(
+            db_session,
+            models.ForecastJob,
+            models.ForecastJob.created_at.desc(),
+            20,
+        ),
         "forecast_reasoning": _read_rows(
             db_session,
             models.EventLog,
@@ -919,24 +964,42 @@ def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
 
 @app.post("/api/track-a/forecast/run")
 def track_a_run_forecast() -> Dict[str, Any]:
-    forecaster = _track_a_agent("forecaster")
-    with db.DB_LOCK:
-        forecasts = forecaster.run_forecast("manual")
-    return {"created": len(forecasts)}
+    _track_a_agent("forecaster")
+    if ctx.forecast_jobs is None:
+        raise HTTPException(status_code=503, detail="Forecast job runner is not available")
+    _sync_bus_to_clock()
+    job = ctx.forecast_jobs.enqueue(
+        DETERMINISTIC_FORECAST,
+        trigger_reason="manual",
+        requested_by="user",
+    )
+    return {"job_id": job["job_id"], "status": job["status"], "job": job}
+
+
+@app.post("/api/track-a/forecast/finalize")
+def track_a_finalize_forecast() -> Dict[str, Any]:
+    _track_a_agent("forecaster")
+    if ctx.forecast_jobs is None:
+        raise HTTPException(status_code=503, detail="Forecast job runner is not available")
+    _sync_bus_to_clock()
+    job = ctx.forecast_jobs.enqueue(
+        LLM_FINALIZER,
+        trigger_reason="manual_llm_review",
+        requested_by="user",
+    )
+    return {"job_id": job["job_id"], "status": job["status"], "job": job}
 
 
 @app.post("/api/track-a/forecast/optimize")
 def track_a_optimize_forecast() -> Dict[str, Any]:
-    forecaster = _track_a_agent("forecaster")
-    with db.DB_LOCK:
-        forecasts = forecaster.optimize_forecast("manual")
-    return {"created": len(forecasts), "optimized": True}
+    return track_a_finalize_forecast()
 
 
 @app.post("/api/track-a/forecast/auto-mode")
 def track_a_forecast_auto_mode(body: TrackAForecastAutoBody) -> Dict[str, Any]:
     forecaster = _track_a_agent("forecaster")
     with db.DB_LOCK:
+        _sync_bus_to_clock()
         return forecaster.set_auto_mode(body.enabled)
 
 
@@ -1004,6 +1067,7 @@ def reject_approval(approval_id: int) -> Dict[str, Any]:
 
 @app.post("/api/voice/transcript")
 def voice_transcript(body: VoiceBody) -> Dict[str, Any]:
+    _sync_bus_to_clock()
     return ctx.voice.process(body.text)
 
 

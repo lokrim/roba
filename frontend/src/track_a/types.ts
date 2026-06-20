@@ -27,6 +27,8 @@ export interface ForecastTrace {
   version?: number;
   scope?: Record<string, unknown>;
   baseline?: Record<string, unknown>;
+  deterministic_recommendation?: Record<string, unknown>;
+  llm_final_decision?: Record<string, unknown>;
   adjustments?: Array<Record<string, unknown>>;
   constraints?: Array<Record<string, unknown>>;
   final?: Record<string, unknown>;
@@ -93,6 +95,30 @@ export interface ForecastAdjustment {
   reason: string;
   evidence: Record<string, unknown>;
   created_at: number;
+}
+
+export interface ForecastJob {
+  id: number;
+  job_id: string;
+  kind: "deterministic_forecast" | "llm_finalizer" | string;
+  status: "queued" | "running" | "succeeded" | "failed" | "superseded" | "stale" | string;
+  sim_time: number;
+  daypart: string;
+  window: { start: number; end: number };
+  requested_by: string;
+  trigger_reason: string;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  error: string | null;
+  result: {
+    approval_ids?: number[];
+    needs_approval?: boolean;
+    proposals?: unknown[];
+    created?: number;
+    reason?: string;
+    [key: string]: unknown;
+  } | null;
 }
 
 export interface Batch {
@@ -229,6 +255,7 @@ export interface TrackASnapshot {
   forecast_overrides: ForecastOverride[];
   forecast_traces: ForecastTraceRow[];
   forecast_adjustments: ForecastAdjustment[];
+  forecast_jobs: ForecastJob[];
   forecast_reasoning: EventLog[];
   competitors: Competitor[];
   competitor_offers: CompetitorOffer[];
