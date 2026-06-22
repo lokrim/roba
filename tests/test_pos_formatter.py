@@ -149,6 +149,60 @@ def test_pos_sim_creates_orders_and_lines(wired):
     assert lines >= 1
 
 
+def test_pos_tick_catches_up_multiple_due_orders(wired):
+    sim, _formatter, bus, session_factory, _item_ids = wired
+    sim._rng = random.Random(11)
+    sim_time = 12 * 3600
+    bus.sim_time = sim_time
+
+    session = session_factory()
+    try:
+        settings = session.get(SimSettings, 1)
+        settings.base_orders_per_day = 100000
+        settings.velocity = 1.0
+        session.commit()
+    finally:
+        session.close()
+
+    sim.next_order_due = sim_time - 60.0
+    assert sim.tick(sim_time) is not None
+
+    session = session_factory()
+    try:
+        orders = session.query(Order).count()
+    finally:
+        session.close()
+
+    assert 1 < orders <= 25
+
+
+def test_pos_invalid_settings_fall_back_to_safe_sampling(wired):
+    sim, _formatter, bus, session_factory, _item_ids = wired
+    sim._rng = random.Random(3)
+    sim_time = 12 * 3600
+    bus.sim_time = sim_time
+
+    session = session_factory()
+    try:
+        settings = session.get(SimSettings, 1)
+        settings.channel_mix = {"dine_in": 0, "delivery": -1, "bad": "nope"}
+        settings.dish_mix_weights = {"bad": "nope", "999": -1}
+        settings.anomaly_injections = [
+            {"start": "bad", "end": 100.0, "velocity_mult": 99},
+            {"start": 0.0, "end": 86400.0, "velocity_mult": "bad", "dish_mix_skew": {"1": "bad"}},
+        ]
+        session.commit()
+    finally:
+        session.close()
+
+    generated = sim.generate_order(sim_time)
+
+    assert generated is not None
+    order, lines = generated
+    assert order.channel in {"dine_in", "delivery", "takeout"}
+    assert lines
+
+
 def test_item_velocity_positive_after_orders(wired):
     """After processing sold lines, item_velocity is a positive float."""
     sim, formatter, bus, session_factory, item_ids = wired
@@ -312,6 +366,7 @@ def test_active_injections_window_bounds():
     assert active_injections(inj, 500.0) == [inj[2]]
     assert active_injections(inj, 250.0) == []
     assert active_injections(None, 0.0) == []
+    assert active_injections([{"start": "bad", "end": 200.0}], 150.0) == []
 
 
 def test_anomaly_velocity_mult_scales_rate(wired):

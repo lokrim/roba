@@ -29,8 +29,11 @@ from core.models import (
     ForecastAdjustment,
     ForecastOverride,
     ForecastTrace,
+    Ingredient,
     MenuItem,
     OrderLine,
+    Recipe,
+    RecipeLine,
     Signal,
     SimSettings,
     Staff,
@@ -62,6 +65,19 @@ STATION_ALIASES: Dict[str, List[str]] = {
     "bar": ["bar", "drink", "beverage"],
     "fry": ["fry", "fries", "fryer"],
     "grill": ["grill", "burger", "steak", "tandoor"],
+}
+
+LLM_AUTHORITY_FORECAST = "llm_authority_forecast"
+
+MATERIAL_SIGNAL_TYPES = {
+    SignalType.USER_FACT.value,
+    SignalType.STAFF_COVERAGE.value,
+    SignalType.COMPETITOR_UPDATE.value,
+    SignalType.COMPETITOR_INTEL.value,
+    SignalType.REVIEW_INSIGHT.value,
+    SignalType.WEATHER_UPDATE.value,
+    SignalType.MENU_TOGGLE.value,
+    SignalType.STOCKOUT_RISK.value,
 }
 
 
@@ -116,7 +132,12 @@ class DemandForecaster(BaseAgent):
         }:
             if signal.type == SignalType.USER_FACT.value:
                 self._persist_user_forecast_overrides(signal)
-            self._enqueue_or_run_forecast("deterministic_forecast", f"signal:{signal.type}")
+            kind = (
+                LLM_AUTHORITY_FORECAST
+                if self.llm_auto_mode and self._signal_requires_llm_authority(signal)
+                else "deterministic_forecast"
+            )
+            self._enqueue_or_run_forecast(kind, f"signal:{signal.type}")
 
     def set_forecast_job_enqueue(self, fn: Callable[[str, str], Any]) -> None:
         self.forecast_job_enqueue = fn
@@ -124,6 +145,8 @@ class DemandForecaster(BaseAgent):
     def _enqueue_or_run_forecast(self, kind: str, trigger_reason: str) -> Any:
         if self.forecast_job_enqueue is not None:
             return self.forecast_job_enqueue(kind, trigger_reason)
+        if kind == LLM_AUTHORITY_FORECAST:
+            return self.run_forecast(trigger_reason, optimize=True, optimize_batches=False)
         if kind == "llm_finalizer":
             return self.optimize_forecast(trigger_reason)
         return self.run_forecast(trigger_reason, optimize=False)
@@ -141,6 +164,29 @@ class DemandForecaster(BaseAgent):
         )
         return {"enabled": self.llm_auto_mode}
 
+    def _should_use_llm_authority(self, live: Iterable[Signal]) -> bool:
+        if not self.llm_auto_mode:
+            return False
+        return any(self._signal_requires_llm_authority(signal) for signal in live)
+
+    @staticmethod
+    def _signal_requires_llm_authority(signal: Signal) -> bool:
+        if signal.type not in MATERIAL_SIGNAL_TYPES:
+            return False
+        payload = signal.payload or {}
+        if signal.type == SignalType.USER_FACT.value:
+            return payload.get("intent") in {
+                "add_event",
+                "set_operational_constraint",
+                "set_leave",
+                "set_attendance",
+            }
+        if signal.type == SignalType.STAFF_COVERAGE.value:
+            return payload.get("covered") is False
+        if signal.type == SignalType.COMPETITOR_UPDATE.value:
+            return bool(payload.get("offers_changed") or payload.get("is_open") is False)
+        return True
+
     # ------------------------------------------------------------------
     # Public forecast and batch API
     # ------------------------------------------------------------------
@@ -149,6 +195,7 @@ class DemandForecaster(BaseAgent):
         self,
         trigger_reason: str = "manual",
         optimize: bool = False,
+        optimize_batches: Optional[bool] = None,
     ) -> List[Forecast]:
         """Forecast every active menu item and emit integer demand signals."""
         now = float(self.bus.sim_time)
@@ -158,6 +205,7 @@ class DemandForecaster(BaseAgent):
         row_summaries: List[Dict[str, Any]] = []
         after_commit: List[Tuple[str, Any]] = []
         run_id = forecast_run_id(now, daypart, window, trigger_reason)
+        llm_fallback = False
 
         session = self.db_session_factory()
         try:
@@ -174,7 +222,9 @@ class DemandForecaster(BaseAgent):
             for prepared_item in prepared:
                 self._finalize_deterministic_recommendation(session, prepared_item, daypart, window, now)
 
-            llm_plan = self._llm_plan(session, prepared, live, daypart, window) if optimize else {}
+            authority_required = bool(optimize) or self._should_use_llm_authority(live)
+            llm_plan = self._llm_plan(session, prepared, live, daypart, window) if authority_required else {}
+            llm_fallback = bool(authority_required and not llm_plan)
             if llm_plan:
                 self._queue_llm_plan_memory(llm_plan, after_commit)
 
@@ -188,6 +238,13 @@ class DemandForecaster(BaseAgent):
                 llm_decision = self._final_decision_for(llm_plan, item.id)
                 llm_adjustment = {} if llm_decision else self._adjustment_for(llm_plan, item.id)
                 used_llm_decision = bool(llm_decision or llm_adjustment)
+
+                if llm_fallback:
+                    multipliers["llm_fallback"] = 1.0
+                    explanations["llm_fallback"] = (
+                        "LLM authority was requested but unavailable or invalid; "
+                        "deterministic forecast published as fallback."
+                    )
 
                 if llm_decision:
                     hard_override = self._apply_llm_final_decision(
@@ -241,7 +298,18 @@ class DemandForecaster(BaseAgent):
                     optimized=used_llm_decision,
                     trigger_reason=trigger_reason,
                     deterministic_recommendation=deterministic_recommendation,
-                    finalizer_decision=llm_decision or llm_adjustment or None,
+                    finalizer_decision=(
+                        llm_decision
+                        or llm_adjustment
+                        or (
+                            {
+                                "decision": "fallback_deterministic",
+                                "reason": explanations["llm_fallback"],
+                            }
+                            if llm_fallback
+                            else None
+                        )
+                    ),
                 )
                 forecast = Forecast(
                     menu_item_id=item.id,
@@ -288,6 +356,7 @@ class DemandForecaster(BaseAgent):
                     "explanations": explanations,
                     "hard_override": hard_override,
                     "optimized": used_llm_decision,
+                    "llm_fallback": llm_fallback,
                     "trigger": trigger_reason,
                     "trace": trace,
                 }
@@ -331,8 +400,11 @@ class DemandForecaster(BaseAgent):
             session.close()
 
         self._run_after_commit(after_commit)
-        self._remember_run_summary(row_summaries, optimize, trigger_reason)
-        self.decide_batches(trigger_reason, optimize=optimize)
+        self._remember_run_summary(row_summaries, optimize or (not llm_fallback and bool(llm_plan)), trigger_reason)
+        self.decide_batches(
+            trigger_reason,
+            optimize=bool(optimize if optimize_batches is None else optimize_batches),
+        )
         return rows
 
     def optimize_forecast(self, trigger_reason: str = "manual") -> List[Forecast]:
@@ -1107,7 +1179,6 @@ class DemandForecaster(BaseAgent):
             session.query(ForecastOverride)
             .filter(
                 ForecastOverride.menu_item_id == item_id,
-                ForecastOverride.daypart == daypart,
                 ForecastOverride.status == "active",
                 ForecastOverride.source == "voice",
                 ForecastOverride.authority == "user_instruction",
@@ -1121,26 +1192,11 @@ class DemandForecaster(BaseAgent):
             if float(row.valid_until or 0.0) <= now:
                 row.status = "expired"
                 continue
-            if forecast_window_matches(row.window or {}, window):
+            if windows_overlap(row.window or {}, window):
                 candidates.append(row)
         if not candidates:
             return None
-        for row in candidates:
-            if (
-                row.source == "voice"
-                and row.authority == "user_instruction"
-                and row.operation == "hard_zero_production"
-            ):
-                return row
-        return sorted(candidates, key=self._override_priority, reverse=True)[0]
-
-    @staticmethod
-    def _override_priority(row: ForecastOverride) -> Tuple[int, float, int]:
-        authority_rank = 3 if row.authority == "user_instruction" else 2 if row.authority else 1
-        voice_rank = 2 if row.source == "voice" else 1
-        hard_zero_rank = 1 if row.operation == "hard_zero_production" else 0
-        created = float(row.created_at or 0.0)
-        return (authority_rank + voice_rank + hard_zero_rank, created, int(row.id or 0))
+        return candidates[0]
 
     def _vague_capacity_constraint(
         self,
@@ -1322,8 +1378,8 @@ class DemandForecaster(BaseAgent):
             if not windows_overlap(window, fact_window):
                 return
             window = {
-                "start": max(float(window["start"]), float(fact_window.get("start", window["start"]))),
-                "end": min(float(window["end"]), float(fact_window["end"])),
+                "start": max(now, float(fact_window.get("start", window["start"]))),
+                "end": float(fact_window["end"]),
             }
 
         session = self.db_session_factory()
@@ -1388,6 +1444,20 @@ class DemandForecaster(BaseAgent):
         )
 
     def _items_for_user_fact(self, session: Any, payload: Dict[str, Any]) -> List[MenuItem]:
+        # Prefer the VoiceProcessor's context-aware resolution. The fallback
+        # token matcher exists only for older USER_FACT payload shapes.
+        explicit_ids = self._affected_item_ids_from_user_fact(payload)
+        if explicit_ids:
+            return (
+                session.query(MenuItem)
+                .filter(MenuItem.active == 1, MenuItem.id.in_(sorted(explicit_ids)))
+                .all()
+            )
+
+        dependency_items = self._items_for_dependency_fact(session, payload)
+        if dependency_items:
+            return dependency_items
+
         target = str(payload.get("entity_ref") or payload.get("raw_text") or "").lower()
         tokens = self._target_tokens(target)
         if not tokens:
@@ -1398,6 +1468,102 @@ class DemandForecaster(BaseAgent):
             if self._item_matches_tokens(item, tokens)
         ]
         return matched
+
+    @staticmethod
+    def _affected_item_ids_from_user_fact(payload: Dict[str, Any]) -> set[int]:
+        value = payload.get("value")
+        candidates: List[Any] = []
+        if isinstance(value, dict):
+            candidates.extend(value.get("affected_menu_item_ids") or [])
+            candidates.extend(value.get("menu_item_ids") or [])
+            candidates.extend(value.get("affected_items") or [])
+        candidates.extend(payload.get("affected_menu_item_ids") or [])
+        ids: set[int] = set()
+        for raw in candidates:
+            try:
+                item_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if item_id > 0:
+                ids.add(item_id)
+        return ids
+
+    def _items_for_dependency_fact(self, session: Any, payload: Dict[str, Any]) -> List[MenuItem]:
+        value = payload.get("value") if isinstance(payload.get("value"), dict) else {}
+        dependency_type = str(value.get("dependency_type") or payload.get("entity_type") or "").lower()
+        dependency_ref = str(value.get("dependency_ref") or payload.get("entity_ref") or "").lower().strip()
+        if not dependency_ref:
+            return []
+        items = session.query(MenuItem).filter(MenuItem.active == 1).all()
+        if "ingredient" in dependency_type or "dependency" in dependency_type:
+            item_ids = self._item_ids_requiring_ingredient(session, dependency_ref)
+            matched = [item for item in items if int(item.id) in item_ids]
+            if matched:
+                return matched
+        if "equipment" in dependency_type or "dependency" in dependency_type:
+            return [
+                item for item in items
+                if self._item_matches_equipment_dependency(session, item, dependency_ref)
+            ]
+        return []
+
+    @staticmethod
+    def _item_ids_requiring_ingredient(session: Any, dependency_ref: str) -> set[int]:
+        target_tokens = {
+            singularize_token(token)
+            for token in re.findall(r"[a-z0-9]+", dependency_ref)
+            if len(token) > 2
+        }
+        if not target_tokens:
+            return set()
+        recipe_to_item = {
+            int(recipe.id): int(recipe.menu_item_id)
+            for recipe in session.query(Recipe).all()
+        }
+        ingredient_names = {
+            int(ingredient.id): str(ingredient.name or "").lower()
+            for ingredient in session.query(Ingredient).all()
+        }
+        item_ids: set[int] = set()
+        for line in session.query(RecipeLine).all():
+            name = ingredient_names.get(int(line.ingredient_id), "")
+            name_tokens = {
+                singularize_token(token)
+                for token in re.findall(r"[a-z0-9]+", name)
+                if len(token) > 2
+            }
+            if target_tokens.intersection(name_tokens):
+                item_id = recipe_to_item.get(int(line.recipe_id))
+                if item_id is not None:
+                    item_ids.add(item_id)
+        return item_ids
+
+    def _item_matches_equipment_dependency(self, session: Any, item: MenuItem, dependency_ref: str) -> bool:
+        station = session.get(Station, item.station_id)
+        haystack = " ".join(
+            str(value or "")
+            for value in (
+                item.name,
+                item.category,
+                item.description,
+                station.name if station is not None else "",
+            )
+        ).lower()
+        tokens = self._target_tokens(dependency_ref)
+        if not tokens:
+            return False
+        if len(tokens) > 1:
+            return all(
+                token in haystack or any(alias in haystack for alias in STATION_ALIASES.get(token, []))
+                for token in tokens
+            )
+        for token in tokens:
+            if token in haystack:
+                return True
+            aliases = STATION_ALIASES.get(token, [])
+            if aliases and any(alias in haystack for alias in aliases):
+                return True
+        return False
 
     @staticmethod
     def _item_matches_tokens(item: MenuItem, tokens: List[str]) -> bool:
@@ -1446,7 +1612,7 @@ class DemandForecaster(BaseAgent):
             if float(row.valid_until or 0.0) <= now:
                 row.status = "expired"
                 continue
-            if forecast_window_matches(row.window or {}, window):
+            if windows_overlap(row.window or {}, window):
                 active_rows.append(row)
         if not active_rows:
             return None
@@ -1524,7 +1690,7 @@ class DemandForecaster(BaseAgent):
                 .all()
             )
             for row in active:
-                if forecast_window_matches(row.window or {}, window):
+                if windows_overlap(row.window or {}, window):
                     if row.authority == "user_instruction" and authority != "user_instruction":
                         continue
                     row.status = "superseded"
@@ -1655,13 +1821,16 @@ class DemandForecaster(BaseAgent):
             },
             "required": ["global_notes", "memory_updates"],
         }
-        result = self.llm.complete(
-            messages,
-            json_schema=schema,
-            max_tokens=1200,
-            use_site="forecaster_optimization",
-            temperature=0.1,
-        )
+        try:
+            result = self.llm.complete(
+                messages,
+                json_schema=schema,
+                max_tokens=1200,
+                use_site="forecaster_optimization",
+                temperature=0.1,
+            )
+        except Exception:  # noqa: BLE001 - deterministic fallback is the contract.
+            return {}
         if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
             return {}
         return result
@@ -1708,13 +1877,16 @@ class DemandForecaster(BaseAgent):
             "properties": {"batch_adjustments": {"type": "array"}},
             "required": ["batch_adjustments"],
         }
-        result = self.llm.complete(
-            messages,
-            json_schema=schema,
-            max_tokens=600,
-            use_site="forecaster_optimization",
-            temperature=0.2,
-        )
+        try:
+            result = self.llm.complete(
+                messages,
+                json_schema=schema,
+                max_tokens=600,
+                use_site="forecaster_optimization",
+                temperature=0.2,
+            )
+        except Exception:  # noqa: BLE001 - batch optimization is optional.
+            return {}
         if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
             return {}
         return result

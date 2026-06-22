@@ -20,8 +20,9 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
+  Trash2,
 } from "lucide-react";
-import { apiPost } from "../api";
+import { apiDelete, apiPost } from "../api";
 import {
   formatBaseline,
   formatQty,
@@ -54,6 +55,8 @@ type ConstraintView = {
   summary: string;
   expiresAt?: number | null;
   tone: "neutral" | "good" | "warn" | "bad" | "accent";
+  deleteKind?: "override" | "signal";
+  deleteId?: number | string;
 };
 
 type LedgerAdjustment = Pick<
@@ -66,6 +69,7 @@ type LedgerAdjustment = Pick<
 export function ForecastDashboard() {
   const { data, loading, error, refresh } = useTrackAData();
   const [busyAction, setBusyAction] = useState<"run" | "finalize" | null>(null);
+  const [deletingConstraintId, setDeletingConstraintId] = useState<string | null>(null);
   const [selectedItemId, setSelectedItemId] = useState<number | null>(null);
 
   async function runForecast() {
@@ -85,6 +89,20 @@ export function ForecastDashboard() {
       await refresh();
     } finally {
       setBusyAction(null);
+    }
+  }
+
+  async function deleteConstraint(constraint: ConstraintView) {
+    if (!constraint.deleteKind || constraint.deleteId == null) return;
+    setDeletingConstraintId(constraint.id);
+    try {
+      await apiDelete(
+        `/api/track-a/constraints/${constraint.deleteKind}/${encodeURIComponent(String(constraint.deleteId))}`,
+      );
+      await apiPost("/api/track-a/forecast/run").catch(() => undefined);
+      await refresh();
+    } finally {
+      setDeletingConstraintId(null);
     }
   }
 
@@ -169,7 +187,11 @@ export function ForecastDashboard() {
             <Metric label="Active constraints" value={formatQty(constraints.length)} icon={<ShieldCheck size={17} />} />
           </div>
 
-          <ActiveConstraintsStrip constraints={constraints} />
+          <ActiveConstraintsStrip
+            constraints={constraints}
+            deletingId={deletingConstraintId}
+            onDelete={deleteConstraint}
+          />
 
           <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-start">
             <div className="h-[348px] rounded-md border border-[#16426e] bg-[#101d39] p-3">
@@ -347,7 +369,15 @@ function PanelTitle({ icon, label }: { icon: ReactNode; label: string }) {
   );
 }
 
-function ActiveConstraintsStrip({ constraints }: { constraints: ConstraintView[] }) {
+function ActiveConstraintsStrip({
+  constraints,
+  deletingId,
+  onDelete,
+}: {
+  constraints: ConstraintView[];
+  deletingId: string | null;
+  onDelete: (constraint: ConstraintView) => void;
+}) {
   return (
     <div className="rounded-md border border-muted bg-primary/30 p-3">
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -360,11 +390,25 @@ function ActiveConstraintsStrip({ constraints }: { constraints: ConstraintView[]
         <div className="text-sm text-text/55">No voice, inventory, staff, or authority constraints are active.</div>
       ) : (
         <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-          {constraints.slice(0, 6).map((constraint) => (
+          {constraints.map((constraint) => (
             <div key={constraint.id} className="rounded-md border border-muted bg-[#10182f] p-3">
               <div className="flex items-center justify-between gap-2">
-                <div className="text-sm font-semibold text-text">{constraint.label}</div>
-                <Pill tone={constraint.tone}>{constraint.source}</Pill>
+                <div className="min-w-0 text-sm font-semibold text-text">{constraint.label}</div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Pill tone={constraint.tone}>{constraint.source}</Pill>
+                  {constraint.deleteKind ? (
+                    <button
+                      type="button"
+                      onClick={() => onDelete(constraint)}
+                      disabled={deletingId === constraint.id}
+                      aria-label={`Remove ${constraint.label} constraint`}
+                      title="Remove constraint"
+                      className="inline-flex size-7 items-center justify-center rounded-md border border-muted bg-primary/55 text-text/60 hover:border-[#ef476f]/70 hover:bg-[#ef476f]/10 hover:text-[#ff8aa5] disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <Trash2 size={14} className={deletingId === constraint.id ? "animate-pulse" : ""} />
+                    </button>
+                  ) : null}
+                </div>
               </div>
               <div className="mt-2 text-xs leading-5 text-text/60">{constraint.summary}</div>
               {constraint.expiresAt != null ? (
@@ -586,9 +630,12 @@ function latestAgentEvents(data: TrackASnapshot): EventLog[] {
 function activeConstraints(data: TrackASnapshot): ConstraintView[] {
   const now = data.sim_state?.sim_time ?? 0;
   const constraints: ConstraintView[] = [];
+  const linkedSignalIds = new Set<string>();
   for (const override of data.forecast_overrides ?? []) {
     if (override.status !== "active") continue;
     if (override.valid_until != null && override.valid_until <= now) continue;
+    const linkedSignalId = typeof override.evidence?.signal_id === "string" ? override.evidence.signal_id : null;
+    if (linkedSignalId) linkedSignalIds.add(linkedSignalId);
     constraints.push({
       id: `override-${override.id}`,
       label: itemName(data, override.menu_item_id),
@@ -596,6 +643,8 @@ function activeConstraints(data: TrackASnapshot): ConstraintView[] {
       summary: override.reason,
       expiresAt: override.valid_until,
       tone: override.source === "voice" ? "accent" : "warn",
+      deleteKind: "override",
+      deleteId: override.id,
     });
   }
   for (const signal of data.signals ?? []) {
@@ -611,6 +660,8 @@ function activeConstraints(data: TrackASnapshot): ConstraintView[] {
         summary: `Ingredient ${String(payload.ingredient_id ?? "unknown")} affects ${affectedNames(data, payload.affected_items)}`,
         expiresAt: signal.expires_at,
         tone: "bad",
+        deleteKind: "signal",
+        deleteId: signal.signal_id,
       });
     } else if (signal.type === "STAFF_COVERAGE" && payload.covered === false) {
       constraints.push({
@@ -620,6 +671,8 @@ function activeConstraints(data: TrackASnapshot): ConstraintView[] {
         summary: `Station ${String(payload.station_id ?? "unknown")} is not covered.`,
         expiresAt: signal.expires_at,
         tone: "warn",
+        deleteKind: "signal",
+        deleteId: signal.signal_id,
       });
     } else if (signal.type === "MENU_TOGGLE" && payload.action === "disable") {
       constraints.push({
@@ -629,8 +682,11 @@ function activeConstraints(data: TrackASnapshot): ConstraintView[] {
         summary: String(payload.reason ?? "Menu item disabled."),
         expiresAt: signal.expires_at,
         tone: "bad",
+        deleteKind: "signal",
+        deleteId: signal.signal_id,
       });
     } else if (signal.type === "USER_FACT" && payload.intent === "set_operational_constraint") {
+      if (linkedSignalIds.has(signal.signal_id)) continue;
       constraints.push({
         id: signal.signal_id,
         label: String(payload.entity_ref ?? "Voice constraint"),
@@ -638,6 +694,8 @@ function activeConstraints(data: TrackASnapshot): ConstraintView[] {
         summary: String(payload.raw_text ?? payload.attribute ?? "Voice operational constraint"),
         expiresAt: signal.expires_at,
         tone: "accent",
+        deleteKind: "signal",
+        deleteId: signal.signal_id,
       });
     }
   }

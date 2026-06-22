@@ -79,6 +79,69 @@ def test_seed_switch_deletes_in_fk_safe_order():
         assert client.get("/api/track-a/snapshot").status_code == 200
 
 
+def test_delete_track_a_constraint_expires_override_and_linked_signal():
+    db.reset_db(keep_reference=False)
+    with TestClient(api.app) as client:
+        seed = client.post("/api/seed/preset/bellas_kitchen")
+        assert seed.status_code == 200, seed.text
+
+        now = api.ctx.clock.sim_time
+        signal_id = "voice-constraint-test"
+        session = db.new_session()
+        try:
+            session.add(
+                models.Signal(
+                    signal_id=signal_id,
+                    type="USER_FACT",
+                    source="voice",
+                    groups=["forecasting", "human"],
+                    priority=3,
+                    payload={
+                        "intent": "set_operational_constraint",
+                        "entity_ref": "pizza oven",
+                        "attribute": "production_unavailable",
+                        "value": {"affected_menu_item_ids": [1]},
+                    },
+                    created_at=now,
+                    expires_at=now + 3600,
+                    dedup_key=None,
+                    status="live",
+                    correlation_id=None,
+                )
+            )
+            override = models.ForecastOverride(
+                menu_item_id=1,
+                daypart="breakfast",
+                window={"start": now, "end": now + 3600},
+                operation="hard_zero_production",
+                value={"qty": 0},
+                reason="Voice instruction marks pizza oven as unavailable.",
+                source="voice",
+                authority="user_instruction",
+                status="active",
+                created_at=now,
+                valid_until=now + 3600,
+                evidence={"signal_id": signal_id},
+            )
+            session.add(override)
+            session.commit()
+            override_id = override.id
+        finally:
+            session.close()
+
+        deleted = client.delete(f"/api/track-a/constraints/override/{override_id}")
+        assert deleted.status_code == 200, deleted.text
+
+        session = db.new_session()
+        try:
+            override = session.get(models.ForecastOverride, override_id)
+            signal = session.get(models.Signal, signal_id)
+            assert override.status == "expired"
+            assert signal.status == "expired"
+        finally:
+            session.close()
+
+
 def test_bootstrap_interval_triggers_start_from_persisted_sim_time():
     db.reset_db(keep_reference=False)
     session = db.new_session()

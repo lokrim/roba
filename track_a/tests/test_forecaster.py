@@ -1,5 +1,6 @@
 import pytest
 
+import track_a.forecast_jobs as forecast_jobs_module
 from core.models import (
     ApprovalRequest,
     Batch,
@@ -15,8 +16,9 @@ from core.models import (
     SimSettings,
 )
 from core.approvals import ApprovalsHub
+from core.llm import CANNED_NOTE
 from core.signals import SignalType
-from track_a.agents.forecaster import DemandForecaster
+from track_a.agents.forecaster import LLM_AUTHORITY_FORECAST, DemandForecaster
 from track_a.forecast_jobs import DETERMINISTIC_FORECAST, LLM_FINALIZER, ForecastJobRunner
 
 
@@ -128,9 +130,228 @@ class FakeFinalizerUnjustifiedChangeLLM:
         }
 
 
+class FakeMaterialFinalizerLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **_kwargs):
+        self.calls += 1
+        return {
+            "item_final_forecasts": [
+                {
+                    "menu_item_id": 1,
+                    "final_qty": 7,
+                    "confidence": 0.88,
+                    "decision": "adjust",
+                    "changed": True,
+                    "reason": "Competitor signal materially changes pizza demand.",
+                    "evidence": ["COMPETITOR_INTEL popular_dishes includes Margherita Pizza"],
+                }
+            ],
+            "global_notes": [],
+            "memory_updates": [],
+            "confidence": 0.88,
+        }
+
+
+class FakeCannedForecastLLM:
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **_kwargs):
+        return {"note": CANNED_NOTE}
+
+
+class FakeHardZeroIgnoringLLM:
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **_kwargs):
+        return {
+            "item_final_forecasts": [
+                {
+                    "menu_item_id": 1,
+                    "final_qty": 9,
+                    "confidence": 0.9,
+                    "decision": "adjust",
+                    "changed": True,
+                    "reason": "Demand is high despite the stockout.",
+                    "evidence": ["demand signal"],
+                }
+            ],
+            "global_notes": [],
+            "memory_updates": [],
+            "confidence": 0.9,
+        }
+
+
 class FailingForecastLLM:
     def complete(self, *_args, **_kwargs):
         raise AssertionError("regular forecasts must not call the remote LLM")
+
+
+class RecordingForecaster:
+    def __init__(self):
+        self.calls = []
+
+    def run_forecast(self, *_args, **_kwargs):
+        self.calls.append((_args, _kwargs))
+        return []
+
+
+class ExplodingLock:
+    def __enter__(self):
+        raise AssertionError("forecast computation must not hold DB_LOCK")
+
+    def __exit__(self, *_args):
+        return False
+
+
+def test_auto_mode_normal_forecast_skips_llm_without_material_context(bus, session_factory, seeded):
+    agent = DemandForecaster(bus, session_factory, llm=FailingForecastLLM())
+    agent.set_auto_mode(True)
+    agent.run_forecast("interval")
+
+    session = session_factory()
+    try:
+        stored = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        assert stored is not None
+        assert "llm_finalizer" not in stored.multipliers
+        assert "llm_fallback" not in stored.multipliers
+    finally:
+        session.close()
+
+
+def test_material_competitor_signal_routes_to_llm_authority(bus, session_factory, seeded):
+    bus.emit(
+        SignalType.COMPETITOR_INTEL,
+        {
+            "competitor_id": 1,
+            "popular_dishes": ["Margherita Pizza"],
+            "price_points": {},
+            "method": "call",
+            "call_id": 1,
+        },
+        source="test",
+    )
+    llm = FakeMaterialFinalizerLLM()
+    agent = DemandForecaster(bus, session_factory, llm=llm)
+    agent.set_auto_mode(True)
+    agent.run_forecast("interval")
+
+    session = session_factory()
+    try:
+        stored = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        trace = session.query(ForecastTrace).filter(ForecastTrace.forecast_id == stored.id).one()
+        assert llm.calls == 1
+        assert stored.forecast_qty == 7
+        assert stored.multipliers["llm_final"] == 1.0
+        assert trace.trace["llm_final_decision"]["decision"] == "adjust"
+    finally:
+        session.close()
+
+
+def test_signal_handler_enqueues_llm_authority_job_for_material_signal(bus, session_factory, seeded):
+    calls = []
+    agent = DemandForecaster(bus, session_factory, llm=FakeMaterialFinalizerLLM())
+    agent.set_auto_mode(True)
+    agent.set_forecast_job_enqueue(lambda kind, reason: calls.append((kind, reason)))
+    signal = bus.emit(
+        SignalType.COMPETITOR_UPDATE,
+        {"competitor_id": 1, "is_open": False, "offers_changed": False, "summary": "closed"},
+        source="test",
+    )
+
+    agent.on_signal(signal)
+
+    assert calls == [(LLM_AUTHORITY_FORECAST, "signal:COMPETITOR_UPDATE")]
+
+
+def test_forecast_job_runner_releases_clock_lock_while_forecasting(
+    bus, session_factory, seeded, monkeypatch
+):
+    forecaster = RecordingForecaster()
+    runner = ForecastJobRunner(bus, session_factory, forecaster, approvals=None)
+    runner._finish = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(forecast_jobs_module.db, "DB_LOCK", ExplodingLock())
+
+    runner._run_deterministic({"job_id": "job-1", "trigger_reason": "manual"})
+
+    assert len(forecaster.calls) == 1
+
+
+def test_llm_authority_fallback_publishes_deterministic_trace(bus, session_factory, seeded):
+    bus.emit(
+        SignalType.COMPETITOR_INTEL,
+        {
+            "competitor_id": 1,
+            "popular_dishes": ["Margherita Pizza"],
+            "price_points": {},
+            "method": "call",
+            "call_id": 1,
+        },
+        source="test",
+    )
+    agent = DemandForecaster(bus, session_factory, llm=FakeCannedForecastLLM())
+    agent.set_auto_mode(True)
+    agent.run_forecast("interval")
+
+    session = session_factory()
+    try:
+        stored = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        trace = session.query(ForecastTrace).filter(ForecastTrace.forecast_id == stored.id).one()
+        assert stored.forecast_qty == 5
+        assert stored.multipliers["llm_fallback"] == 1.0
+        assert trace.trace["llm_final_decision"]["decision"] == "fallback_deterministic"
+    finally:
+        session.close()
+
+
+def test_llm_authority_does_not_overwrite_hard_zero(bus, session_factory, seeded):
+    bus.emit(
+        SignalType.STOCKOUT_RISK,
+        {"ingredient_id": 1, "on_hand": 1.0, "projected_runout": 30000.0, "affected_items": [1]},
+        source="test",
+    )
+    agent = DemandForecaster(bus, session_factory, llm=FakeHardZeroIgnoringLLM())
+    agent.set_auto_mode(True)
+    agent.run_forecast("interval")
+
+    session = session_factory()
+    try:
+        stored = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        assert stored.forecast_qty == 0
+        assert stored.multipliers["availability"] == 0.0
+        assert stored.multipliers["llm_finalizer"] == 1.0
+    finally:
+        session.close()
+
+
+def test_material_signal_keeps_later_interval_runs_llm_authoritative(bus, session_factory, seeded):
+    bus.emit(
+        SignalType.COMPETITOR_INTEL,
+        {
+            "competitor_id": 1,
+            "popular_dishes": ["Margherita Pizza"],
+            "price_points": {},
+            "method": "call",
+            "call_id": 1,
+        },
+        source="test",
+    )
+    llm = FakeMaterialFinalizerLLM()
+    agent = DemandForecaster(bus, session_factory, llm=llm)
+    agent.set_auto_mode(True)
+    agent.run_forecast("interval")
+    agent.run_forecast("interval")
+
+    session = session_factory()
+    try:
+        latest = (
+            session.query(Forecast)
+            .filter(Forecast.menu_item_id == 1)
+            .order_by(Forecast.generated_at.desc(), Forecast.id.desc())
+            .first()
+        )
+        assert llm.calls == 2
+        assert latest.forecast_qty == 7
+        assert latest.multipliers["llm_final"] == 1.0
+    finally:
+        session.close()
 
 
 def test_forecast_applies_multipliers_and_explains(bus, session_factory, seeded):

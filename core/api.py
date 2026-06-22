@@ -1003,6 +1003,88 @@ def track_a_forecast_auto_mode(body: TrackAForecastAutoBody) -> Dict[str, Any]:
         return forecaster.set_auto_mode(body.enabled)
 
 
+def _expire_constraint_override(override: models.ForecastOverride, now: float) -> int:
+    override.status = "expired"
+    override.valid_until = min(float(override.valid_until or now), now)
+    return int(override.id)
+
+
+def _expire_constraint_signal(signal: models.Signal, now: float) -> str:
+    signal.status = "expired"
+    signal.expires_at = min(float(signal.expires_at or now), now)
+    return str(signal.signal_id)
+
+
+def _expire_overrides_for_signal(db_session: Any, signal_id: str, now: float) -> List[int]:
+    expired: List[int] = []
+    rows = db_session.query(models.ForecastOverride).filter(
+        models.ForecastOverride.status == "active"
+    ).all()
+    for override in rows:
+        evidence = override.evidence or {}
+        if str(evidence.get("signal_id") or "") != signal_id:
+            continue
+        expired.append(_expire_constraint_override(override, now))
+    return expired
+
+
+@app.delete("/api/track-a/constraints/{kind}/{identifier}")
+def track_a_delete_constraint(
+    kind: str,
+    identifier: str,
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    _sync_bus_to_clock()
+    now = float(ctx.bus.sim_time if ctx.bus is not None else 0.0)
+    normalized_kind = kind.strip().lower()
+    expired_overrides: List[int] = []
+    expired_signals: List[str] = []
+
+    if normalized_kind == "override":
+        try:
+            override_id = int(identifier)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid override id") from exc
+        with db.DB_LOCK:
+            override = db_session.get(models.ForecastOverride, override_id)
+            if override is None:
+                raise HTTPException(status_code=404, detail=f"Constraint override {override_id} not found")
+            expired_overrides.append(_expire_constraint_override(override, now))
+            evidence = override.evidence or {}
+            signal_id = evidence.get("signal_id")
+            if signal_id:
+                signal = db_session.get(models.Signal, str(signal_id))
+                if signal is not None and signal.status == "live":
+                    expired_signals.append(_expire_constraint_signal(signal, now))
+            db_session.commit()
+    elif normalized_kind == "signal":
+        with db.DB_LOCK:
+            signal = db_session.get(models.Signal, identifier)
+            if signal is None:
+                raise HTTPException(status_code=404, detail=f"Constraint signal {identifier} not found")
+            expired_signals.append(_expire_constraint_signal(signal, now))
+            expired_overrides.extend(_expire_overrides_for_signal(db_session, identifier, now))
+            db_session.commit()
+    else:
+        raise HTTPException(status_code=422, detail="Constraint kind must be override or signal")
+
+    ctx.hub.broadcast(
+        "constraint_deleted",
+        {
+            "kind": normalized_kind,
+            "identifier": identifier,
+            "expired_overrides": expired_overrides,
+            "expired_signals": expired_signals,
+        },
+    )
+    return {
+        "kind": normalized_kind,
+        "identifier": identifier,
+        "expired_overrides": expired_overrides,
+        "expired_signals": expired_signals,
+    }
+
+
 @app.post("/api/track-a/reviews/process")
 def track_a_process_reviews() -> Dict[str, Any]:
     review = _track_a_agent("review")

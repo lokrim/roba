@@ -37,7 +37,8 @@ import type {
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8];
 const CONDITIONS: WeatherCondition[] = ["clear", "clouds", "rain", "storm", "snow"];
 const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const VOICE_TIMEOUT_MS = 15000;
+// Voice extraction can include a real LLM call; keep this above provider timeout.
+const VOICE_TIMEOUT_MS = 45000;
 
 // ---------------------------------------------------------------------------
 // Display helpers (pure formatting of server state — not business logic)

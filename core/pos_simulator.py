@@ -22,6 +22,9 @@ from .models import MenuItem, Order, OrderLine, SimSettings
 # Operating window length used by the Poisson rate (§10): 54000 sim-seconds
 # (08:00–23:00). Kept explicit because the rate formula divides by it verbatim.
 WINDOW_SECONDS = 54000.0
+# Catch up under high simulation speeds without letting one tick flood the DB.
+MAX_ORDERS_PER_TICK = 25
+ZERO_RATE_RETRY_SIM_S = 15.0
 
 
 def _hhmm_to_seconds(hhmm: str) -> int:
@@ -45,12 +48,29 @@ def active_injections(injections: Any, sim_time: float) -> List[dict]:
             continue
         start = inj.get("start")
         end = inj.get("end")
-        if start is not None and sim_time < float(start):
-            continue
-        if end is not None and sim_time >= float(end):
+        try:
+            if start is not None and sim_time < float(start):
+                continue
+            if end is not None and sim_time >= float(end):
+                continue
+        except (TypeError, ValueError):
             continue
         out.append(inj)
     return out
+
+
+def _positive_mapping(raw: Any, fallback: dict) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    normalized = {}
+    for key, value in raw.items():
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            continue
+        if weight > 0:
+            normalized[str(key)] = weight
+    return normalized or dict(fallback)
 
 
 class _Settings:
@@ -71,9 +91,13 @@ class _Settings:
         else:
             self.velocity = 1.0
 
-        self.dish_mix_weights = (row.dish_mix_weights if row is not None else None) or {}
-        self.channel_mix = (
-            (row.channel_mix if row is not None else None) or dict(config.CHANNEL_MIX)
+        self.dish_mix_weights = _positive_mapping(
+            row.dish_mix_weights if row is not None else None,
+            {},
+        )
+        self.channel_mix = _positive_mapping(
+            row.channel_mix if row is not None else None,
+            dict(config.CHANNEL_MIX),
         )
         self.anomaly_injections = (
             (row.anomaly_injections if row is not None else None) or []
@@ -168,15 +192,18 @@ class POSSimulator:
         and then subside at their window's end.
         """
         rate = (
-            settings.base_orders_per_day
-            * settings.velocity
-            * self.daypart_weight(sim_time, settings)
+            max(0.0, settings.base_orders_per_day)
+            * max(0.0, settings.velocity)
+            * max(0.0, self.daypart_weight(sim_time, settings))
             / WINDOW_SECONDS
         )
         for inj in active_injections(settings.anomaly_injections, sim_time):
             mult = inj.get("velocity_mult")
             if mult is not None:
-                rate *= float(mult)
+                try:
+                    rate *= max(0.0, float(mult))
+                except (TypeError, ValueError):
+                    continue
         return rate
 
     def _interval(self, sim_time: float, settings: Optional[_Settings] = None) -> float:
@@ -258,7 +285,12 @@ class POSSimulator:
             for idx, iid in enumerate(population):
                 factor = skew.get(str(iid))
                 if factor is not None:
-                    weights[idx] *= float(factor)
+                    try:
+                        weights[idx] *= max(0.0, float(factor))
+                    except (TypeError, ValueError):
+                        continue
+        if not any(weight > 0 for weight in weights):
+            weights = [1.0] * len(population)
 
         # Channel sampling population, shifted by the current weather condition
         # (§18.5): ``random.choices`` does not require normalised weights, so a
@@ -268,8 +300,11 @@ class POSSimulator:
         shift = self._weather_channel_shift()
         if shift:
             channel_weights = [
-                w * float(shift.get(c, 1.0)) for c, w in zip(channels, channel_weights)
+                w * max(0.0, float(shift.get(c, 1.0))) for c, w in zip(channels, channel_weights)
             ]
+        if not channels or not any(weight > 0 for weight in channel_weights):
+            channels = list(config.CHANNEL_MIX.keys())
+            channel_weights = [float(config.CHANNEL_MIX[c]) for c in channels]
         channel = self._rng.choices(channels, weights=channel_weights, k=1)[0]
 
         # n_lines ~ LINES_PER_ORDER.
@@ -340,42 +375,48 @@ class POSSimulator:
     # -- the tick (§10) -----------------------------------------------------
 
     def tick(self, sim_time: float) -> Optional[Order]:
-        """Generate at most one order when ``sim_time`` reaches the next due
-        arrival; persist it, notify the formatter, and schedule the next.
+        """Generate due orders up to a small safety cap.
 
-        Returns the created :class:`Order` (or ``None`` when not yet due / no
-        order could be generated).
+        At high sim speeds one real tick can cross several Poisson arrivals.
+        Catching those up keeps POS velocity realistic; returning only the last
+        created order preserves the old public shape for callers that ignore it.
         """
         # Lazy init: make the first arrival due immediately.
         if self.next_order_due is None:
             self.next_order_due = sim_time
 
-        if sim_time < self.next_order_due:
-            return None
+        created: Optional[Order] = None
+        generated_count = 0
+        while self.next_order_due is not None and sim_time >= self.next_order_due:
+            if generated_count >= MAX_ORDERS_PER_TICK:
+                break
 
-        # Closed hours / zero-rate gap between dayparts: the Poisson rate is 0
-        # so the inter-arrival is infinite. Do NOT generate an order and do NOT
-        # park ``next_order_due`` at ``inf`` (which would wedge the loop). Just
-        # defer the due time to the next tick so arrivals resume the moment the
-        # rate becomes positive again (e.g. when operating hours reopen).
-        interval = self._interval(sim_time)
-        if not math.isfinite(interval):
-            self.next_order_due = sim_time
-            return None
+            due_at = float(self.next_order_due)
+            interval_at = due_at
+            interval = self._interval(interval_at)
+            if not math.isfinite(interval) and due_at < sim_time:
+                interval_at = sim_time
+                interval = self._interval(interval_at)
+            if not math.isfinite(interval):
+                self.next_order_due = sim_time + ZERO_RATE_RETRY_SIM_S
+                break
 
-        generated = self.generate_order(sim_time)
-        if generated is None:
-            # No active menu items; retry on the next tick.
-            return None
+            generated = self.generate_order(interval_at)
+            self.next_order_due = interval_at + max(interval, 1e-6)
+            if generated is None:
+                # No active menu items; keep time moving instead of retrying
+                # the same due timestamp on every tick.
+                self.next_order_due = max(self.next_order_due, sim_time + 1.0)
+                break
 
-        order, lines = generated
-        self._persist(order, lines)
+            order, lines = generated
+            self._persist(order, lines)
+            if self.formatter is not None:
+                self.formatter.on_order(order, lines)
+            created = order
+            generated_count += 1
 
-        if self.formatter is not None:
-            self.formatter.on_order(order, lines)
-
-        self.next_order_due = sim_time + interval
-        return order
+        return created
 
     # -- orchestrator registration (§10 / §17) -----------------------------
 

@@ -21,6 +21,7 @@ from track_a.agents.forecaster import current_window, forecast_window_matches
 logger = logging.getLogger(__name__)
 
 DETERMINISTIC_FORECAST = "deterministic_forecast"
+LLM_AUTHORITY_FORECAST = "llm_authority_forecast"
 LLM_FINALIZER = "llm_finalizer"
 ACTIVE_STATUSES = {"queued", "running"}
 TERMINAL_STATUSES = {"succeeded", "failed", "superseded", "stale"}
@@ -78,7 +79,7 @@ class ForecastJobRunner:
         trigger_reason: str = "manual",
         requested_by: str = "system",
     ) -> Dict[str, Any]:
-        if kind not in {DETERMINISTIC_FORECAST, LLM_FINALIZER}:
+        if kind not in {DETERMINISTIC_FORECAST, LLM_AUTHORITY_FORECAST, LLM_FINALIZER}:
             raise ValueError(f"Unknown forecast job kind {kind!r}")
 
         now = float(self.bus.sim_time)
@@ -158,13 +159,17 @@ class ForecastJobRunner:
 
         if job["kind"] == DETERMINISTIC_FORECAST:
             self._run_deterministic(job)
+        elif job["kind"] == LLM_AUTHORITY_FORECAST:
+            self._run_llm_authority(job)
         elif job["kind"] == LLM_FINALIZER:
             self._run_llm_finalizer(job)
 
     def _run_deterministic(self, job: Dict[str, Any]) -> None:
         try:
-            with db.DB_LOCK:
-                rows = self.forecaster.run_forecast(job.get("trigger_reason") or "job")
+            # Do not hold DB_LOCK while forecasting. run_forecast may invoke the
+            # LLM when material context is live, and the simulation tick loop
+            # needs the same lock to keep the clock moving.
+            rows = self.forecaster.run_forecast(job.get("trigger_reason") or "job")
             self._finish(
                 job["job_id"],
                 "succeeded",
@@ -172,6 +177,25 @@ class ForecastJobRunner:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Deterministic forecast job failed")
+            self._finish(job["job_id"], "failed", error=str(exc))
+
+    def _run_llm_authority(self, job: Dict[str, Any]) -> None:
+        try:
+            # LLM-authoritative runs are intentionally outside the global
+            # coordinator lock. Job status transitions stay locked via
+            # _start/_finish, but slow model calls must not pause the sim clock.
+            rows = self.forecaster.run_forecast(
+                job.get("trigger_reason") or "job",
+                optimize=True,
+                optimize_batches=False,
+            )
+            self._finish(
+                job["job_id"],
+                "succeeded",
+                result={"created": len(rows), "optimized": True, "authority": "llm"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("LLM authority forecast job failed")
             self._finish(job["job_id"], "failed", error=str(exc))
 
     def _run_llm_finalizer(self, job: Dict[str, Any]) -> None:

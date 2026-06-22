@@ -21,8 +21,9 @@ consumes the ``USER_FACT``).
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from .clock import DAY_CLOSE_OFFSET, DAY_OPEN_OFFSET, SECONDS_PER_DAY
 from .config import EVENT_MULT
@@ -53,7 +54,15 @@ EXTRACTION_SCHEMA: Dict[str, Any] = {
         "entity_type": {"type": "string"},
         "entity_ref": {"type": "string"},
         "attribute": {"type": "string"},
-        "value": {"type": "string"},
+        "value": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "number"},
+                {"type": "boolean"},
+                {"type": "object"},
+                {"type": "array"},
+            ]
+        },
         "effective_window": {"type": "object"},
         "confidence": {"type": "number"},
     },
@@ -105,18 +114,33 @@ class VoiceProcessor:
     def _extract(self, raw_text: str) -> Dict[str, Any]:
         """Ask the LLM to extract the §11 schema; fall back to regex when the
         LLM is unavailable (canned) or returns an unusable result."""
+        context = self._restaurant_context_for_prompt()
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You extract a single operational fact from a restaurant "
-                    "manager's spoken note. Respond with JSON matching: intent, "
-                    "entity_type, entity_ref, attribute, value, "
-                    "effective_window (optional {start_sim,end_sim}), confidence "
-                    "(0..1). intent is one of: " + ", ".join(sorted(INTENTS)) + "."
+                    "You extract one operational fact from a restaurant manager's "
+                    "spoken note. Use the provided menu, recipe, equipment, staff, "
+                    "inventory, and active-constraint context as a semantic map, not "
+                    "an exact string filter. Respond with JSON matching: intent, "
+                    "entity_type, entity_ref, attribute, value, effective_window "
+                    "(optional {start,end}), confidence (0..1). intent is one of: "
+                    + ", ".join(sorted(INTENTS)) + ". For production constraints, "
+                    "value should be an object with action, target_qty when relevant, "
+                    "dependency_type, dependency_ref, affected_menu_item_ids, "
+                    "affected_item_names, and reasoning. Category phrases must "
+                    "cascade to active menu items in that category: 'desserts are "
+                    "over for today' or 'no desserts left' affects dessert items such "
+                    "as Tiramisu. Specific ingredient/modifier phrases stay narrow: "
+                    "'no more bacon burgers' affects bacon-dependent items, not all "
+                    "burgers. Equipment failures affect only items whose station, "
+                    "category, item name, recipe, or equipment context depends on "
+                    "that equipment. Restaurant shorthand such as over, done, "
+                    "finished, 86, sold out, no more, or out of means production is "
+                    "unavailable for the stated window."
                 ),
             },
-            {"role": "user", "content": raw_text},
+            {"role": "user", "content": f"Restaurant context:\n{context}\n\nSpoken note:\n{raw_text}"},
         ]
         result = self.llm.complete(
             messages, json_schema=EXTRACTION_SCHEMA, max_tokens=400, use_site="voice"
@@ -164,7 +188,319 @@ class VoiceProcessor:
                 "raw_value": out.get("value"),
                 "raw_text": raw_text,
             }
+        if out["intent"] == "set_operational_constraint":
+            out = self._enrich_operational_constraint(out, raw_text)
         return out
+
+    def _restaurant_context_for_prompt(self) -> str:
+        """Compact operational context for voice extraction.
+
+        The prompt needs enough structure to reason about dependencies, but it
+        must stay small because voice runs happen interactively.
+        """
+        session = self.db_session_factory()
+        try:
+            menu_rows = self._menu_dependency_rows(session)
+            staff_rows = [
+                {
+                    "id": int(staff.id),
+                    "name": staff.name,
+                    "role": staff.role,
+                    "active": bool(staff.active),
+                }
+                for staff in session.query(Staff).order_by(Staff.id.asc()).all()
+            ][:20]
+            inventory_rows = [
+                {
+                    "ingredient_id": int(level.ingredient_id),
+                    "on_hand": float(level.on_hand_cached or 0.0),
+                    "last_counted_qty": (
+                        float(level.last_counted_qty)
+                        if level.last_counted_qty is not None else None
+                    ),
+                }
+                for level in session.query(InventoryLevel)
+                .order_by(InventoryLevel.ingredient_id.asc())
+                .all()
+            ][:40]
+        finally:
+            session.close()
+
+        active_constraints = []
+        try:
+            active_constraints = [
+                {
+                    "type": sig.type,
+                    "source": sig.source,
+                    "payload": sig.payload,
+                    "expires_at": sig.expires_at,
+                }
+                for sig in self.bus.live(groups=["forecasting", "human"])[:20]
+            ]
+        except Exception:
+            active_constraints = []
+
+        payload = {
+            "sim_time": float(self.bus.sim_time),
+            "menu": menu_rows[:80],
+            "staff": staff_rows,
+            "inventory": inventory_rows,
+            "active_constraints": active_constraints,
+            "guidance": {
+                "specific_modifier_rule": "Ingredient/modifier words like bacon or mozzarella narrow the impact before category words like burger or pizza.",
+                "category_rule": "Category words like dessert, desserts, pizza, pasta, or beverages cascade to every active menu item in that category.",
+                "equipment_rule": "Equipment failures only affect items whose station, category, item name, or description indicates that equipment.",
+                "hard_zero_rule": "Broken equipment, out-of-stock required ingredients, no-more, over, done, finished, and 86 instructions are hard production_unavailable constraints.",
+            },
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def _enrich_operational_constraint(
+        self,
+        extracted: Dict[str, Any],
+        raw_text: str,
+    ) -> Dict[str, Any]:
+        value = extracted.get("value")
+        if not isinstance(value, dict):
+            value = {"raw_value": value}
+        else:
+            value = dict(value)
+
+        resolution = self._resolve_constraint_impact(extracted, raw_text)
+        if resolution:
+            value.update(resolution)
+            if resolution.get("dependency_ref") and resolution.get("dependency_type") != "category":
+                extracted["entity_ref"] = resolution["dependency_ref"]
+            if resolution.get("dependency_type") and not extracted.get("entity_type"):
+                extracted["entity_type"] = str(resolution["dependency_type"])
+
+        if not value.get("raw_text"):
+            value["raw_text"] = raw_text
+        extracted["value"] = value
+        return extracted
+
+    def _resolve_constraint_impact(
+        self,
+        extracted: Dict[str, Any],
+        raw_text: str,
+    ) -> Dict[str, Any]:
+        text = " ".join(
+            str(part or "")
+            for part in (
+                raw_text,
+                extracted.get("entity_ref"),
+                extracted.get("attribute"),
+                extracted.get("value"),
+            )
+        ).lower()
+        tokens = self._target_tokens(text)
+        if not tokens:
+            return {}
+
+        session = self.db_session_factory()
+        try:
+            menu_rows = self._menu_dependency_rows(session)
+        finally:
+            session.close()
+
+        # Specific dependencies should win before broad labels. That keeps
+        # "bacon burgers" scoped to bacon items and lets exact item names beat
+        # generic equipment/category matches.
+        ingredient_names = sorted(
+            {
+                str(ingredient).lower()
+                for row in menu_rows
+                for ingredient in row.get("ingredients", [])
+                if ingredient
+            },
+            key=len,
+            reverse=True,
+        )
+        matched_ingredient = self._best_dependency_match(text, ingredient_names, tokens)
+        if matched_ingredient:
+            affected = [
+                row for row in menu_rows
+                if self._dependency_name_matches(matched_ingredient, row.get("ingredients", []))
+            ]
+            return self._impact_payload("ingredient", matched_ingredient, affected)
+
+        equipment_names = sorted(
+            {
+                str(equipment).lower()
+                for row in menu_rows
+                for equipment in row.get("equipment", [])
+                if equipment
+            },
+            key=len,
+            reverse=True,
+        )
+        item_match = self._best_item_match(text, menu_rows)
+        if item_match is not None:
+            return self._impact_payload("menu_item", item_match["name"], [item_match])
+
+        matched_equipment = self._best_dependency_match(text, equipment_names, tokens)
+        if matched_equipment:
+            affected = [
+                row for row in menu_rows
+                if self._dependency_name_matches(matched_equipment, row.get("equipment", []))
+            ]
+            return self._impact_payload("equipment", matched_equipment, affected)
+
+        categories = sorted(
+            {str(row.get("category") or "").lower() for row in menu_rows if row.get("category")},
+            key=len,
+            reverse=True,
+        )
+        matched_category = self._best_dependency_match(text, categories, tokens)
+        if matched_category:
+            affected = [
+                row for row in menu_rows
+                if self._singular(str(row.get("category") or "")) == self._singular(matched_category)
+            ]
+            return self._impact_payload("category", matched_category, affected)
+
+        return {}
+
+    @staticmethod
+    def _impact_payload(
+        dependency_type: str,
+        dependency_ref: str,
+        affected: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not affected:
+            return {}
+        return {
+            "dependency_type": dependency_type,
+            "dependency_ref": dependency_ref,
+            "affected_menu_item_ids": [int(row["id"]) for row in affected],
+            "affected_item_names": [str(row["name"]) for row in affected],
+            "reasoning": (
+                f"Matched {dependency_type} '{dependency_ref}' against menu and recipe context."
+            ),
+        }
+
+    def _menu_dependency_rows(self, session: Any) -> List[Dict[str, Any]]:
+        ingredients_by_recipe: Dict[int, List[str]] = {}
+        recipe_ids_by_item: Dict[int, List[int]] = {}
+        ingredient_names = {
+            int(ingredient.id): str(ingredient.name or "")
+            for ingredient in session.query(Ingredient).all()
+        }
+        for recipe in session.query(Recipe).all():
+            recipe_ids_by_item.setdefault(int(recipe.menu_item_id), []).append(int(recipe.id))
+        for line in session.query(RecipeLine).all():
+            ingredients_by_recipe.setdefault(int(line.recipe_id), []).append(
+                ingredient_names.get(int(line.ingredient_id), str(line.ingredient_id))
+            )
+        station_names = {
+            int(station.id): str(station.name or "")
+            for station in session.query(Station).all()
+        }
+        rows = []
+        for item in session.query(MenuItem).filter(MenuItem.active == 1).order_by(MenuItem.id.asc()).all():
+            recipe_ids = recipe_ids_by_item.get(int(item.id), [])
+            ingredients = [
+                name
+                for recipe_id in recipe_ids
+                for name in ingredients_by_recipe.get(recipe_id, [])
+                if name
+            ]
+            station = station_names.get(int(item.station_id or 0), "")
+            rows.append(
+                {
+                    "id": int(item.id),
+                    "name": item.name or "",
+                    "category": item.category or "",
+                    "station": station,
+                    "ingredients": sorted(set(ingredients)),
+                    "equipment": self._equipment_dependencies_for_item(item, station),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _equipment_dependencies_for_item(item: MenuItem, station_name: str) -> List[str]:
+        haystack = " ".join(
+            str(value or "")
+            for value in (item.name, item.category, item.description, station_name)
+        ).lower()
+        equipment: Set[str] = set()
+        rules = {
+            "pizza oven": ("pizza oven", "pizza"),
+            "oven": ("oven", "baked", "bake"),
+            "grill": ("grill", "burger", "steak", "kebab"),
+            "fryer": ("fryer", "fried", "fries", "chips"),
+            "pasta station": ("pasta",),
+            "cold station": ("salad", "cold"),
+            "bar": ("bar", "beverage", "drink", "coffee"),
+        }
+        for label, terms in rules.items():
+            if any(term in haystack for term in terms):
+                equipment.add(label)
+        if station_name:
+            equipment.add(station_name.lower())
+        return sorted(equipment)
+
+    @classmethod
+    def _best_dependency_match(
+        cls,
+        text: str,
+        candidates: List[str],
+        tokens: List[str],
+    ) -> Optional[str]:
+        token_set = {cls._singular(token) for token in tokens if len(token) > 2}
+        best: tuple[int, int, str] | None = None
+        for candidate in candidates:
+            candidate_low = candidate.lower().strip()
+            if not candidate_low:
+                continue
+            candidate_tokens = {
+                cls._singular(token)
+                for token in re.findall(r"[a-z0-9]+", candidate_low)
+                if len(token) > 2
+            }
+            if candidate_low in text:
+                score = 100 + len(candidate_tokens)
+            else:
+                overlap = len(candidate_tokens.intersection(token_set))
+                if overlap <= 0:
+                    continue
+                score = overlap
+            tie_breaker = -len(candidate_low)
+            if best is None or (score, tie_breaker) > (best[0], best[1]):
+                best = (score, tie_breaker, candidate)
+        return best[2] if best is not None else None
+
+    @classmethod
+    def _dependency_name_matches(cls, dependency: str, candidates: List[Any]) -> bool:
+        target = cls._singular(str(dependency or ""))
+        target_tokens = {
+            cls._singular(token)
+            for token in re.findall(r"[a-z0-9]+", target)
+            if len(token) > 2
+        }
+        for candidate in candidates:
+            candidate_low = str(candidate or "").lower()
+            candidate_tokens = {
+                cls._singular(token)
+                for token in re.findall(r"[a-z0-9]+", candidate_low)
+                if len(token) > 2
+            }
+            if target == cls._singular(candidate_low):
+                return True
+            if len(target_tokens) > 1 and target_tokens.issubset(candidate_tokens):
+                return True
+            if len(target_tokens) == 1 and target_tokens.intersection(candidate_tokens):
+                return True
+        return False
+
+    @staticmethod
+    def _best_item_match(text: str, menu_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        for row in sorted(menu_rows, key=lambda entry: len(str(entry.get("name") or "")), reverse=True):
+            name = str(row.get("name") or "").lower()
+            if name and name in text:
+                return row
+        return None
 
     @staticmethod
     def _is_unavailable_constraint_shape(extracted: Dict[str, Any]) -> bool:
@@ -245,10 +581,14 @@ class VoiceProcessor:
                 "confidence": 0.6,
             }
 
+        contextual_constraint = self._contextual_unavailable_constraint(text, low)
+        if contextual_constraint is not None:
+            return self._normalise(contextual_constraint, raw_text)
+
         # set_operational_constraint: "no desserts possible" / "we cannot make tiramisu"
         if self._looks_like_unavailable_menu_constraint(low):
             target = self._unavailable_target(text, low)
-            return {
+            return self._normalise({
                 "intent": "set_operational_constraint",
                 "entity_type": "menu_item_or_category",
                 "entity_ref": target,
@@ -260,12 +600,12 @@ class VoiceProcessor:
                 },
                 "effective_window": self._window_from_text(low) or self._default_constraint_window(),
                 "confidence": 0.7,
-            }
+            }, raw_text)
 
         # set_operational_constraint: "desserts are overstocked" / "too much tiramisu"
         if self._looks_like_overstock_constraint(low):
             target = self._overstock_target(text, low)
-            return {
+            return self._normalise({
                 "intent": "set_operational_constraint",
                 "entity_type": "menu_item_or_category",
                 "entity_ref": target,
@@ -277,7 +617,7 @@ class VoiceProcessor:
                 },
                 "effective_window": self._window_from_text(low) or self._default_constraint_window(),
                 "confidence": 0.65,
-            }
+            }, raw_text)
 
         # add_inventory_count: "we have 12 kg of flour left" / "count ..."
         if "count" in low or ("we have" in low and " of " in low) or "stock of" in low:
@@ -345,14 +685,20 @@ class VoiceProcessor:
 
     @staticmethod
     def _looks_like_unavailable_menu_constraint(low: str) -> bool:
+        if VoiceProcessor._looks_like_overstock_constraint(low):
+            return False
         unavailable = (
             "no more", "not possible", "impossible", "can't make", "cannot make",
             "cant make", "unable to make", "not available", "unavailable",
-            "stop making", "halt", "pause",
+            "stop making", "halt", "pause", "out of", "ran out",
+            "sold out", "over for today", "over tonight", "are over", "is over",
+            "done for today", "done tonight", "are done", "is done",
+            "finished for today", "finished tonight", "are finished", "is finished",
+            "86", "eighty six",
         )
         food_context = (
             "dessert", "desert", "pizza", "pasta", "salad", "beverage",
-            "dish", "item", "menu", "tiramisu",
+            "dish", "item", "menu", "tiramisu", "burger",
         )
         no_possible = re.search(r"\bno\s+(?:more\s+)?[a-z0-9 '&-]+\s+possible\b", low) is not None
         return (no_possible or any(word in low for word in unavailable)) and any(
@@ -364,7 +710,9 @@ class VoiceProcessor:
         patterns = [
             r"no\s+(?:more\s+)?([A-Za-z0-9 '&-]+?)(?:\s+(?:possible|available|today|tonight|now|$)|$)",
             r"([A-Za-z0-9 '&-]+?)\s+(?:is|are|was|were)?\s*(?:not possible|impossible|unavailable|not available)",
+            r"([A-Za-z0-9 '&-]+?)\s+(?:is|are|was|were)\s+(?:over|done|finished)(?:\s+for\s+(?:today|tonight))?",
             r"(?:can't|cannot|cant|unable to|stop|halt|pause)\s+(?:make|making|serve|serving|prep|prepping)?\s*([A-Za-z0-9 '&-]+)",
+            r"(?:86|eighty\s+six)\s+([A-Za-z0-9 '&-]+)",
         ]
         for pattern in patterns:
             m = re.search(pattern, text, re.IGNORECASE)
@@ -377,6 +725,68 @@ class VoiceProcessor:
             if category in low:
                 return category
         return low
+
+    def _contextual_unavailable_constraint(self, text: str, low: str) -> Optional[Dict[str, Any]]:
+        if self._looks_like_overstock_constraint(low):
+            return None
+        hard_zero_phrases = (
+            "no more", "can't make", "cannot make", "cant make", "unable to make",
+            "stop making", "stop serving", "not available", "unavailable",
+            "sold out", "out of", "ran out", "broken", "not working", "down",
+            "over for today", "over tonight", "are over", "is over",
+            "done for today", "done tonight", "are done", "is done",
+            "finished for today", "finished tonight", "are finished", "is finished",
+            "86", "eighty six",
+        )
+        if not any(phrase in low for phrase in hard_zero_phrases):
+            return None
+        entity_type = "operational_dependency" if any(
+            phrase in low for phrase in ("broken", "not working", "down")
+        ) else "menu_item_or_dependency"
+        target = self._unavailable_target(text, low)
+        if target == low:
+            target = self._target_phrase_for_constraint(text, low)
+        return {
+            "intent": "set_operational_constraint",
+            "entity_type": entity_type,
+            "entity_ref": target,
+            "attribute": "production_unavailable",
+            "value": {
+                "action": "halt_production",
+                "target_qty": 0,
+                "raw_text": text,
+            },
+            "effective_window": self._window_from_text(low) or self._default_constraint_window(),
+            "confidence": 0.72,
+        }
+
+    @staticmethod
+    def _target_phrase_for_constraint(text: str, low: str) -> str:
+        patterns = [
+            r"(?:the\s+)?([A-Za-z0-9 '&-]+?)\s+(?:is|are|was|were)\s+(?:broken|down|not working)",
+            r"(?:out of|ran out of)\s+([A-Za-z0-9 '&-]+?)(?:\s+(?:today|tonight|now|$)|$)",
+            r"(?:no\s+more|sold out of)\s+([A-Za-z0-9 '&-]+?)(?:\s+(?:today|tonight|now|$)|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                target = match.group(1).strip(" .,'\"")
+                if target:
+                    return target
+        return low
+
+    @staticmethod
+    def _target_tokens(phrase: str) -> List[str]:
+        words = re.findall(r"[a-z0-9]+", phrase.lower())
+        ignored = {
+            "the", "all", "possible", "staff", "worker", "workers", "cook",
+            "chef", "station", "making", "make", "are", "is", "was", "were",
+            "absent", "unavailable", "available", "missing", "sick", "off",
+            "for", "today", "tonight", "now", "more", "none", "cannot", "cant",
+            "can't", "stop", "serve", "serving", "production", "halt", "out",
+            "ran", "broken", "working", "down", "only", "one",
+        }
+        return [word for word in words if word not in ignored and len(word) > 2]
 
     @staticmethod
     def _looks_like_overstock_constraint(low: str) -> bool:

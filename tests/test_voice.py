@@ -172,6 +172,23 @@ def test_no_more_desserts_gets_default_unavailable_window(seeded):
     assert result["signal_id"] is not None
 
 
+def test_desserts_are_over_maps_to_dessert_items(seeded):
+    voice, _session_factory = seeded
+    voice.bus.sim_time = 38100.0
+
+    result = voice.process("Desserts are over for today.")
+
+    value = result["extracted"]["value"]
+    assert result["extracted"]["intent"] == "set_operational_constraint"
+    assert result["extracted"]["entity_ref"] == "Desserts"
+    assert result["extracted"]["attribute"] == "production_unavailable"
+    assert value["dependency_type"] == "category"
+    assert value["dependency_ref"] == "dessert"
+    assert value["affected_menu_item_ids"] == [4]
+    assert value["affected_item_names"] == ["Tiramisu"]
+    assert result["extracted"]["effective_window"]["end"] == 82800.0
+
+
 def test_llm_availability_false_normalises_to_production_unavailable(seeded):
     voice, _session_factory = seeded
     voice.llm = FakeAvailabilityLLM()
@@ -207,3 +224,37 @@ def test_event_fallback_preserves_attendance_and_hour_range(seeded):
     assert result["extracted"]["attribute"] == "expected_attendance"
     assert result["extracted"]["value"] == 800.0
     assert result["extracted"]["effective_window"] == {"start": 32400.0, "end": 39600.0}
+
+
+def test_pizza_oven_constraint_targets_only_pizza_oven_items(seeded):
+    voice, _session_factory = seeded
+
+    result = voice.process("The pizza oven is broken today.")
+
+    value = result["extracted"]["value"]
+    assert result["extracted"]["intent"] == "set_operational_constraint"
+    assert result["extracted"]["attribute"] == "production_unavailable"
+    assert value["dependency_type"] == "equipment"
+    assert value["dependency_ref"] == "pizza oven"
+    assert value["affected_menu_item_ids"] == [1]
+    assert value["affected_item_names"] == ["Margherita Pizza"]
+
+
+def test_no_more_bacon_burgers_targets_bacon_items_only(bus, session_factory, monkeypatch):
+    for var in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    llm = LLMProvider()
+    llm._sleep = lambda *_a, **_k: None
+    Seeder(llm, session_factory).load_preset("burger_joint")
+    bus.sim_time = 38100.0
+    voice = VoiceProcessor(llm, bus, session_factory)
+
+    result = voice.process("No more bacon burgers for today.")
+
+    value = result["extracted"]["value"]
+    assert result["extracted"]["intent"] == "set_operational_constraint"
+    assert result["extracted"]["attribute"] == "production_unavailable"
+    assert value["dependency_type"] == "ingredient"
+    assert value["dependency_ref"] == "bacon"
+    assert value["affected_menu_item_ids"] == [2]
+    assert value["affected_item_names"] == ["Bacon Burger"]
