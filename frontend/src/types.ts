@@ -15,6 +15,8 @@ export interface SimState {
   speed: number;
   status: SimStatus;
   call_mode?: "freeze" | "slow";
+  /** Active preset id; changes when a restaurant is (re)seeded. */
+  active_seed_id?: string | null;
 }
 
 /** Canonical weather struct (00 §9.1) as carried by weather_updated / GET /api/weather. */
@@ -152,3 +154,34 @@ export interface MenuItem {
 
 /** Generic entity row for the entity editor (columns vary per resource). */
 export type EntityRow = Record<string, unknown>;
+
+/** orders row, as carried by GET /api/orders and the order_created WS payload. */
+export interface PosOrder {
+  id: number;
+  sim_time: number;
+  service_mode: string | null;
+  channel: string | null;
+  guest_count: number | null;
+  status: string;
+  total: number | null;
+}
+
+/** order_lines row. */
+export interface PosOrderLine {
+  id: number;
+  order_id: number;
+  menu_item_id: number;
+  qty: number;
+  unit_price: number | null;
+  line_total: number | null;
+  status: string;
+  sim_time: number;
+}
+
+/** One POS event: an order plus its lines. The live order_created WS event also
+ * carries a `velocity` map ({ menu_item_id: items/sec }); backfill omits it. */
+export interface PosOrderEvent {
+  order: PosOrder;
+  lines: PosOrderLine[];
+  velocity?: Record<string, number>;
+}

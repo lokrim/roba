@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Plus, Trash2, X } from "lucide-react";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api";
+import { useSimState } from "../store";
 import type {
   AnomalyInjection,
   EntityRow,
@@ -101,6 +102,11 @@ function PosMixPanel() {
     { ...DAYPART_DEFAULTS },
   );
 
+  // Re-fetch when a new restaurant is seeded: a (re)seed changes the menu and
+  // POS settings and broadcasts sim_state_changed with a new active_seed_id, so
+  // keying the load on it refreshes the dish-mix list without a tab toggle.
+  const activeSeedId = useSimState()?.active_seed_id ?? null;
+
   useEffect(() => {
     let cancelled = false;
     Promise.all([
@@ -125,7 +131,7 @@ function PosMixPanel() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [activeSeedId]);
 
   function normalise(mix: Record<string, number>): Record<string, number> {
     const total = Object.values(mix).reduce((a, b) => a + b, 0);
@@ -139,8 +145,12 @@ function PosMixPanel() {
       await apiPatch("/api/sim/pos", {
         base_orders_per_day: ordersPerDay,
         channel_mix: normalise(channelMix),
+        // Dish weights are sent as raw relative weights — the POS sampler
+        // normalises them proportionally. We deliberately do NOT rescale them
+        // here so the sliders keep their positions across apply/reload; the
+        // share shown next to each item is purely a display of weight / total.
         dish_mix_weights:
-          Object.keys(dishWeights).length > 0 ? normalise(dishWeights) : undefined,
+          Object.keys(dishWeights).length > 0 ? dishWeights : undefined,
         daypart_curve: daypartWeights,
       });
       await apiPost("/api/track-a/forecast/run").catch(() => undefined);
@@ -245,8 +255,8 @@ function PosMixPanel() {
         <div>
           <SectionHeading>Dish Mix Weights</SectionHeading>
           <p className="mb-2 text-[10px] text-text/40">
-            Relative weights — normalised on apply. % shown is each item's
-            share of orders.
+            Drag to set each dish's relative weight. The % beside each item is
+            its share of orders (weight ÷ total) and always sums to 100%.
           </p>
           <div className="space-y-2">
             {menuItems.map((item) => {
