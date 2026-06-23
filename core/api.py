@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional
@@ -29,13 +30,14 @@ from typing import Any, Callable, Dict, List, Optional
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import func
 
 from . import config, db, models
 from .approvals import ApprovalsHub
 from .bus import SignalBus
 from .calls import CallSubsystem
 from .clock import SimClock, get_or_create_sim_state
-from .formatter import DataFormatter
+from .formatter import DataFormatter, line_to_dict, order_to_dict
 from .llm import LLMProvider
 from .orchestrator import Orchestrator
 from .pos_simulator import POSSimulator
@@ -163,6 +165,10 @@ class AppContext:
         self.hub: WebSocketHub = WebSocketHub()
         self.loop_task: Optional[asyncio.Task] = None
         self.track_a: Dict[str, Any] = {}
+        # Per-track component dicts returned by each track's register(), e.g.
+        # ctx.tracks["track_b"]["market_spectator"] — used by REST endpoints
+        # that need to call into a track's agents (e.g. the Negotiate button).
+        self.tracks: Dict[str, Dict[str, Any]] = {}
 
 
 ctx = AppContext()
@@ -230,6 +236,14 @@ def _bootstrap() -> None:
     calls.set_ws_broadcast(sink)
     calls.attach_approvals(approvals)
 
+    # §14.4 agent-group routing: every signal type fans out to
+    # ``orchestrator.on_signal`` (which dispatches to each registered agent
+    # whose subscribed groups intersect the signal's groups). Wired via the
+    # same generic ``bus.subscribe`` dispatch path used by the call subsystem
+    # / approvals — fires once per genuine new emit, never on a dedup-refresh.
+    for _sig_type in SignalType:
+        bus.subscribe(_sig_type, orchestrator.on_signal)
+
     # Register the §17 triggers core owns: the weather fetch, the POS arrival
     # generator, the approvals-expiry sweep, and the scenario engine.
     weather.register(orchestrator)
@@ -284,6 +298,20 @@ def _bootstrap() -> None:
     else:
         ctx.forecast_jobs = None
 
+    # Track B: Inventory Management. Registers ledger, optimizer, market
+    # spectator and (in track_b standalone mode) the MockForecaster.
+    demo_mode = os.getenv("DEMO_MODE", "combined")
+    _register_tracks(
+        demo_mode,
+        bus=bus,
+        orchestrator=orchestrator,
+        db_session_factory=factory,
+        llm=llm,
+        calls=calls,
+        approvals=approvals,
+        ws_broadcast=sink,
+    )
+
     ctx.bus = bus
     ctx.clock = clock
     ctx.orchestrator = orchestrator
@@ -296,6 +324,35 @@ def _bootstrap() -> None:
     ctx.formatter = formatter
     ctx.pos = pos
     ctx.scenarios = scenarios
+
+
+def _register_tracks(demo_mode: str, **ctx_kwargs: Any) -> None:
+    """Call each active track's ``agents.register(...)`` for ``demo_mode``.
+
+    ``track_b`` / ``track_a`` run their real agents in ``combined`` and in their
+    own standalone mode; the standalone mode additionally selects that track's
+    mocks (the other track's signals). Each call is isolated so one track's
+    wiring problem cannot take down the app."""
+    targets = []
+    if demo_mode in ("track_b", "combined"):
+        targets.append("track_b")
+    if demo_mode in ("track_a", "combined"):
+        targets.append("track_a")
+
+    for pkg_name in targets:
+        try:
+            module = __import__(f"{pkg_name}.agents", fromlist=["register"])
+        except Exception:  # noqa: BLE001 — a missing/broken track must not crash core.
+            logger.exception("Could not import %s.agents", pkg_name)
+            continue
+        register = getattr(module, "register", None)
+        if register is None:
+            logger.info("%s.agents has no register() yet — skipping", pkg_name)
+            continue
+        try:
+            ctx.tracks[pkg_name] = register(demo_mode=demo_mode, **ctx_kwargs) or {}
+        except Exception:  # noqa: BLE001 — isolate track wiring failures.
+            logger.exception("%s.agents.register failed", pkg_name)
 
 
 @asynccontextmanager
@@ -419,6 +476,13 @@ async def sim_play() -> Dict[str, Any]:
     state = ctx.clock.current_state()
     if state["status"] == SimClock.RUNNING:
         raise HTTPException(status_code=409, detail="Simulation is already running")
+    # Starting a fresh run after a stop clears the previous run's live orders so
+    # the POS monitor starts clean rather than continuing onward. Resuming from
+    # a pause keeps them. (The frontend clears its live buffer on the same
+    # stopped→running transition.)
+    if state["status"] == SimClock.STOPPED:
+        _wipe_live_orders()
+        ctx.hub.broadcast("pos_reset", {})
     _ensure_loop_task()
     result = ctx.clock.play()
     ctx.hub.broadcast("sim_state_changed", result)
@@ -470,6 +534,7 @@ def sim_restart() -> Dict[str, Any]:
 
         result = ctx.clock.restart(_reseed)
     ctx.hub.broadcast("sim_state_changed", result)
+    ctx.hub.broadcast("pos_reset", {})
     return result
 
 
@@ -571,6 +636,21 @@ def _wipe_for_seed() -> None:
             session.execute(table.delete())
 
 
+
+def _wipe_live_orders() -> None:
+    """Delete the current run's orders/lines (``sim_time >= 0``), keeping the
+    seeded historical rows (negative ``sim_time``) that back the forecast
+    baseline. Used when starting a fresh run after a stop so the POS monitor
+    starts clean instead of continuing onward."""
+    with db.session_scope(coordinated=True) as session:
+        session.query(models.OrderLine).filter(
+            models.OrderLine.sim_time >= 0
+        ).delete(synchronize_session=False)
+        session.query(models.Order).filter(
+            models.Order.sim_time >= 0
+        ).delete(synchronize_session=False)
+
+
 def _apply_bundle_singletons(data: Dict[str, Any], preset_id: Optional[str]) -> None:
     """Apply a bundle's ``sim_state`` / ``sim_settings`` onto the kept
     singletons (in-place update, not insert) and stamp the active seed."""
@@ -587,6 +667,7 @@ def _apply_bundle_singletons(data: Dict[str, Any], preset_id: Optional[str]) -> 
         for field in _SIM_SETTINGS_FIELDS:
             if field in bundle_settings:
                 setattr(settings, field, bundle_settings[field])
+
 
 
 def _sync_bus_to_clock() -> Dict[str, Any]:
@@ -628,6 +709,7 @@ def seed_preset(preset_id: str) -> Dict[str, Any]:
         ctx.scenarios.seed_default_scenario()
         state = _sync_bus_to_clock()
     ctx.hub.broadcast("sim_state_changed", state)
+    ctx.hub.broadcast("pos_reset", {})
     return {"preset_id": preset_id, "inserted": _bundle_summary(data), "sim_state": state}
 
 
@@ -641,6 +723,7 @@ def seed_generate(body: GenerateBody) -> Dict[str, Any]:
         ctx.scenarios.seed_default_scenario()
         state = _sync_bus_to_clock()
     ctx.hub.broadcast("sim_state_changed", state)
+    ctx.hub.broadcast("pos_reset", {})
     return {"cuisine": body.cuisine, "inserted": _bundle_summary(data), "sim_state": state}
 
 
@@ -649,10 +732,12 @@ def seed_generate(body: GenerateBody) -> Dict[str, Any]:
 # ===========================================================================
 
 CRUD_RESOURCES = {
+    "ingredients": models.Ingredient,
     "menu": models.MenuItem,
     "recipes": models.Recipe,
     "staff": models.Staff,
     "suppliers": models.Supplier,
+    "supplier-catalog": models.SupplierCatalog,
     "inventory": models.InventoryLevel,
     "competitors": models.Competitor,
     "reviews": models.Review,
@@ -808,6 +893,121 @@ def read_signals(
     return result
 
 
+@app.get("/api/orders")
+def read_orders(
+    limit: int = Query(50),
+    since: Optional[float] = Query(None),
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    """Recent POS orders for the monitor's initial backfill.
+
+    Returns newest-first ``[{order, lines}]`` mirroring the live
+    ``order_created`` WS payload (minus the ephemeral ``velocity`` map, which
+    the client recomputes from the streamed window). Lines are fetched in a
+    single ``IN`` query to avoid N+1.
+    """
+    limit = max(1, min(limit, 200))
+    query = db_session.query(models.Order)
+    if since is not None:
+        query = query.filter(models.Order.sim_time > since)
+    orders = query.order_by(models.Order.sim_time.desc()).limit(limit).all()
+    if not orders:
+        return []
+    order_ids = [o.id for o in orders]
+    lines = (
+        db_session.query(models.OrderLine)
+        .filter(models.OrderLine.order_id.in_(order_ids))
+        .all()
+    )
+    lines_by_order: Dict[int, List[Dict[str, Any]]] = {}
+    for line in lines:
+        lines_by_order.setdefault(line.order_id, []).append(line_to_dict(line))
+    return [
+        {"order": order_to_dict(o), "lines": lines_by_order.get(o.id, [])}
+        for o in orders
+    ]
+
+
+@app.get("/api/pos/stats")
+def read_pos_stats(
+    since: float = Query(0.0),
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    """Aggregated POS statistics over ``(since, now]`` for the monitor's window
+    selector (Today / last hour / 30m / 15m).
+
+    Computed server-side so totals are accurate for any window regardless of the
+    client's bounded live buffer. ``since`` is clamped to ``>= 0`` so the seeded
+    negative-``sim_time`` history is never included. Also returns ~24 adaptive
+    time buckets across the window for the orders-over-time chart.
+    """
+    since = max(float(since), 0.0)
+    now = float(ctx.clock.sim_time)
+
+    order_filter = models.Order.sim_time > since
+    line_filter = models.OrderLine.sim_time > since
+
+    orders = db_session.query(func.count(models.Order.id)).filter(order_filter).scalar() or 0
+    revenue = (
+        db_session.query(func.coalesce(func.sum(models.Order.total), 0.0))
+        .filter(order_filter)
+        .scalar()
+        or 0.0
+    )
+    channel_split = {
+        (channel or "unknown"): count
+        for channel, count in db_session.query(
+            models.Order.channel, func.count(models.Order.id)
+        )
+        .filter(order_filter)
+        .group_by(models.Order.channel)
+        .all()
+    }
+    lines = db_session.query(func.count(models.OrderLine.id)).filter(line_filter).scalar() or 0
+    voided_lines = (
+        db_session.query(func.count(models.OrderLine.id))
+        .filter(line_filter, models.OrderLine.status == "voided")
+        .scalar()
+        or 0
+    )
+    top_items = [
+        {"menu_item_id": menu_item_id, "qty": float(qty or 0.0)}
+        for menu_item_id, qty in db_session.query(
+            models.OrderLine.menu_item_id, func.sum(models.OrderLine.qty)
+        )
+        .filter(line_filter, models.OrderLine.status != "voided")
+        .group_by(models.OrderLine.menu_item_id)
+        .order_by(func.sum(models.OrderLine.qty).desc())
+        .limit(8)
+        .all()
+    ]
+
+    # ~24 adaptive buckets (min 60 sim-s wide) for the orders-over-time chart.
+    span = max(now - since, 1.0)
+    width = max(60.0, span / 24.0)
+    bucket_count = int(math.ceil(span / width))
+    counts = [0] * (bucket_count + 1)
+    for (sim_time,) in db_session.query(models.Order.sim_time).filter(order_filter).all():
+        idx = int((float(sim_time) - since) // width)
+        if 0 <= idx < len(counts):
+            counts[idx] += 1
+    buckets = [
+        {"t": since + i * width, "orders": count} for i, count in enumerate(counts)
+    ]
+
+    return {
+        "since": since,
+        "now": now,
+        "orders": int(orders),
+        "revenue": float(revenue),
+        "lines": int(lines),
+        "voided_lines": int(voided_lines),
+        "channel_split": channel_split,
+        "top_items": top_items,
+        "buckets": buckets,
+    }
+
+
 @app.get("/api/approvals")
 def read_approvals(
     status: Optional[str] = Query(None),
@@ -846,6 +1046,30 @@ def read_waste(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
 @app.get("/api/purchase-orders")
 def read_purchase_orders(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
     return [_row_to_dict(r) for r in db_session.query(models.PurchaseOrder).all()]
+
+
+@app.get("/api/inventory/lots")
+def read_inventory_lots(
+    ingredient_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None),
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    query = db_session.query(models.InventoryLot)
+    if ingredient_id is not None:
+        query = query.filter(models.InventoryLot.ingredient_id == ingredient_id)
+    if status is not None:
+        query = query.filter(models.InventoryLot.status == status)
+    return [_row_to_dict(r) for r in query.order_by(models.InventoryLot.expiry_date.asc()).all()]
+
+
+@app.get("/api/promotions")
+def read_promotions(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
+    return [_row_to_dict(r) for r in db_session.query(models.Promotion).order_by(models.Promotion.sim_time.asc()).all()]
+
+
+@app.get("/api/negotiations")
+def read_negotiations(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
+    return [_row_to_dict(r) for r in db_session.query(models.Negotiation).order_by(models.Negotiation.sim_time.asc()).all()]
 
 
 @app.get("/api/competitor-intel")
@@ -1217,6 +1441,23 @@ def call_end(call_id: int) -> Dict[str, Any]:
         session.close()
     outcome = ctx.calls.end_call(call_id)
     return {"call_id": call_id, "outcome": outcome}
+
+
+class NegotiateBody(BaseModel):
+    supplier_id: int
+    ingredient_id: int
+
+
+@app.post("/api/market/negotiate")
+def market_negotiate(body: NegotiateBody) -> Dict[str, Any]:
+    """Presenter-triggered negotiation (SupplierEditor's "Negotiate" button,
+    02 §B6) — routes into Track B's Market Spectator, which creates the
+    approval-gated outbound call (§8.2)."""
+    market = (ctx.tracks.get("track_b") or {}).get("market_spectator")
+    if market is None:
+        raise HTTPException(status_code=503, detail="Market Spectator not active")
+    market.negotiate(body.supplier_id, body.ingredient_id)
+    return {"supplier_id": body.supplier_id, "ingredient_id": body.ingredient_id, "requested": True}
 
 
 # ===========================================================================

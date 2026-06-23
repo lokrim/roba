@@ -111,6 +111,7 @@ class SimClock:
                 "speed": state.speed,
                 "status": state.status,
                 "call_mode": state.call_mode,
+                "active_seed_id": state.active_seed_id,
             }
         finally:
             session.close()
@@ -185,6 +186,10 @@ class SimClock:
         # ledger history, logs (those live in other tables). §6.2.
         self.bus.sweep(now=SWEEP_ALL_NOW)
         self.bus.sim_time = new_time
+        # Re-anchor interval triggers to the rewound clock so the POS (and other
+        # interval-driven agents) resume on the new timeline instead of stalling.
+        if self.orchestrator is not None:
+            self.orchestrator.reset_schedules()
         return self.current_state()
 
     def restart(self, seeding_fn: Optional[Callable[[], Any]] = None) -> Dict[str, Any]:
@@ -204,6 +209,8 @@ class SimClock:
             session.close()
 
         self.bus.sim_time = new_time
+        if self.orchestrator is not None:
+            self.orchestrator.reset_schedules()
         return self.current_state()
 
     def set_speed(self, speed: float) -> Dict[str, Any]:

@@ -249,6 +249,7 @@ Generates `orders` + `order_lines` during `RUNNING`, the live sales feed both tr
 - **Cancellations:** with prob `CANCEL_RATE`, a line is marked `voided` shortly after creation → emits a `WASTE_EVENT(cancelled_order)` (§16).
 
 Editable live: `base_orders_per_day`, `velocity`, `dish_mix_weights`, `channel_mix`, `daypart curve`.
+- **Clock-rewind safety:** `tick()` detects a backward `sim_time` jump (stop/restart rewinds to start-of-day) and restarts its next-arrival schedule, so orders resume on the first tick after replay. A **start after a stop** wipes the previous run's live orders (`_wipe_live_orders` in `api.py`) so a fresh run doesn't continue onward; **stop** keeps them. See `docs/06` §3.3/§3.6.
 
 ---
 
@@ -402,6 +403,8 @@ Per tick: advance clock → run due triggers → sweep signals → broadcast. Fi
 
 Cascade controls per §14.5 apply to all emits.
 
+`reset_schedules()` re-anchors every interval trigger's `next_due` to the current `sim_time`; the clock calls it on `stop()`/`restart()` so interval work (e.g. the POS generator) resumes on the rewound timeline instead of stalling. See `docs/06` §3.6.
+
 ---
 
 ## 18. Core algorithms (the deterministic logic — decided)
@@ -518,7 +521,7 @@ All JSON. Prefix `/api`.
 **Seeding/generation:** `POST /seed/preset/{id}`, `GET /seed/presets`, `POST /seed/generate {cuisine, size_params}`, `POST /generate/{menu|recipes|staff|supplier} {...}`.
 **Demo editing (CRUD):** `/menu`, `/recipes`, `/staff`, `/suppliers`, `/inventory`, `/competitors`, `/reviews` — `GET` list, `POST` create, `PATCH /{id}`, `DELETE /{id}`.
 **Weather:** `GET /weather`, `POST /weather/override {temp_c, condition, precip_mm, wind_kph}`.
-**Reads:** `GET /forecasts`, `/inventory`, `/inventory/ledger`, `/signals?status=live&group=`, `/approvals?status=pending`, `/events?since=`, `/batches`, `/waste`, `/purchase-orders`, `/competitors`, `/competitor-intel`, `/calls`.
+**Reads:** `GET /forecasts`, `/inventory`, `/inventory/ledger`, `/signals?status=live&group=`, `/approvals?status=pending`, `/events?since=`, `/batches`, `/waste`, `/purchase-orders`, `/competitors`, `/competitor-intel`, `/calls`, `/orders?limit&since` (newest-first `[{order,lines}]`, POS backfill), `/pos/stats?since` (windowed POS aggregate: `{orders,revenue,lines,voided_lines,channel_split,top_items,buckets}`). `GET /sim/state` (and the `sim_state_changed` WS payload) also carry `active_seed_id`. See `docs/06` for the POS monitor + menu surfaces.
 **Actions:** `POST /approvals/{id}/approve|reject`, `POST /voice/transcript {text}` (returns extracted + writes), `POST /calls/{id}/turn {role, text}` (append a roleplay turn), `POST /calls/{id}/end`.
 **Scenarios:** `GET /scenarios`, `POST /scenarios/{id}/activate`, `POST /scenarios/{id}/deactivate`.
 
@@ -526,7 +529,7 @@ All JSON. Prefix `/api`.
 
 ## 21. WebSocket contract (`/ws`)
 
-One connection; server pushes `{event, payload}`. Events: `sim_tick {sim_time, day_number, time_of_day, speed, status}`, `order_created {order, lines, velocity}`, `signal_emitted {signal}`, `forecast_updated {forecast}`, `batch_decided {batch}`, `inventory_updated {ingredient_id, on_hand}`, `menu_toggled {menu_item_id, action}`, `approval_created {approval}`, `approval_resolved {approval}`, `event_logged {event}`, `weather_updated {weather}`, `call_request {call}`, `call_started {call}`, `call_turn {call_id, role, text}`, `call_ended {call, outcome}`. The frontend is a **pure consumer**; each track UI subscribes to the subset it needs.
+One connection; server pushes `{event, payload}`. Events: `sim_tick {sim_time, day_number, time_of_day, speed, status}`, `order_created {order, lines, velocity}`, `signal_emitted {signal}`, `forecast_updated {forecast}`, `batch_decided {batch}`, `inventory_updated {ingredient_id, on_hand}`, `menu_toggled {menu_item_id, action}`, `approval_created {approval}`, `approval_resolved {approval}`, `event_logged {event}`, `weather_updated {weather}`, `call_request {call}`, `call_started {call}`, `call_turn {call_id, role, text}`, `call_ended {call, outcome}`, `pos_reset {}` (emitted on restart, reseed, and start-after-stop; clears the POS monitor — see `docs/06` §3.3). The frontend is a **pure consumer**; each track UI subscribes to the subset it needs.
 
 ---
 
@@ -576,6 +579,8 @@ WEATHER_FETCH_SIM_S=10800   # every 3 sim-h
 ## 23. Frontend shell & design tokens (`/frontend`)
 
 `core` provides: the app shell (router, single WS client + reconnect, a global store of the latest WS state), the **Demo Control Bar** (play/pause/stop/restart/step/speed + scrubber + scenario picker + seed/generate buttons + POS velocity & dish-mix sliders + weather override + voice console), the **Approval Inbox** (shared shell panel, shown in every mode; lists `approval_requests` and posts approve/reject), and **design tokens** (Tailwind config: spacing, a restrained palette, type scale; light/dark). Track panels mount into a tabbed layout: **Track A tabs** = Forecast, Competitors, Reviews, Staff, Signal Feed; **Track B tabs** = Inventory, Expiry, Suppliers, Activity Log. The voice console has a normal mode and a **ROLEPLAY mode** (during calls) showing "You are playing: {party}" with mic + text input and the live transcript.
+
+The shell is now routed with `react-router-dom` (4 routes): `/` (Control Bar + panels), `/control` (controls only), `/panels` (dashboards only), and `/menu` (public, lazy-loaded customer menu — REST-only, no WS). Operator routes share one WS connection via `OperatorLayout`. A **POS Monitor** tab (live order feed + windowed `/api/pos/stats` analytics) sits alongside the Track tabs. Full detail in `docs/06`.
 
 ---
 

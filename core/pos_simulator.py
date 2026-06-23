@@ -136,6 +136,9 @@ class POSSimulator:
         # Rolling sim-time at which the next order arrives; lazily initialised
         # on the first tick so the very first arrival fires immediately.
         self.next_order_due: Optional[float] = None
+        # Sim-time of the previous tick, used to detect a backward clock jump
+        # (stop / restart rewind sim_time) and restart the arrival schedule.
+        self._last_tick_sim_time: Optional[float] = None
 
     # -- formatter wiring ---------------------------------------------------
 
@@ -381,6 +384,17 @@ class POSSimulator:
         Catching those up keeps POS velocity realistic; returning only the last
         created order preserves the old public shape for callers that ignore it.
         """
+        # A backward jump means the clock was reset (stop/restart rewinds
+        # sim_time to the start of the day). Restart the arrival schedule from
+        # the new sim_time so the first order fires immediately rather than
+        # waiting for sim_time to climb back to the stale next_order_due.
+        if (
+            self._last_tick_sim_time is not None
+            and sim_time < self._last_tick_sim_time
+        ):
+            self.next_order_due = sim_time
+        self._last_tick_sim_time = sim_time
+
         # Lazy init: make the first arrival due immediately.
         if self.next_order_due is None:
             self.next_order_due = sim_time
