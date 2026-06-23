@@ -1,7 +1,7 @@
 # 06 — Frontend Pages, POS Monitor & Customer Menu
 
 > **Scope:** the multi-page frontend restructure, the live POS monitoring view,
-> and the public customer menu site. Branch: feature work off `main`.
+> and the public customer menu site. Merged into `main`.
 > **Audience:** frontend + backend programmers extending these surfaces.
 
 ---
@@ -150,17 +150,26 @@ stopped run), stop leaves the data inspectable, and restart clears immediately.
 The buffer is shared and never re-backfills, so cleared/kept state holds across
 page navigation.
 
-### 3.4 Settings ↔ seed refresh
+### 3.4 Settings — seed refresh & dish-mix weights
 
 `SettingsDrawer`'s `PosMixPanel` keys its menu + `/api/sim/pos` fetch on the
 store's `sim_state_changed`-driven `active_seed_id`. Loading/reseeding a
 restaurant changes that id, so the dish-mix list refreshes automatically without
 toggling tabs.
 
-### 3.5 Backend support — `GET /api/orders`
+**Dish-mix weights are raw relative weights.** The sliders set a weight per dish
+and `apply()` sends those values **as-is** — there is no normalize-on-apply step
+(an earlier version rescaled them to sum to 1, which collapsed the sliders to
+tiny fractions after each apply). So slider positions persist across
+apply/reload. The `%` shown beside each item is purely display: `weight ÷ total`
+(always sums to 100%). The backend POS sampler (`pos_simulator.py`,
+`random.choices`) normalizes weights internally, so raw values are correct.
 
-New read endpoint (`core/api.py`), the only required backend change. Orders were
-previously write-only.
+### 3.5 Backend read endpoints — `GET /api/orders` & `GET /api/pos/stats`
+
+Two new read endpoints in `core/api.py` (orders were previously write-only). The
+windowed aggregate `GET /api/pos/stats` is documented in §3.1a; the order
+backfill is:
 
 ```
 GET /api/orders?limit=50&since=<sim_time?>
@@ -170,10 +179,9 @@ GET /api/orders?limit=50&since=<sim_time?>
 - Returns **newest-first** `[{ "order": {...}, "lines": [...] }, ...]`, mirroring
   the live `order_created` payload (minus `velocity`).
 - Lines fetched in a single `IN` query (no N+1).
-- Serialization reuses `order_to_dict` / `line_to_dict`, now module-level
-  functions in `core/formatter.py` shared with the WS payload so both stay in
-  lockstep. The old `DataFormatter._order_to_dict` / `_line_to_dict` remain as
-  thin `staticmethod` aliases.
+- Serialization uses the module-level `order_to_dict` / `line_to_dict` in
+  `core/formatter.py`, shared with the WS `order_created` payload (`on_order`
+  calls them directly) so both stay in lockstep.
 
 > Note: presets seed historical orders (negative `sim_time`). The backfill uses
 > `since=0`, so it returns only current-run (positive `sim_time`) orders and the
@@ -231,17 +239,24 @@ optimization could instead listen for the `MENU_TOGGLE` `signal_emitted` WS even
 
 | File | Change |
 |------|--------|
-| `core/api.py` | New `GET /api/orders`; import `order_to_dict`/`line_to_dict` |
-| `core/formatter.py` | Module-level `order_to_dict`/`line_to_dict`; static aliases |
-| `frontend/package.json` | + `react-router-dom` |
+| `core/api.py` | New `GET /api/orders` & `GET /api/pos/stats`; `_wipe_live_orders()`; `pos_reset` broadcasts (restart / reseed / start-after-stop); imports the shared serializers |
+| `core/formatter.py` | Module-level `order_to_dict`/`line_to_dict` (shared with the endpoints) |
+| `core/clock.py` | `current_state()` returns `active_seed_id`; `stop()`/`restart()` call `reset_schedules()` |
+| `core/orchestrator.py` | New `reset_schedules()` — re-anchors interval triggers after a clock rewind |
+| `core/pos_simulator.py` | Backward-`sim_time`-jump guard restarts the arrival schedule |
+| `frontend/package.json`, `package-lock.json` | + `react-router-dom` |
 | `frontend/src/main.tsx` | Wrap app in `<BrowserRouter>` |
 | `frontend/src/App.tsx` | Route table; lazy `/menu` |
 | `frontend/src/routes/OperatorLayout.tsx` | **new** — WS lifecycle + nav + `<Outlet/>` |
-| `frontend/src/routes/{ConsolePage,ControlPage,PanelsPage}.tsx` | **new** |
+| `frontend/src/routes/{ConsolePage,ControlPage,PanelsPage}.tsx` | **new** — route compositions |
+| `frontend/src/shell/ControlShell.tsx` | **new** — shared ControlBar + drawers shell |
 | `frontend/src/shell/PanelsView.tsx` | **new** — extracted tabs + POS Monitor tab |
-| `frontend/src/pos/usePosStream.ts`, `pos/PosMonitor.tsx` | **new** |
-| `frontend/src/menu/MenuPage.tsx` | **new** |
-| `frontend/src/types.ts` | + `PosOrder`/`PosOrderLine`/`PosOrderEvent` |
+| `frontend/src/shell/SettingsDrawer.tsx` | Seed-keyed refresh; raw dish-mix weights (§3.4) |
+| `frontend/src/pos/usePosStream.ts` | **new** — shared live order buffer (ticker + velocity) |
+| `frontend/src/pos/usePosStats.ts` | **new** — windowed backend stats + window selector |
+| `frontend/src/pos/PosMonitor.tsx` | **new** — the monitor view |
+| `frontend/src/menu/MenuPage.tsx` | **new** — public customer menu (lazy) |
+| `frontend/src/types.ts` | + `PosOrder`/`PosOrderLine`/`PosOrderEvent`; `SimState.active_seed_id` |
 
 ---
 
