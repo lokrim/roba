@@ -77,6 +77,7 @@ def test_seed_switch_deletes_in_fk_safe_order():
 
         assert client.get("/api/menu").status_code == 200
         assert client.get("/api/track-a/snapshot").status_code == 200
+        assert client.get("/api/inventory/lots").status_code == 200
 
 
 def test_delete_track_a_constraint_expires_override_and_linked_signal():
@@ -181,6 +182,7 @@ def test_dashboard_reads_survive_running_sim_concurrently():
         "/api/menu",
         "/api/weather",
         "/api/track-a/snapshot",
+        "/api/inventory/lots",
         "/api/scenarios",
         "/api/sim/pos",
     ]
@@ -231,9 +233,13 @@ def test_running_sim_periodically_updates_core_feeds(monkeypatch):
         assert client.post("/api/sim/play").status_code == 200
 
         deadline = time.monotonic() + 3.0
-        saw_forecast = saw_order = saw_weather = False
+        saw_forecast = saw_ledger = saw_order = saw_weather = False
         while time.monotonic() < deadline:
             forecasts = client.get("/api/forecasts").json()
+            # Track B's InventoryLedger depletes stock per order line (no
+            # interval trigger needed — it reacts to ORDER_CREATED), so this
+            # feed updates as soon as the POS sim produces an order.
+            ledger = client.get("/api/inventory/ledger").json()
             weather = client.get("/api/weather").json()
             with db.DB_LOCK:
                 session = db.new_session()
@@ -246,14 +252,16 @@ def test_running_sim_periodically_updates_core_feeds(monkeypatch):
                 finally:
                     session.close()
             saw_forecast = bool(forecasts)
+            saw_ledger = bool(ledger)
             saw_weather = bool(weather and weather["sim_time"] >= 0)
-            if saw_forecast and saw_order and saw_weather:
+            if saw_forecast and saw_ledger and saw_order and saw_weather:
                 break
             time.sleep(0.05)
 
         client.post("/api/sim/pause")
 
     assert saw_forecast
+    assert saw_ledger
     assert saw_order
     assert saw_weather
 
@@ -283,6 +291,25 @@ def test_restart_reseeds_active_preset_and_clears_runtime_rows():
             time.sleep(0.05)
         assert forecasts
 
+        # Seed a Track B intelligence-model runtime row (an INTELLIGENCE_MODELS
+        # table, same wipe class as Forecast) the way a completed negotiation
+        # would land via Market Spectator's CALL_OUTCOME handling.
+        with db.DB_LOCK:
+            session = db.new_session()
+            try:
+                supplier = session.query(models.Supplier).first()
+                ingredient = session.query(models.Ingredient).first()
+                session.add(models.Negotiation(
+                    supplier_id=supplier.id,
+                    ingredient_id=ingredient.id,
+                    outcome={"result": "accepted"},
+                    sim_time=0.0,
+                ))
+                session.commit()
+            finally:
+                session.close()
+        assert client.get("/api/negotiations").json()
+
         restart = client.post("/api/sim/restart")
         assert restart.status_code == 200, restart.text
         assert restart.json()["status"] == "stopped"
@@ -292,6 +319,7 @@ def test_restart_reseeds_active_preset_and_clears_runtime_rows():
         restored = next(item for item in restored_menu if item["id"] == first_item["id"])
         assert restored["name"] == first_item["name"]
         assert client.get("/api/forecasts").json() == []
+        assert client.get("/api/negotiations").json() == []
 
         with db.DB_LOCK:
             session = db.new_session()

@@ -5,6 +5,7 @@ import { ReviewPanel } from "../track_a/ReviewPanel";
 import { SignalFeed } from "../track_a/SignalFeed";
 import { StaffPanel } from "../track_a/StaffPanel";
 import { PosMonitor } from "../pos/PosMonitor";
+import { TRACK_B_PANELS } from "../track_b";
 
 // The tab strip + panel grid, extracted from the old single-page App so it can
 // be shared by the Console (/) and Panels (/panels) routes.
@@ -35,16 +36,11 @@ function TrackAPanel({ label }: { label: string }) {
   );
 }
 
-function TrackBPlaceholder({ label }: { label: string }) {
-  return (
-    <div
-      data-track="b"
-      data-panel={label}
-      className="flex h-full items-center justify-center rounded-lg border border-dashed border-muted bg-surface/40 text-text/40"
-    >
-      <span className="text-sm">Track B · {label}</span>
-    </div>
-  );
+function TrackBPanel({ label }: { label: string }) {
+  const panel = TRACK_B_PANELS.find((p) => p.name === label);
+  if (!panel) return null;
+  const Panel = panel.component;
+  return <Panel />;
 }
 
 function TabButton({
@@ -127,7 +123,7 @@ export function PanelsView() {
           ) : activeTab.track === "A" ? (
             <TrackAPanel label={activeTab.name} />
           ) : (
-            <TrackBPlaceholder label={activeTab.name} />
+            <TrackBPanel label={activeTab.name} />
           )}
         </div>
       </div>

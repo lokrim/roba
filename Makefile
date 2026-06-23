@@ -24,5 +24,5 @@ demo: base
 	DEMO_MODE=combined docker compose up --build
 
 test:
-	.venv/bin/pytest tests/ -v
+	.venv/bin/pytest tests/ track_b/tests/ -v
 	cd frontend && npm run test -- --run
