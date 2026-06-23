@@ -32,6 +32,34 @@ WASTE_ROUTING: Dict[str, List[str]] = {
 }
 
 
+# -- POS serialization (shared by the WS order_created payload and the
+# GET /api/orders backfill endpoint so both stay in lockstep) ----------------
+
+def order_to_dict(order: Any) -> Dict[str, Any]:
+    return {
+        "id": order.id,
+        "sim_time": order.sim_time,
+        "service_mode": order.service_mode,
+        "channel": order.channel,
+        "guest_count": order.guest_count,
+        "status": order.status,
+        "total": order.total,
+    }
+
+
+def line_to_dict(line: Any) -> Dict[str, Any]:
+    return {
+        "id": line.id,
+        "order_id": line.order_id,
+        "menu_item_id": line.menu_item_id,
+        "qty": line.qty,
+        "unit_price": line.unit_price,
+        "line_total": line.line_total,
+        "status": line.status,
+        "sim_time": line.sim_time,
+    }
+
+
 class DataFormatter:
     """Velocity enrichment + order-line fan-out + wastage relay (§16)."""
 
@@ -117,8 +145,8 @@ class DataFormatter:
         self._broadcast(
             "order_created",
             {
-                "order": self._order_to_dict(order),
-                "lines": [self._line_to_dict(line) for line in lines],
+                "order": order_to_dict(order),
+                "lines": [line_to_dict(line) for line in lines],
                 "velocity": velocity,
             },
         )
@@ -185,30 +213,3 @@ class DataFormatter:
             source="formatter",
             groups=groups,
         )
-
-    # -- serialization helpers ---------------------------------------------
-
-    @staticmethod
-    def _order_to_dict(order: Any) -> Dict[str, Any]:
-        return {
-            "id": order.id,
-            "sim_time": order.sim_time,
-            "service_mode": order.service_mode,
-            "channel": order.channel,
-            "guest_count": order.guest_count,
-            "status": order.status,
-            "total": order.total,
-        }
-
-    @staticmethod
-    def _line_to_dict(line: Any) -> Dict[str, Any]:
-        return {
-            "id": line.id,
-            "order_id": line.order_id,
-            "menu_item_id": line.menu_item_id,
-            "qty": line.qty,
-            "unit_price": line.unit_price,
-            "line_total": line.line_total,
-            "status": line.status,
-            "sim_time": line.sim_time,
-        }

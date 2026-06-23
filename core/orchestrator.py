@@ -154,6 +154,20 @@ class Orchestrator:
         self.triggers.append(trigger)
         return trigger
 
+    def reset_schedules(self) -> None:
+        """Re-anchor interval triggers to the current ``sim_time``.
+
+        Called by the clock after a rewind (stop/restart resets ``sim_time`` to
+        the start of the day). Without this, each interval trigger keeps its
+        stale ``next_due`` from the previous run — which now lies in the future
+        — so nothing fires (and no POS orders are generated) until sim_time
+        climbs back to it. Re-anchoring restarts every interval cadence on the
+        new timeline."""
+        now = self.bus.sim_time
+        for t in self.triggers:
+            if t.trigger_type == "interval" and t.interval_sim_s is not None:
+                t.next_due = now + float(t.interval_sim_s)
+
     def next_due_at(self, now: float) -> Optional[float]:
         """Earliest scheduled trigger due time strictly after ``now`` (used by
         :meth:`SimClock.step`); ``None`` if nothing is scheduled ahead."""

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional
@@ -29,13 +30,14 @@ from typing import Any, Callable, Dict, List, Optional
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import func
 
 from . import config, db, models
 from .approvals import ApprovalsHub
 from .bus import SignalBus
 from .calls import CallSubsystem
 from .clock import SimClock, get_or_create_sim_state
-from .formatter import DataFormatter
+from .formatter import DataFormatter, line_to_dict, order_to_dict
 from .llm import LLMProvider
 from .orchestrator import Orchestrator
 from .pos_simulator import POSSimulator
@@ -419,6 +421,13 @@ async def sim_play() -> Dict[str, Any]:
     state = ctx.clock.current_state()
     if state["status"] == SimClock.RUNNING:
         raise HTTPException(status_code=409, detail="Simulation is already running")
+    # Starting a fresh run after a stop clears the previous run's live orders so
+    # the POS monitor starts clean rather than continuing onward. Resuming from
+    # a pause keeps them. (The frontend clears its live buffer on the same
+    # stopped→running transition.)
+    if state["status"] == SimClock.STOPPED:
+        _wipe_live_orders()
+        ctx.hub.broadcast("pos_reset", {})
     _ensure_loop_task()
     result = ctx.clock.play()
     ctx.hub.broadcast("sim_state_changed", result)
@@ -470,6 +479,7 @@ def sim_restart() -> Dict[str, Any]:
 
         result = ctx.clock.restart(_reseed)
     ctx.hub.broadcast("sim_state_changed", result)
+    ctx.hub.broadcast("pos_reset", {})
     return result
 
 
@@ -571,6 +581,20 @@ def _wipe_for_seed() -> None:
             session.execute(table.delete())
 
 
+def _wipe_live_orders() -> None:
+    """Delete the current run's orders/lines (``sim_time >= 0``), keeping the
+    seeded historical rows (negative ``sim_time``) that back the forecast
+    baseline. Used when starting a fresh run after a stop so the POS monitor
+    starts clean instead of continuing onward."""
+    with db.session_scope(coordinated=True) as session:
+        session.query(models.OrderLine).filter(
+            models.OrderLine.sim_time >= 0
+        ).delete(synchronize_session=False)
+        session.query(models.Order).filter(
+            models.Order.sim_time >= 0
+        ).delete(synchronize_session=False)
+
+
 def _apply_bundle_singletons(data: Dict[str, Any], preset_id: Optional[str]) -> None:
     """Apply a bundle's ``sim_state`` / ``sim_settings`` onto the kept
     singletons (in-place update, not insert) and stamp the active seed."""
@@ -628,6 +652,7 @@ def seed_preset(preset_id: str) -> Dict[str, Any]:
         ctx.scenarios.seed_default_scenario()
         state = _sync_bus_to_clock()
     ctx.hub.broadcast("sim_state_changed", state)
+    ctx.hub.broadcast("pos_reset", {})
     return {"preset_id": preset_id, "inserted": _bundle_summary(data), "sim_state": state}
 
 
@@ -641,6 +666,7 @@ def seed_generate(body: GenerateBody) -> Dict[str, Any]:
         ctx.scenarios.seed_default_scenario()
         state = _sync_bus_to_clock()
     ctx.hub.broadcast("sim_state_changed", state)
+    ctx.hub.broadcast("pos_reset", {})
     return {"cuisine": body.cuisine, "inserted": _bundle_summary(data), "sim_state": state}
 
 
@@ -806,6 +832,121 @@ def read_signals(
     if group is not None:
         result = [r for r in result if group in (r.get("groups") or [])]
     return result
+
+
+@app.get("/api/orders")
+def read_orders(
+    limit: int = Query(50),
+    since: Optional[float] = Query(None),
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    """Recent POS orders for the monitor's initial backfill.
+
+    Returns newest-first ``[{order, lines}]`` mirroring the live
+    ``order_created`` WS payload (minus the ephemeral ``velocity`` map, which
+    the client recomputes from the streamed window). Lines are fetched in a
+    single ``IN`` query to avoid N+1.
+    """
+    limit = max(1, min(limit, 200))
+    query = db_session.query(models.Order)
+    if since is not None:
+        query = query.filter(models.Order.sim_time > since)
+    orders = query.order_by(models.Order.sim_time.desc()).limit(limit).all()
+    if not orders:
+        return []
+    order_ids = [o.id for o in orders]
+    lines = (
+        db_session.query(models.OrderLine)
+        .filter(models.OrderLine.order_id.in_(order_ids))
+        .all()
+    )
+    lines_by_order: Dict[int, List[Dict[str, Any]]] = {}
+    for line in lines:
+        lines_by_order.setdefault(line.order_id, []).append(line_to_dict(line))
+    return [
+        {"order": order_to_dict(o), "lines": lines_by_order.get(o.id, [])}
+        for o in orders
+    ]
+
+
+@app.get("/api/pos/stats")
+def read_pos_stats(
+    since: float = Query(0.0),
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    """Aggregated POS statistics over ``(since, now]`` for the monitor's window
+    selector (Today / last hour / 30m / 15m).
+
+    Computed server-side so totals are accurate for any window regardless of the
+    client's bounded live buffer. ``since`` is clamped to ``>= 0`` so the seeded
+    negative-``sim_time`` history is never included. Also returns ~24 adaptive
+    time buckets across the window for the orders-over-time chart.
+    """
+    since = max(float(since), 0.0)
+    now = float(ctx.clock.sim_time)
+
+    order_filter = models.Order.sim_time > since
+    line_filter = models.OrderLine.sim_time > since
+
+    orders = db_session.query(func.count(models.Order.id)).filter(order_filter).scalar() or 0
+    revenue = (
+        db_session.query(func.coalesce(func.sum(models.Order.total), 0.0))
+        .filter(order_filter)
+        .scalar()
+        or 0.0
+    )
+    channel_split = {
+        (channel or "unknown"): count
+        for channel, count in db_session.query(
+            models.Order.channel, func.count(models.Order.id)
+        )
+        .filter(order_filter)
+        .group_by(models.Order.channel)
+        .all()
+    }
+    lines = db_session.query(func.count(models.OrderLine.id)).filter(line_filter).scalar() or 0
+    voided_lines = (
+        db_session.query(func.count(models.OrderLine.id))
+        .filter(line_filter, models.OrderLine.status == "voided")
+        .scalar()
+        or 0
+    )
+    top_items = [
+        {"menu_item_id": menu_item_id, "qty": float(qty or 0.0)}
+        for menu_item_id, qty in db_session.query(
+            models.OrderLine.menu_item_id, func.sum(models.OrderLine.qty)
+        )
+        .filter(line_filter, models.OrderLine.status != "voided")
+        .group_by(models.OrderLine.menu_item_id)
+        .order_by(func.sum(models.OrderLine.qty).desc())
+        .limit(8)
+        .all()
+    ]
+
+    # ~24 adaptive buckets (min 60 sim-s wide) for the orders-over-time chart.
+    span = max(now - since, 1.0)
+    width = max(60.0, span / 24.0)
+    bucket_count = int(math.ceil(span / width))
+    counts = [0] * (bucket_count + 1)
+    for (sim_time,) in db_session.query(models.Order.sim_time).filter(order_filter).all():
+        idx = int((float(sim_time) - since) // width)
+        if 0 <= idx < len(counts):
+            counts[idx] += 1
+    buckets = [
+        {"t": since + i * width, "orders": count} for i, count in enumerate(counts)
+    ]
+
+    return {
+        "since": since,
+        "now": now,
+        "orders": int(orders),
+        "revenue": float(revenue),
+        "lines": int(lines),
+        "voided_lines": int(voided_lines),
+        "channel_split": channel_split,
+        "top_items": top_items,
+        "buckets": buckets,
+    }
 
 
 @app.get("/api/approvals")
