@@ -10,7 +10,6 @@ import {
   Play,
   RotateCcw,
   Send,
-  Settings,
   Square,
   StepForward,
   Wifi,
@@ -23,19 +22,15 @@ import {
   useApprovals,
   useCallTurns,
   useSimState,
-  useWeather,
   useWsConnected,
 } from "../store";
 import type {
-  Scenario,
   SimSettings,
   SimState,
   SimStatus,
-  WeatherCondition,
 } from "../types";
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8];
-const CONDITIONS: WeatherCondition[] = ["clear", "clouds", "rain", "storm", "snow"];
 const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 // Voice extraction can include a real LLM call; keep this above provider timeout.
 const VOICE_TIMEOUT_MS = 45000;
@@ -508,188 +503,6 @@ function VoiceConsole() {
 }
 
 // ---------------------------------------------------------------------------
-// Weather override panel
-// ---------------------------------------------------------------------------
-
-function WeatherOverride() {
-  const weather = useWeather();
-  const [temp, setTemp] = useState(20);
-  const [condition, setCondition] = useState<WeatherCondition>("clear");
-  const [precip, setPrecip] = useState(0);
-  const [wind, setWind] = useState(5);
-
-  async function apply() {
-    try {
-      await apiPost("/api/weather/override", {
-        temp_c: temp,
-        condition,
-        precip_mm: precip,
-        wind_kph: wind,
-      });
-    } catch {
-      /* ignore; weather_updated WS event reflects the applied value */
-    }
-  }
-
-  return (
-    <div className="flex items-end gap-1">
-      <label className="flex flex-col text-[10px] text-text/40">
-        °C
-        <input
-          type="number"
-          value={temp}
-          onChange={(e) => setTemp(Number(e.target.value))}
-          className="w-14 rounded-md border border-muted bg-primary px-1 py-1 text-sm text-text outline-none focus:border-accent"
-        />
-      </label>
-      <label className="flex flex-col text-[10px] text-text/40">
-        Condition
-        <select
-          value={condition}
-          onChange={(e) => setCondition(e.target.value as WeatherCondition)}
-          className="rounded-md border border-muted bg-primary px-1 py-1 text-sm text-text outline-none focus:border-accent"
-        >
-          {CONDITIONS.map((c) => (
-            <option key={c} value={c}>
-              {c}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="flex flex-col text-[10px] text-text/40">
-        precip
-        <input
-          type="number"
-          value={precip}
-          onChange={(e) => setPrecip(Number(e.target.value))}
-          className="w-12 rounded-md border border-muted bg-primary px-1 py-1 text-sm text-text outline-none focus:border-accent"
-        />
-      </label>
-      <label className="flex flex-col text-[10px] text-text/40">
-        wind
-        <input
-          type="number"
-          value={wind}
-          onChange={(e) => setWind(Number(e.target.value))}
-          className="w-12 rounded-md border border-muted bg-primary px-1 py-1 text-sm text-text outline-none focus:border-accent"
-        />
-      </label>
-      <button
-        type="button"
-        onClick={() => void apply()}
-        className="rounded-md bg-muted px-2 py-1.5 text-sm text-text hover:bg-muted/70"
-      >
-        Set
-      </button>
-      <span className="pb-1.5 text-xs text-text/60">
-        now: {weather ? weather.condition : "—"}
-      </span>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Scenario + seed pickers
-// ---------------------------------------------------------------------------
-
-function ScenarioPicker() {
-  const [scenarios, setScenarios] = useState<Scenario[]>([]);
-
-  useEffect(() => {
-    apiGet<Scenario[]>("/api/scenarios")
-      .then(setScenarios)
-      .catch(() => undefined);
-  }, []);
-
-  const activeId = scenarios.find((s) => s.is_active)?.id ?? "";
-
-  async function onChange(value: string) {
-    const prevActive = scenarios.find((s) => s.is_active);
-    try {
-      if (value === "") {
-        if (prevActive) await apiPost(`/api/scenarios/${prevActive.id}/deactivate`);
-      } else {
-        if (prevActive && prevActive.id !== Number(value)) {
-          await apiPost(`/api/scenarios/${prevActive.id}/deactivate`);
-        }
-        await apiPost(`/api/scenarios/${value}/activate`);
-      }
-      const refreshed = await apiGet<Scenario[]>("/api/scenarios");
-      setScenarios(refreshed);
-    } catch {
-      /* ignore */
-    }
-  }
-
-  return (
-    <select
-      value={activeId}
-      onChange={(e) => void onChange(e.target.value)}
-      className="rounded-md border border-muted bg-primary px-2 py-1.5 text-sm text-text outline-none focus:border-accent"
-    >
-      <option value="">No scenario</option>
-      {scenarios.map((s) => (
-        <option key={s.id} value={s.id}>
-          {s.name}
-        </option>
-      ))}
-    </select>
-  );
-}
-
-function SeedPicker() {
-  const [presets, setPresets] = useState<string[]>([]);
-  const [selected, setSelected] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    apiGet<string[]>("/api/seed/presets")
-      .then((rows) => {
-        setPresets(rows);
-        if (rows.length > 0) setSelected(rows[0]);
-      })
-      .catch(() => undefined);
-  }, []);
-
-  async function load() {
-    if (!selected || loading) return;
-    setLoading(true);
-    try {
-      await apiPost(`/api/seed/preset/${selected}`);
-    } catch {
-      /* ignore */
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <div className="flex items-center gap-1">
-      <select
-        value={selected}
-        onChange={(e) => setSelected(e.target.value)}
-        className="rounded-md border border-muted bg-primary px-2 py-1.5 text-sm text-text outline-none focus:border-accent"
-      >
-        {presets.length === 0 && <option value="">no presets</option>}
-        {presets.map((p) => (
-          <option key={p} value={p}>
-            {p}
-          </option>
-        ))}
-      </select>
-      <button
-        type="button"
-        onClick={() => void load()}
-        disabled={!selected || loading}
-        className="rounded-md bg-muted px-2 py-1.5 text-sm text-text hover:bg-muted/70 disabled:opacity-50"
-      >
-        {loading ? "Loading…" : "Load"}
-      </button>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Velocity slider
 // ---------------------------------------------------------------------------
 
@@ -744,10 +557,8 @@ const OPTIMISTIC: Partial<Record<string, SimStatus>> = {
 
 export function ControlBar({
   onToggleInbox,
-  onToggleSettings,
 }: {
   onToggleInbox: () => void;
-  onToggleSettings: () => void;
 }) {
   const simState = useSimState();
   const wsConnected = useWsConnected();
@@ -870,6 +681,10 @@ export function ControlBar({
             </Section>
           </div>
 
+          <Section label="Velocity">
+            <VelocitySlider />
+          </Section>
+
           <Section label="WS">
             <span
               className={
@@ -887,16 +702,6 @@ export function ControlBar({
 
           <button
             type="button"
-            onClick={onToggleSettings}
-            className="flex h-9 w-9 items-center justify-center rounded-md bg-muted text-text hover:bg-muted/70"
-            aria-label="Toggle settings"
-            title="Settings"
-          >
-            <Settings size={18} />
-          </button>
-
-          <button
-            type="button"
             onClick={onToggleInbox}
             className="relative flex h-9 w-9 items-center justify-center rounded-md bg-muted text-text hover:bg-muted/70"
             aria-label="Toggle approval inbox"
@@ -907,23 +712,6 @@ export function ControlBar({
               {approvals.length}
             </span>
           </button>
-        </div>
-
-        <div className="flex flex-wrap items-end gap-x-4 gap-y-2 border-t border-muted/60 pt-2">
-          <div className="min-w-[24rem] flex-1">
-            <Section label="Weather override">
-              <WeatherOverride />
-            </Section>
-          </div>
-          <Section label="Velocity">
-            <VelocitySlider />
-          </Section>
-          <Section label="Scenario">
-            <ScenarioPicker />
-          </Section>
-          <Section label="Seed preset">
-            <SeedPicker />
-          </Section>
         </div>
       </div>
     </header>

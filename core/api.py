@@ -567,6 +567,32 @@ def sim_state() -> Dict[str, Any]:
     return ctx.clock.current_state()
 
 
+class SimConfigBody(BaseModel):
+    """Editable sim_state config fields (not owned by the clock state machine)."""
+    operating_window: Optional[Dict[str, Any]] = None
+    skip_closed_hours: Optional[bool] = None
+    call_mode: Optional[str] = None  # "freeze" | "slow"
+
+
+@app.patch("/api/sim/state")
+def patch_sim_state(body: SimConfigBody) -> Dict[str, Any]:
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=422, detail="No sim config fields provided")
+    with db.DB_LOCK:
+        session = db.new_session()
+        try:
+            state = get_or_create_sim_state(session)
+            for field, value in updates.items():
+                setattr(state, field, value)
+            session.commit()
+        finally:
+            session.close()
+    result = ctx.clock.current_state()
+    ctx.hub.broadcast("sim_state_changed", result)
+    return result
+
+
 @app.get("/api/sim/pos")
 def get_sim_pos() -> Dict[str, Any]:
     with db.DB_LOCK:
@@ -735,6 +761,7 @@ CRUD_RESOURCES = {
     "ingredients": models.Ingredient,
     "menu": models.MenuItem,
     "recipes": models.Recipe,
+    "recipe-lines": models.RecipeLine,
     "staff": models.Staff,
     "suppliers": models.Supplier,
     "supplier-catalog": models.SupplierCatalog,
@@ -743,6 +770,10 @@ CRUD_RESOURCES = {
     "reviews": models.Review,
     # scenario_events get full CRUD here; scenarios use custom GET (nested) below
     "scenario_events": models.ScenarioEvent,
+    # Control page editors
+    "stations": models.Station,
+    "batch-definitions": models.BatchDefinition,
+    "promotions": models.Promotion,
 }
 
 

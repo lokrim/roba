@@ -17,6 +17,10 @@ export interface SimState {
   call_mode?: "freeze" | "slow";
   /** Active preset id; changes when a restaurant is (re)seeded. */
   active_seed_id?: string | null;
+  /** Operating window in seconds-since-midnight, e.g. { open: 28800, close: 82800 }. */
+  operating_window?: { open?: number; close?: number } | null;
+  /** When true the clock jumps over closed hours. */
+  skip_closed_hours?: boolean;
 }
 
 /** Canonical weather struct (00 §9.1) as carried by weather_updated / GET /api/weather. */
@@ -154,6 +158,45 @@ export interface MenuItem {
 
 /** Generic entity row for the entity editor (columns vary per resource). */
 export type EntityRow = Record<string, unknown>;
+
+/** stations row (GET/PATCH /api/stations). */
+export interface Station {
+  id: number;
+  name: string;
+}
+
+/** recipes row (GET /api/recipes). */
+export interface Recipe {
+  id: number;
+  menu_item_id: number;
+}
+
+/** recipe_lines row (GET/PATCH /api/recipe-lines). */
+export interface RecipeLine {
+  id: number;
+  recipe_id: number;
+  ingredient_id: number;
+  qty: number | null;
+  unit: string | null;
+  optional: number;
+}
+
+/** batch_definitions row (GET/PATCH /api/batch-definitions). */
+export interface BatchDefinition {
+  id: number;
+  menu_item_id: number;
+  dayparts: string[] | null;
+  prep_lead_time_min: number | null;
+  batch_size_min: number | null;
+  batch_size_step: number | null;
+  batch_size_max: number | null;
+  decide_by_offset_min: number | null;
+  prepared_shelf_life_min: number | null;
+  station_id: number | null;
+  required_skill: string | null;
+  default_cadence_min: number | null;
+  historical_attach_rate: number | null;
+}
 
 /** orders row, as carried by GET /api/orders and the order_created WS payload. */
 export interface PosOrder {

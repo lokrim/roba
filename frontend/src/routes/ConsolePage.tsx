@@ -1,11 +1,11 @@
 import { ControlShell } from "../shell/ControlShell";
-import { PanelsView } from "../shell/PanelsView";
+import { DashboardView } from "../shell/DashboardView";
 
-// Full operator console: control bar + drawers + panels.
+// Full operator console: live control bar + unified domain-grouped dashboard.
 export default function ConsolePage() {
   return (
     <ControlShell>
-      <PanelsView />
+      <DashboardView />
     </ControlShell>
   );
 }

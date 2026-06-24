@@ -1,0 +1,206 @@
+import { useEffect, useState } from "react";
+import { Save, UserX, Users } from "lucide-react";
+import { apiGet, apiPatch, apiPost } from "../../api";
+import type { EntityRow, Station } from "../../types";
+import { SectionHeading } from "./shared";
+
+interface StaffRow extends EntityRow {
+  id: number;
+  name: string;
+  role: string | null;
+  skill_level: number | null;
+  hourly_cost: number | null;
+  active: number;
+}
+
+function StationsPanel() {
+  const [stations, setStations] = useState<Station[]>([]);
+  const [newName, setNewName] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  useEffect(() => {
+    apiGet<Station[]>("/api/stations").then(setStations).catch(() => undefined);
+  }, []);
+
+  async function create() {
+    if (!newName.trim()) return;
+    setCreating(true);
+    try {
+      const created = await apiPost<Station>("/api/stations", { name: newName.trim() });
+      setStations((prev) => [...prev, created]);
+      setNewName("");
+    } catch { /* ignore */ } finally { setCreating(false); }
+  }
+
+  async function saveName(station: Station, name: string) {
+    if (!name.trim() || name === station.name) return;
+    const updated = await apiPatch<Station>(`/api/stations/${station.id}`, { name });
+    setStations((prev) => prev.map((s) => s.id === station.id ? updated : s));
+  }
+
+  return (
+    <div>
+      <SectionHeading>Kitchen Stations</SectionHeading>
+      <div className="space-y-2">
+        {stations.map((s) => (
+          <StationRow key={s.id} station={s} onSave={(name) => void saveName(s, name)} />
+        ))}
+        {stations.length === 0 && <p className="text-sm text-text/40">No stations. Load a seed or add one.</p>}
+      </div>
+      <div className="mt-3 flex items-center gap-2">
+        <input
+          value={newName} onChange={(e) => setNewName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") void create(); }}
+          placeholder="New station name…"
+          className="flex-1 max-w-xs rounded-md border border-muted bg-primary px-2 py-1.5 text-sm text-text outline-none focus:border-accent"
+        />
+        <button type="button" onClick={() => void create()} disabled={creating || !newName.trim()}
+          className="rounded-md bg-accent px-3 py-1.5 text-sm text-white disabled:opacity-50">
+          {creating ? "…" : "Add Station"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function StationRow({ station, onSave }: { station: Station; onSave: (name: string) => void }) {
+  const [name, setName] = useState(station.name);
+  const dirty = name !== station.name;
+
+  return (
+    <div className="flex items-center gap-2 rounded border border-muted/60 bg-surface px-3 py-1.5">
+      <input
+        value={name} onChange={(e) => setName(e.target.value)}
+        className="flex-1 bg-transparent text-sm text-text outline-none"
+      />
+      {dirty && (
+        <button type="button" onClick={() => onSave(name)}
+          className="flex items-center gap-1 rounded bg-accent px-2 py-0.5 text-[10px] text-white">
+          <Save size={10} /> Save
+        </button>
+      )}
+    </div>
+  );
+}
+
+function StaffPanel() {
+  const [staff, setStaff] = useState<StaffRow[]>([]);
+  const [edits, setEdits] = useState<Record<number, Partial<StaffRow>>>({});
+  const [busyId, setBusyId] = useState<number | null>(null);
+  const [sickBusy, setSickBusy] = useState<number | null>(null);
+
+  useEffect(() => {
+    apiGet<StaffRow[]>("/api/staff").then(setStaff).catch(() => undefined);
+  }, []);
+
+  function patchRow(id: number, patch: Partial<StaffRow>) {
+    setEdits((prev) => ({ ...prev, [id]: { ...(prev[id] ?? {}), ...patch } }));
+  }
+
+  async function saveRow(s: StaffRow) {
+    const patch = edits[s.id];
+    if (!patch || Object.keys(patch).length === 0) return;
+    setBusyId(s.id);
+    try {
+      const updated = await apiPatch<StaffRow>(`/api/staff/${s.id}`, patch);
+      setStaff((prev) => prev.map((r) => r.id === s.id ? { ...r, ...updated } : r));
+      setEdits((prev) => { const n = { ...prev }; delete n[s.id]; return n; });
+    } catch { /* ignore */ } finally { setBusyId(null); }
+  }
+
+  async function callInSick(s: StaffRow) {
+    setSickBusy(s.id);
+    try {
+      await apiPost("/api/track-a/staff/call-in-sick", { staff_id: s.id });
+    } catch { /* ignore */ } finally { setSickBusy(null); }
+  }
+
+  async function recompute() {
+    await apiPost("/api/track-a/staff/recompute").catch(() => undefined);
+  }
+
+  function val(s: StaffRow, key: keyof StaffRow) {
+    return String((edits[s.id]?.[key] ?? s[key]) ?? "");
+  }
+
+  return (
+    <div>
+      <div className="mb-3 flex items-center gap-3">
+        <SectionHeading>Staff</SectionHeading>
+        <button type="button" onClick={() => void recompute()}
+          className="flex items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs text-text hover:bg-muted/70">
+          <Users size={12} /> Recompute coverage
+        </button>
+      </div>
+      <div className="overflow-x-auto rounded-lg border border-muted">
+        <table className="w-full text-left text-xs">
+          <thead>
+            <tr className="border-b border-muted bg-surface/60">
+              {["Name", "Role", "Skill", "Cost/hr", "Active", "Actions"].map((h) => (
+                <th key={h} className="px-2 py-1.5 font-medium text-text/50">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {staff.map((s) => {
+              const hasPatch = Object.keys(edits[s.id] ?? {}).length > 0;
+              const merged = { ...s, ...(edits[s.id] ?? {}) };
+              return (
+                <tr key={s.id} className="border-b border-muted/40 last:border-0 hover:bg-surface/20">
+                  <td className="px-2 py-1">
+                    <input value={val(s, "name")} onChange={(e) => patchRow(s.id, { name: e.target.value })}
+                      className="w-28 bg-transparent outline-none focus:border-b focus:border-accent" />
+                  </td>
+                  <td className="px-2 py-1">
+                    <input value={val(s, "role")} onChange={(e) => patchRow(s.id, { role: e.target.value })}
+                      className="w-24 bg-transparent outline-none focus:border-b focus:border-accent" />
+                  </td>
+                  <td className="px-2 py-1">
+                    <input type="number" min={1} max={5} value={val(s, "skill_level")}
+                      onChange={(e) => patchRow(s.id, { skill_level: Number(e.target.value) })}
+                      className="w-12 bg-transparent outline-none focus:border-b focus:border-accent" />
+                  </td>
+                  <td className="px-2 py-1">
+                    <input type="number" step="0.01" value={val(s, "hourly_cost")}
+                      onChange={(e) => patchRow(s.id, { hourly_cost: Number(e.target.value) })}
+                      className="w-16 bg-transparent outline-none focus:border-b focus:border-accent" />
+                  </td>
+                  <td className="px-2 py-1">
+                    <input type="checkbox" checked={merged.active === 1}
+                      onChange={(e) => patchRow(s.id, { active: e.target.checked ? 1 : 0 })}
+                      className="accent-accent" />
+                  </td>
+                  <td className="flex items-center gap-1 px-2 py-1">
+                    {hasPatch && (
+                      <button type="button" onClick={() => void saveRow(s)} disabled={busyId === s.id}
+                        className="rounded bg-accent px-1.5 py-0.5 text-[10px] text-white disabled:opacity-50">
+                        {busyId === s.id ? "…" : "Save"}
+                      </button>
+                    )}
+                    <button type="button" onClick={() => void callInSick(s)} disabled={sickBusy === s.id}
+                      title="Call in sick"
+                      className="flex items-center gap-0.5 rounded bg-warning/20 px-1.5 py-0.5 text-[10px] text-warning hover:bg-warning/30 disabled:opacity-50">
+                      <UserX size={10} /> Sick
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {staff.length === 0 && (
+              <tr><td colSpan={6} className="py-4 text-center text-text/30">No staff. Load a seed.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+export function StaffStations() {
+  return (
+    <div className="space-y-8">
+      <StationsPanel />
+      <StaffPanel />
+    </div>
+  );
+}

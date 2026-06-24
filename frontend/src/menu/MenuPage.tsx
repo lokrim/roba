@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { apiGet } from "../api";
 import type { MenuItem, SimState } from "../types";
 
@@ -65,7 +66,13 @@ export default function MenuPage() {
   return (
     <div className="min-h-screen bg-stone-50 text-stone-900">
       <header className="border-b border-stone-200 bg-white">
-        <div className="mx-auto max-w-3xl px-6 py-8">
+        <div className="mx-auto max-w-3xl px-6 py-6">
+          <Link
+            to="/"
+            className="mb-4 inline-flex items-center gap-1 text-xs text-stone-400 hover:text-stone-600"
+          >
+            ← Operator console
+          </Link>
           <h1 className="text-3xl font-semibold tracking-tight">{title}</h1>
           <p className="mt-1 text-sm text-stone-500">Menu</p>
         </div>

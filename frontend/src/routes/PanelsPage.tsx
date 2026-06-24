@@ -1,7 +1,6 @@
-import { PanelsView } from "../shell/PanelsView";
+import { DashboardView } from "../shell/DashboardView";
 
-// Read-only dashboards only — no control bar. Intended for a second screen
-// showing the live POS monitor and agent panels while another screen drives.
+// Read-only second screen — unified domain-grouped dashboard, no control bar.
 export default function PanelsPage() {
-  return <PanelsView />;
+  return <DashboardView readOnly />;
 }

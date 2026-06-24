@@ -1,0 +1,111 @@
+/**
+ * DashboardView — unified operator dashboard with domain-grouped tabs.
+ * Replaces PanelsView. All panel components are unchanged; only the tab
+ * container changes — no Track A / Track B wording or group dividers.
+ */
+import { useState } from "react";
+import { CompetitorPanel } from "../track_a/CompetitorPanel";
+import { ForecastDashboard } from "../track_a/ForecastDashboard";
+import { ReviewPanel } from "../track_a/ReviewPanel";
+import { SignalFeed } from "../track_a/SignalFeed";
+import { StaffPanel } from "../track_a/StaffPanel";
+import { PosMonitor } from "../pos/PosMonitor";
+import { TRACK_B_PANELS } from "../track_b";
+
+// ---------------------------------------------------------------------------
+// Tab definitions (flat strip, domain names — no "Track A / Track B")
+// ---------------------------------------------------------------------------
+
+interface TabDef {
+  id: string;
+  label: string;
+}
+
+const TABS: TabDef[] = [
+  { id: "operations",  label: "Operations" },
+  { id: "forecast",    label: "Forecast" },
+  { id: "staff",       label: "Staff" },
+  { id: "inventory",   label: "Inventory" },
+  { id: "expiry",      label: "Expiry" },
+  { id: "competitors", label: "Competitors" },
+  { id: "reviews",     label: "Reviews" },
+  { id: "suppliers",   label: "Suppliers" },
+  { id: "activity",    label: "Activity" },
+  { id: "signals",     label: "Signals" },
+];
+
+function Panel({ id }: { id: string }) {
+  switch (id) {
+    case "operations":  return <PosMonitor />;
+    case "forecast":    return <ForecastDashboard />;
+    case "staff":       return <StaffPanel />;
+    case "inventory": {
+      const p = TRACK_B_PANELS.find((p) => p.name === "Inventory");
+      return p ? <p.component /> : null;
+    }
+    case "expiry": {
+      const p = TRACK_B_PANELS.find((p) => p.name === "Expiry");
+      return p ? <p.component /> : null;
+    }
+    case "competitors": return <CompetitorPanel />;
+    case "reviews":     return <ReviewPanel />;
+    case "suppliers": {
+      const p = TRACK_B_PANELS.find((p) => p.name === "Suppliers");
+      return p ? <p.component /> : null;
+    }
+    case "activity": {
+      const p = TRACK_B_PANELS.find((p) => p.name === "Activity Log");
+      return p ? <p.component /> : null;
+    }
+    case "signals": return <SignalFeed />;
+    default: return <div className="text-text/30 text-sm p-4">Panel not found: {id}</div>;
+  }
+}
+
+function TabButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={
+        active
+          ? "rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white"
+          : "rounded-md px-3 py-1.5 text-sm font-medium text-text/60 hover:bg-muted/50 hover:text-text"
+      }
+    >
+      {label}
+    </button>
+  );
+}
+
+interface DashboardViewProps {
+  /** When true, the panel is read-only (no side effects — reserved for the /panels route). */
+  readOnly?: boolean;
+}
+
+export function DashboardView({ readOnly: _readOnly }: DashboardViewProps) {
+  const [activeId, setActiveId] = useState(TABS[0].id);
+
+  return (
+    <main className="px-4 py-4">
+      <div className="flex flex-col gap-3">
+        {/* Flat tab strip — no Track A / Track B labels */}
+        <div className="flex flex-wrap items-center gap-1.5 rounded-lg bg-surface p-2">
+          {TABS.map((tab) => (
+            <TabButton
+              key={tab.id}
+              label={tab.label}
+              active={activeId === tab.id}
+              onClick={() => setActiveId(tab.id)}
+            />
+          ))}
+        </div>
+
+        {/* Panel */}
+        <div className="min-h-[60vh]">
+          <Panel id={activeId} />
+        </div>
+      </div>
+    </main>
+  );
+}
