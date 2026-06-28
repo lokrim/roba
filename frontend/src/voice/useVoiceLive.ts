@@ -50,7 +50,9 @@ export interface VoiceLiveHook {
 }
 
 const CONNECT_TIMEOUT_MS = 8_000;   // "connecting" → "unavailable"
-const THINKING_TIMEOUT_MS = 20_000; // "thinking" → "ready" + error msg
+// Safety net only — normally cleared by the first audio byte ("speaking"),
+// the first roba transcript, a tool_result, or an error.
+const THINKING_TIMEOUT_MS = 30_000; // "thinking" → "ready" + error msg
 
 let _lineId = 0;
 function nextId() {
@@ -154,10 +156,23 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           break;
         case "tool_result":
           clearThinkingTimer();
-          setState("ready");
           if (ev.tool === "get_kitchen_status" && ev.result) {
             setLastStatus(ev.result as Record<string, unknown>);
           }
+          break;
+        case "speaking":
+          // First audio byte arrived — the pipeline is responding.
+          clearThinkingTimer();
+          setState("speaking");
+          break;
+        case "turn_complete":
+          // Done generating; stay "speaking" until audio drains (playback_done).
+          clearThinkingTimer();
+          break;
+        case "playback_done":
+          setState((cur) =>
+            cur === "speaking" || cur === "thinking" ? "ready" : cur,
+          );
           break;
         case "error":
           clearThinkingTimer();

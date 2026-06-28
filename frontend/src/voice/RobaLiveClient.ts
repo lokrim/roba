@@ -15,6 +15,9 @@ export type LiveClientEvent =
   | { type: "plan_preview"; plan: PlanResult }
   | { type: "tool_result"; tool: string; result: unknown }
   | { type: "applied"; plan_id: string; signal_ids: string[] }
+  | { type: "speaking" }       // first audio byte of a turn started playing
+  | { type: "turn_complete" }  // server signalled the turn is done generating
+  | { type: "playback_done" }  // turn done AND all audio finished playing
   | { type: "error"; message: string }
   | { type: "disconnected" };
 
@@ -226,6 +229,11 @@ export class RobaLiveClient {
           signal_ids: (result.signal_ids as string[]) ?? [],
         });
       }
+    } else if (t === "turn_complete") {
+      this.turnComplete = true;
+      this.emit({ type: "turn_complete" });
+      // No audio still playing (text-only turn or already drained) → end now.
+      if (this.playbackSources === 0) this.finishTurn();
     } else if (t === "error") {
       this.emit({ type: "error", message: String(msg.message ?? "") });
     }
@@ -236,18 +244,36 @@ export class RobaLiveClient {
   // ---------------------------------------------------------------------------
 
   private playbackCtx: AudioContext | null = null;
+  private playbackSources = 0;   // buffers scheduled but not yet finished
+  private speakingEmitted = false; // emitted "speaking" for the current turn?
+  private turnComplete = false;   // server sent turn_complete for this turn?
 
   private stopPlayback() {
     // Clear any in-progress audio by closing and re-creating the context.
     this.playbackCtx?.close();
     this.playbackCtx = null;
     this.playbackTime = 0;
+    this.playbackSources = 0;
+    this.speakingEmitted = false;
+    this.turnComplete = false;
+  }
+
+  // Turn finished generating AND all its audio has played out.
+  private finishTurn() {
+    this.speakingEmitted = false;
+    this.turnComplete = false;
+    this.emit({ type: "playback_done" });
   }
 
   private playPcm(buffer: ArrayBuffer) {
     if (!this.playbackCtx) {
       this.playbackCtx = new AudioContext({ sampleRate: 24000 });
       this.playbackTime = this.playbackCtx.currentTime;
+    }
+    // First audio of the turn → tell the UI Roba is speaking (clears "thinking").
+    if (!this.speakingEmitted) {
+      this.speakingEmitted = true;
+      this.emit({ type: "speaking" });
     }
     const samples = new Int16Array(buffer);
     const float32 = new Float32Array(samples.length);
@@ -260,6 +286,12 @@ export class RobaLiveClient {
     source.buffer = audioBuffer;
     source.connect(this.playbackCtx.destination);
     const startAt = Math.max(this.playbackTime, this.playbackCtx.currentTime);
+    this.playbackSources += 1;
+    source.onended = () => {
+      this.playbackSources = Math.max(0, this.playbackSources - 1);
+      // Last buffer drained and the server already closed the turn → done.
+      if (this.playbackSources === 0 && this.turnComplete) this.finishTurn();
+    };
     source.start(startAt);
     this.playbackTime = startAt + audioBuffer.duration;
   }

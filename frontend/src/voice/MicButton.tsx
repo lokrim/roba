@@ -9,7 +9,7 @@
  * This matches common voice assistant UX conventions.
  */
 
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { Mic, MicOff, Loader2, Volume2 } from "lucide-react";
 import type { VoiceState } from "./useVoiceLive";
 
@@ -21,7 +21,7 @@ export const STATE_LABEL: Record<VoiceState, string> = {
   ready: "Tap or hold to talk",
   listening: "Listening… release or tap to send",
   thinking: "Thinking…",
-  speaking: "Roba speaking",
+  speaking: "Roba speaking — tap to interrupt",
   unavailable: "Voice unavailable",
 };
 
@@ -41,6 +41,8 @@ const SIZE = {
 export function MicButton({ state, size = "md", onStart, onStop }: MicButtonProps) {
   const pressTimeRef = useRef<number | null>(null);
   const isHoldRef = useRef(false);
+  // True while the mic is held open by a tap (toggle) rather than a press-hold.
+  const [toggleListening, setToggleListening] = useState(false);
   const isListening = state === "listening";
   const disabled =
     state === "idle" ||
@@ -49,6 +51,12 @@ export function MicButton({ state, size = "md", onStart, onStop }: MicButtonProp
     state === "thinking";
 
   const { btn, icon } = SIZE[size];
+
+  // Stop capturing immediately and clear toggle bookkeeping.
+  function stop() {
+    setToggleListening(false);
+    onStop();
+  }
 
   function handlePointerDown(e: React.PointerEvent) {
     if (disabled) return;
@@ -69,33 +77,45 @@ export function MicButton({ state, size = "md", onStart, onStop }: MicButtonProp
 
     if (isListening) {
       if (elapsed < HOLD_THRESHOLD_MS) {
-        // Short tap while listening: was a toggle-on. Keep it on (toggle behaviour).
-        // Do nothing — user tapped to toggle it on, another tap will toggle off.
+        // Short tap while listening: it was a toggle-on. Keep listening; mark it
+        // a toggle so the UI shows a persistent "listening" indicator.
+        setToggleListening(true);
         return;
       } else {
-        // Hold-to-talk release: stop.
+        // Hold-to-talk release: stop instantly.
         isHoldRef.current = true;
-        onStop();
+        stop();
       }
     } else {
       // We called onStart() on pointerDown. If it was a short tap, toggle mode:
       // keep listening until next tap.  If it was a long hold, stop immediately.
       if (elapsed >= HOLD_THRESHOLD_MS) {
         isHoldRef.current = true;
-        onStop();
+        stop();
+      } else {
+        // short tap = toggle on → keep listening, show the indicator.
+        setToggleListening(true);
       }
-      // else: short tap = toggle on, do nothing on pointerUp.
     }
   }
 
   function handlePointerLeave() {
-    // If currently in hold mode (long press that left the button), stop.
+    // If currently in hold mode (long press that left the button), stop instantly.
     if (!disabled && isListening && pressTimeRef.current !== null) {
       const elapsed = Date.now() - pressTimeRef.current;
       pressTimeRef.current = null;
       if (elapsed >= HOLD_THRESHOLD_MS) {
-        onStop();
+        stop();
       }
+    }
+  }
+
+  // Pointer interrupted (e.g. OS gesture, mouse left window mid-press): if we're
+  // in a hold, stop recording instantly so we never keep a dangling open mic.
+  function handlePointerCancel() {
+    pressTimeRef.current = null;
+    if (isListening && !toggleListening) {
+      stop();
     }
   }
 
@@ -104,18 +124,27 @@ export function MicButton({ state, size = "md", onStart, onStop }: MicButtonProp
     if (disabled) return;
     // Only treat as toggle-off if we didn't just do a hold-to-talk release.
     if (isListening && !isHoldRef.current) {
-      onStop();
+      stop();
     }
     isHoldRef.current = false;
   }
 
   return (
     <div className="flex flex-col items-center gap-3">
+      {/* Persistent indicator when the mic is toggled on (tap-to-talk), so the
+          user always knows it is still listening until they tap again. */}
+      {isListening && toggleListening && (
+        <span className="flex items-center gap-1.5 rounded-full bg-danger/15 px-2.5 py-1 text-xs font-medium text-danger">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-danger" />
+          Listening — tap to send
+        </span>
+      )}
       <button
         disabled={disabled}
         onPointerDown={handlePointerDown}
         onPointerUp={handlePointerUp}
         onPointerLeave={handlePointerLeave}
+        onPointerCancel={handlePointerCancel}
         onClick={handleClick}
         aria-label={isListening ? "Stop listening" : "Start listening"}
         aria-pressed={isListening}

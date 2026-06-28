@@ -34,12 +34,18 @@ from .models import (
     Forecast,
     Batch,
     BatchDefinition,
+    Competitor,
+    CompetitorObservation,
+    Forecast,
     Ingredient,
     InventoryLevel,
     MenuItem,
     Recipe,
     RecipeLine,
+    Review,
+    ReviewInsight,
     Staff,
+    StaffStation,
     Station,
     Supplier,
     UserFact,
@@ -941,9 +947,24 @@ class VoiceProcessor:
                 }
                 for staff in session.query(Staff).order_by(Staff.id.asc()).all()
             ][:20]
+            ingredient_lookup = {
+                int(ingredient.id): ingredient
+                for ingredient in session.query(Ingredient).all()
+            }
             inventory_rows = [
                 {
                     "ingredient_id": int(level.ingredient_id),
+                    "name": (
+                        str(ingredient_lookup[int(level.ingredient_id)].name or "")
+                        if int(level.ingredient_id) in ingredient_lookup
+                        else str(level.ingredient_id)
+                    ),
+                    # on_hand is expressed in the ingredient's base unit (g | ml | each).
+                    "unit": (
+                        str(ingredient_lookup[int(level.ingredient_id)].base_unit or "")
+                        if int(level.ingredient_id) in ingredient_lookup
+                        else None
+                    ),
                     "on_hand": float(level.on_hand_cached or 0.0),
                     "last_counted_qty": (
                         float(level.last_counted_qty)
@@ -1032,6 +1053,7 @@ class VoiceProcessor:
                 "category_rule": "Category words like dessert, desserts, pizza, pasta, or beverages cascade to every active menu item in that category.",
                 "equipment_rule": "Equipment failures only affect items whose station, category, item name, or description indicates that equipment.",
                 "hard_zero_rule": "Broken equipment, out-of-stock required ingredients, no-more, over, done, finished, and 86 instructions are hard production_unavailable constraints.",
+                "inventory_units_rule": "Each inventory row has a 'name' and a 'unit' (g, ml, or each); 'on_hand' is the quantity in that unit. Always state the unit when reporting a quantity and never read 'on_hand' as a raw item count.",
                 "status_vocabulary": (
                     "Batch state vocabulary (use EXACTLY these terms — do not invent others): "
                     "state=skipped: decision is 'skip', do not cook; "
@@ -1044,6 +1066,232 @@ class VoiceProcessor:
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
+    # -- read queries for the voice assistant -------------------------------
+    #
+    # These power the live voice assistant's read-only tools (get_inventory,
+    # get_forecast, …).  Each returns plain JSON-able structures with names and
+    # units so the model can answer questions accurately rather than guessing
+    # from opaque ids.  They are deliberately small and self-contained (each
+    # opens and closes its own session) so they can be dispatched from the
+    # Gemini Live bridge in a worker thread without touching the event loop.
+
+    def query_inventory(self, item_name: Optional[str] = None) -> Dict[str, Any]:
+        """Current on-hand inventory with ingredient names and units.
+
+        ``on_hand`` is in the ingredient's base unit (g | ml | each).  When
+        ``item_name`` is given, rows whose name contains it (case-insensitive)
+        are returned; if nothing matches, the full list is returned so the
+        caller can reason about near-matches.
+        """
+        session = self.db_session_factory()
+        try:
+            ingredients = {int(ing.id): ing for ing in session.query(Ingredient).all()}
+            all_rows: List[Dict[str, Any]] = []
+            for level in (
+                session.query(InventoryLevel)
+                .order_by(InventoryLevel.ingredient_id.asc())
+                .all()
+            ):
+                ing = ingredients.get(int(level.ingredient_id))
+                all_rows.append({
+                    "ingredient_id": int(level.ingredient_id),
+                    "name": str(ing.name or "") if ing else str(level.ingredient_id),
+                    "unit": (str(ing.base_unit or "") if ing and ing.base_unit else None),
+                    "on_hand": float(level.on_hand_cached or 0.0),
+                    "last_counted_qty": (
+                        float(level.last_counted_qty)
+                        if level.last_counted_qty is not None else None
+                    ),
+                    "par_level": float(level.par_level) if level.par_level is not None else None,
+                    "reorder_point": (
+                        float(level.reorder_point) if level.reorder_point is not None else None
+                    ),
+                })
+        finally:
+            session.close()
+
+        rows = all_rows
+        if item_name:
+            needle = item_name.strip().lower()
+            matched = [r for r in all_rows if needle in str(r["name"]).lower()]
+            rows = matched if matched else all_rows
+        return {"inventory": rows, "count": len(rows)}
+
+    def query_forecast(self, item_name: Optional[str] = None) -> Dict[str, Any]:
+        """Most recent demand forecasts, resolved to menu-item names."""
+        session = self.db_session_factory()
+        try:
+            item_names = {
+                int(mi.id): str(mi.name or "") for mi in session.query(MenuItem).all()
+            }
+            rows: List[Dict[str, Any]] = []
+            for fc in session.query(Forecast).order_by(Forecast.generated_at.desc()).all():
+                name = item_names.get(int(fc.menu_item_id), str(fc.menu_item_id))
+                if item_name and item_name.strip().lower() not in name.lower():
+                    continue
+                rows.append({
+                    "menu_item": name,
+                    "daypart": fc.daypart,
+                    "forecast_qty": int(fc.forecast_qty or 0),
+                    "baseline_qty": (
+                        float(fc.baseline_qty) if fc.baseline_qty is not None else None
+                    ),
+                    "confidence": float(fc.confidence) if fc.confidence is not None else None,
+                    "window": fc.window,
+                    "generated_at": (
+                        float(fc.generated_at) if fc.generated_at is not None else None
+                    ),
+                })
+                if len(rows) >= 40:
+                    break
+        finally:
+            session.close()
+        return {"sim_time": float(self.bus.sim_time), "forecasts": rows, "count": len(rows)}
+
+    def query_competitors(self) -> Dict[str, Any]:
+        """Competitor profiles plus recent market-intelligence observations."""
+        session = self.db_session_factory()
+        try:
+            comp_objs = session.query(Competitor).order_by(Competitor.id.asc()).all()
+            comp_names = {int(c.id): str(c.name or "") for c in comp_objs}
+            competitors = [
+                {
+                    "name": c.name,
+                    "platform": c.platform,
+                    "rating": float(c.rating) if c.rating is not None else None,
+                    "price_tier": c.price_tier,
+                    "distance_km": float(c.distance_km) if c.distance_km is not None else None,
+                    "is_open": bool(c.is_open),
+                }
+                for c in comp_objs
+            ][:40]
+            observations = [
+                {
+                    "competitor": (
+                        comp_names.get(int(o.competitor_id))
+                        if o.competitor_id is not None else None
+                    ),
+                    "signal_kind": o.signal_kind,
+                    "direction": o.direction,
+                    "impact_score": float(o.impact_score) if o.impact_score is not None else None,
+                    "confidence": float(o.confidence) if o.confidence is not None else None,
+                    "affected_menu_items": o.affected_menu_items,
+                    "source_channel": o.source_channel,
+                }
+                for o in (
+                    session.query(CompetitorObservation)
+                    .order_by(CompetitorObservation.sim_time.desc())
+                    .all()
+                )
+            ][:20]
+        finally:
+            session.close()
+        return {"competitors": competitors, "observations": observations}
+
+    def query_reviews(self) -> Dict[str, Any]:
+        """Recent customer reviews and the insights derived from them."""
+        session = self.db_session_factory()
+        try:
+            reviews = [
+                {
+                    "source": r.source,
+                    "rating": float(r.rating) if r.rating is not None else None,
+                    "text": r.text,
+                    "sentiment": r.sentiment,
+                    "dish_mentions": r.dish_mentions,
+                }
+                for r in session.query(Review).order_by(Review.sim_time.desc()).all()
+            ][:20]
+            insights = [
+                {
+                    "insight_type": i.insight_type,
+                    "summary": i.summary,
+                    "suggested_action": i.suggested_action,
+                    "severity": i.severity,
+                }
+                for i in (
+                    session.query(ReviewInsight)
+                    .order_by(ReviewInsight.sim_time.desc())
+                    .all()
+                )
+            ][:20]
+        finally:
+            session.close()
+        return {"reviews": reviews, "insights": insights}
+
+    def query_staff(self) -> Dict[str, Any]:
+        """Staff roster with the stations each person can cover."""
+        session = self.db_session_factory()
+        try:
+            station_names = {
+                int(s.id): str(s.name or "") for s in session.query(Station).all()
+            }
+            cover_by_staff: Dict[int, List[str]] = {}
+            for ss in session.query(StaffStation).all():
+                cover_by_staff.setdefault(int(ss.staff_id), []).append(
+                    station_names.get(int(ss.station_id), str(ss.station_id))
+                )
+            staff = [
+                {
+                    "name": s.name,
+                    "role": s.role,
+                    "skill_level": int(s.skill_level) if s.skill_level is not None else None,
+                    "active": bool(s.active),
+                    "stations": sorted(cover_by_staff.get(int(s.id), [])),
+                }
+                for s in session.query(Staff).order_by(Staff.id.asc()).all()
+            ]
+        finally:
+            session.close()
+        return {"staff": staff, "count": len(staff)}
+
+    def query_signals(self) -> Dict[str, Any]:
+        """All currently-live signals on the bus (constraints, forecasts, etc.)."""
+        try:
+            signals = [
+                {
+                    "type": sig.type,
+                    "source": sig.source,
+                    "priority": sig.priority,
+                    "payload": sig.payload,
+                    "expires_at": sig.expires_at,
+                }
+                for sig in self.bus.live()
+            ][:40]
+        except Exception:  # noqa: BLE001
+            signals = []
+        return {"sim_time": float(self.bus.sim_time), "signals": signals}
+
+    def query_batches(self) -> Dict[str, Any]:
+        """Upcoming / in-progress production batches, resolved to item names."""
+        session = self.db_session_factory()
+        try:
+            item_names = {
+                int(mi.id): str(mi.name or "") for mi in session.query(MenuItem).all()
+            }
+            rows: List[Dict[str, Any]] = []
+            for b in (
+                session.query(Batch)
+                .filter(Batch.status.in_(["decided", "approved", "prepping", "ready"]))
+                .order_by(Batch.decided_at.desc())
+                .all()
+            ):
+                rows.append({
+                    "menu_item": item_names.get(int(b.menu_item_id), str(b.menu_item_id)),
+                    "decision": b.decision,
+                    "status": b.status,
+                    "planned_qty": int(b.planned_qty or 0),
+                    "actual_made_qty": (
+                        float(b.actual_made_qty) if b.actual_made_qty is not None else None
+                    ),
+                    "serve_window": b.serve_window,
+                    "cooked_at": float(b.cooked_at) if b.cooked_at is not None else None,
+                })
+                if len(rows) >= 40:
+                    break
+        finally:
+            session.close()
+        return {"sim_time": float(self.bus.sim_time), "batches": rows, "count": len(rows)}
     def kitchen_status(self, *, dish: str | None = None, topic: str = "all") -> dict:
         """Live DB read for the get_kitchen_status tool.
 
