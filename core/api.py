@@ -1900,16 +1900,21 @@ async def voice_live_endpoint(
     websocket: WebSocket,
     role: str = Query("manager"),
     mode: str = Query("confirm"),
+    mic_mode: str = Query("ptt"),
 ) -> None:
     """Gemini Live API bridge (Stream B5).
 
     Browser connects, sends 16kHz PCM16 binary frames + JSON control frames;
     receives 24kHz PCM16 audio frames + JSON transcript/plan events back.
+
+    mic_mode="ptt"          Automatic VAD disabled; turns are delimited by
+                            explicit activity_start / activity_end frames.
+    mic_mode="conversation" Default automatic VAD; Gemini detects turn ends.
     """
     await websocket.accept()
     try:
         from .voice_live import live_bridge
-        await live_bridge(websocket, ctx.voice, role=role, mode=mode)
+        await live_bridge(websocket, ctx.voice, role=role, mode=mode, mic_mode=mic_mode)
     except Exception:  # noqa: BLE001
         logger.exception("voice live endpoint error")
     finally:

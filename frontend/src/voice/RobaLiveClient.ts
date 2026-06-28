@@ -18,6 +18,7 @@ export type LiveClientEvent =
   | { type: "speaking" }       // first audio byte of a turn started playing
   | { type: "turn_complete" }  // server signalled the turn is done generating
   | { type: "playback_done" }  // turn done AND all audio finished playing
+  | { type: "interrupted" }    // barge-in: Roba stopped, mic should stay open
   | { type: "error"; message: string }
   | { type: "disconnected" };
 
@@ -59,11 +60,22 @@ export class RobaLiveClient {
   private handlers: EventHandler[] = [];
   private role: string;
   private mode: string;
+  private _micMode: "ptt" | "conversation" = "ptt";
   private _listening = false;
+  // Monotonically increasing session id — incremented on each startListening/
+  // stopListening call so any in-flight startListening can detect staleness.
+  private _micSession = 0;
+  // True if at least one audio chunk was sent during the current mic session.
+  private _audioSentThisTurn = false;
+  // Callback set by stopListening(); invoked by the worklet "flushed" sentinel
+  // (or the 250 ms fallback timer) to guarantee activity_end is sent AFTER all
+  // audio has been written to the socket.
+  private _finalizeStop: (() => void) | null = null;
 
-  constructor(role = "manager", mode = "confirm") {
+  constructor(role = "manager", mode = "confirm", micMode: "ptt" | "conversation" = "ptt") {
     this.role = role;
     this.mode = mode;
+    this._micMode = micMode;
   }
 
   on(handler: EventHandler): () => void {
@@ -81,6 +93,10 @@ export class RobaLiveClient {
     return this._listening;
   }
 
+  setMicMode(m: "ptt" | "conversation") {
+    this._micMode = m;
+  }
+
   // ---------------------------------------------------------------------------
   // Connect / disconnect
   // ---------------------------------------------------------------------------
@@ -88,7 +104,7 @@ export class RobaLiveClient {
   async connect(): Promise<void> {
     const base = window.location.host;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${base}/ws/voice/live?role=${this.role}&mode=${this.mode}`;
+    const url = `${proto}://${base}/ws/voice/live?role=${this.role}&mode=${this.mode}&mic_mode=${this._micMode}`;
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
 
@@ -134,41 +150,134 @@ export class RobaLiveClient {
     this._listening = true;
     this.stopPlayback(); // barge-in: stop Roba audio when user starts speaking
 
+    // Capture the session id BEFORE any await so we can detect if stopListening
+    // was called while we were awaiting getUserMedia or addModule.
+    const session = ++this._micSession;
+    this._audioSentThisTurn = false;
+
+    let stream: MediaStream | null = null;
+    let ctx: AudioContext | null = null;
     try {
-      this.micStream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, sampleRate: 48000, echoCancellation: true },
       });
-      this.audioCtx = new AudioContext({ sampleRate: 48000 });
-      await this.audioCtx.audioWorklet.addModule("/mic-processor.js");
-      this.micSource = this.audioCtx.createMediaStreamSource(this.micStream);
-      this.workletNode = new AudioWorkletNode(this.audioCtx, "mic-processor");
-      this.workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+
+      // After each await: bail if stopListening() was called in the interim.
+      if (!this._listening || session !== this._micSession) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      ctx = new AudioContext({ sampleRate: 48000 });
+      await ctx.audioWorklet.addModule("/mic-processor.js");
+
+      if (!this._listening || session !== this._micSession) {
+        ctx.close();
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      // Graph is fully wired — commit to instance fields now.
+      const src = ctx.createMediaStreamSource(stream);
+      const node = new AudioWorkletNode(ctx, "mic-processor");
+
+      node.port.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
+        if (typeof e.data === "string") {
+          // "flushed" sentinel: the worklet has drained its buffer — safe to
+          // send activity_end and tear down the audio graph in order.
+          if (e.data === "flushed") this._finalizeStop?.();
+          return;
+        }
         if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(e.data);
+          // In PTT mode, signal speech start to Gemini with the very first chunk
+          // so the server knows to begin buffering this turn (VAD is disabled).
+          if (this._micMode === "ptt" && !this._audioSentThisTurn) {
+            this.ws.send(JSON.stringify({ type: "activity_start" }));
+          }
+          this.ws.send(e.data as ArrayBuffer);
+          this._audioSentThisTurn = true;
         }
       };
-      this.micSource.connect(this.workletNode);
-      this.workletNode.connect(this.audioCtx.destination);
+      src.connect(node);
+      node.connect(ctx.destination);
+
+      this.micStream = stream;
+      this.audioCtx = ctx;
+      this.micSource = src;
+      this.workletNode = node;
     } catch (err) {
-      this._listening = false;
-      this.emit({ type: "error", message: String(err) });
+      // Only surface the error if this session is still active.
+      if (session === this._micSession) {
+        this._listening = false;
+        ctx?.close();
+        stream?.getTracks().forEach((t) => t.stop());
+        this.emit({ type: "error", message: String(err) });
+      } else {
+        // Superseded by a stopListening() call — clean up silently.
+        ctx?.close();
+        stream?.getTracks().forEach((t) => t.stop());
+      }
     }
   }
 
   stopListening(): void {
     if (!this._listening) return;
     this._listening = false;
-    this.micSource?.disconnect();
-    this.workletNode?.disconnect();
-    this.micStream?.getTracks().forEach((t) => t.stop());
-    this.audioCtx?.close();
+    // Increment session id so any in-flight startListening bails on its next check.
+    this._micSession++;
+
+    // Capture graph refs locally so finalize() can't race with a new startListening.
+    const micSource = this.micSource;
+    const workletNode = this.workletNode;
+    const micStream = this.micStream;
+    const audioCtx = this.audioCtx;
+    const audioSentThisTurn = this._audioSentThisTurn;
+
+    // Clear instance fields immediately so the next startListening starts clean.
     this.micSource = null;
     this.workletNode = null;
     this.micStream = null;
     this.audioCtx = null;
-    // Signal end-of-turn to Gemini.
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "end_of_turn" }));
+    this._audioSentThisTurn = false;
+
+    // finalize() tears down the audio graph and — crucially — sends activity_end
+    // AFTER all buffered audio has been flushed, so Gemini receives audio before
+    // the turn-end marker (not the reverse).  A `done` flag prevents double-run.
+    let done = false;
+    const finalize = () => {
+      if (done) return;
+      done = true;
+      this._finalizeStop = null;
+
+      micSource?.disconnect();
+      workletNode?.disconnect();
+      micStream?.getTracks().forEach((t) => t.stop());
+      audioCtx?.close();
+
+      // In PTT mode, activity_end is the hard turn commit (VAD is disabled).
+      // Only send it if audio was actually captured this press.
+      // In conversation mode, Gemini's auto-VAD handles turn ends — we just
+      // close the mic silently.
+      if (
+        this._micMode === "ptt" &&
+        audioSentThisTurn &&
+        this.ws?.readyState === WebSocket.OPEN
+      ) {
+        this.ws.send(JSON.stringify({ type: "activity_end" }));
+      }
+    };
+
+    if (workletNode) {
+      // Ask the worklet to drain its partial buffer first.  It will post a
+      // "flushed" string sentinel when done; the onmessage handler above calls
+      // finalize() then.  The 250 ms fallback covers the rare case where the
+      // sentinel is lost (e.g. the worklet was already torn down).
+      this._finalizeStop = finalize;
+      try { workletNode.port.postMessage("flush"); } catch { /* already stopped */ }
+      setTimeout(finalize, 250);
+    } else {
+      // No worklet — nothing to flush, finalize immediately.
+      finalize();
     }
   }
 
@@ -234,6 +343,10 @@ export class RobaLiveClient {
       this.emit({ type: "turn_complete" });
       // No audio still playing (text-only turn or already drained) → end now.
       if (this.playbackSources === 0) this.finishTurn();
+    } else if (t === "interrupted") {
+      // Server-side barge-in: stop any Roba audio immediately.
+      this.stopPlayback();
+      this.emit({ type: "interrupted" });
     } else if (t === "error") {
       this.emit({ type: "error", message: String(msg.message ?? "") });
     }
