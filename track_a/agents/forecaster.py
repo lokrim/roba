@@ -68,6 +68,8 @@ MATERIAL_SIGNAL_TYPES = {
     SignalType.WEATHER_UPDATE.value,
     SignalType.MENU_TOGGLE.value,
     SignalType.STOCKOUT_RISK.value,
+    SignalType.BATCH_PROGRESS.value,
+    SignalType.WASTE_EVENT.value,
 }
 
 
@@ -81,11 +83,13 @@ class DemandForecaster(BaseAgent):
         formatter: Optional[Any] = None,
         ws_broadcast: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
         llm: Optional[Any] = None,
+        approvals: Optional[Any] = None,
     ):
         super().__init__(bus, db_session_factory, "track_a.forecaster")
         self.formatter = formatter
         self.ws_broadcast = ws_broadcast
         self.llm = llm
+        self.approvals = approvals
         self.llm_auto_mode = bool(config.LLM_FORECAST_AUTO_MODE)
         self.forecast_job_enqueue: Optional[Callable[[str, str], Any]] = None
         self.subscribe(["forecasting"])
@@ -109,8 +113,21 @@ class DemandForecaster(BaseAgent):
         )
 
     def on_signal(self, signal: Signal) -> None:
+        # Cook feedback: batch progress (actual < planned) or cook-source waste.
+        # These inform the forecaster's memory for iterative improvement.
+        if signal.type == SignalType.BATCH_PROGRESS.value:
+            self._learn_from_batch_progress(signal.payload or {})
+            return
+        if signal.type == SignalType.WASTE_EVENT.value:
+            payload = signal.payload or {}
+            if payload.get("source") == "cook":
+                # Cook-reported waste: learn from it.
+                self._learn_from_cook_waste(payload)
+            # Still re-run the forecast when waste is observed.
+            self._enqueue_or_run_forecast("deterministic_forecast", f"signal:{signal.type}")
+            return
+
         if signal.type in {
-            SignalType.WASTE_EVENT.value,
             SignalType.STAFF_COVERAGE.value,
             SignalType.COMPETITOR_UPDATE.value,
             SignalType.COMPETITOR_INTEL.value,
@@ -557,6 +574,12 @@ class DemandForecaster(BaseAgent):
                 if not reasons and decision == "cook":
                     reasons.extend([f"{daypart} forecast {f_qty:d}", "capacity available", "ingredients OK"])
 
+                # Determine initial batch status: auto-approve cook batches by
+                # default; gate them through the approval hub when
+                # BATCH_APPROVAL_GATED=True.
+                gated = bool(config.BATCH_APPROVAL_GATED)
+                initial_status = "decided" if (decision == "skip" or gated) else "approved"
+
                 row = Batch(
                     batch_definition_id=definition.id,
                     menu_item_id=item.id,
@@ -567,7 +590,7 @@ class DemandForecaster(BaseAgent):
                     actual_made_qty=0.0,
                     sold_qty=0.0,
                     wasted_qty=0.0,
-                    status="decided",
+                    status=initial_status,
                     by="agent",
                 )
                 session.add(row)
@@ -583,6 +606,7 @@ class DemandForecaster(BaseAgent):
                     "decision": decision,
                     "qty": int(planned),
                     "by": "agent",
+                    "approval_status": initial_status,
                 }
                 log_detail = {
                     "batch_id": row.id,
@@ -616,11 +640,36 @@ class DemandForecaster(BaseAgent):
                         ),
                     ]
                 )
+                # Collect gated-approval metadata (batch_id available after flush).
+                if gated and decision == "cook":
+                    after_commit.append((
+                        "_batch_approval",
+                        (row.id, item.name, int(planned), reason_text),
+                    ))
             session.commit()
         finally:
             session.close()
 
-        self._run_after_commit(after_commit)
+        # Run standard after-commit actions (emit/log/broadcast).
+        std_actions = [(k, v) for k, v in after_commit if k != "_batch_approval"]
+        self._run_after_commit(std_actions)
+
+        # Create approval requests for gated batches (after DB commit so IDs are stable).
+        if self.approvals is not None:
+            for kind, args in after_commit:
+                if kind == "_batch_approval":
+                    bid, item_name, qty, reason_text = args
+                    try:
+                        self.approvals.create(
+                            type="batch",
+                            title=f"Cook batch: {item_name} ×{qty}",
+                            summary=f"Forecaster recommends {qty} portions. {reason_text}",
+                            payload={"batch_id": bid, "qty": qty},
+                            ref_id=bid,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
         return rows
 
     def generate_suggestions(self) -> Dict[str, Any]:
@@ -1956,6 +2005,77 @@ class DemandForecaster(BaseAgent):
             return decision, 0
         qty = qty if qty > 0 else forecast_qty
         return decision, self._round_batch_qty(qty, definition)
+
+    # ------------------------------------------------------------------
+    # Cook feedback → iterative learning (Stream B3)
+    # ------------------------------------------------------------------
+
+    def _learn_from_batch_progress(self, payload: Dict[str, Any]) -> None:
+        """Record a DemandForecasterMemory insight when a batch's actual qty
+        differs significantly from what was planned.  Used by decide_batches on
+        the next run to nudge the planned qty in the right direction."""
+        actual = float(payload.get("actual_made_qty") or 0.0)
+        planned = float(payload.get("planned_qty") or actual)
+        menu_item_id = payload.get("menu_item_id")
+        if not menu_item_id or planned <= 0:
+            return
+        ratio = actual / planned
+        if 0.85 <= ratio <= 1.15:
+            return  # within 15% — no significant deviation to learn from
+        direction = "reduce_batch" if ratio < 0.85 else "increase_batch"
+        self._remember(
+            scope_type="menu_item",
+            scope_ref=str(menu_item_id),
+            insight={
+                "title": f"Cook reported batch deviation ({direction})",
+                "actual": actual,
+                "planned": planned,
+                "ratio": round(ratio, 3),
+                "direction": direction,
+                "action": "adjust_batch_decision",
+            },
+            evidence={"batch_progress_payload": payload},
+            confidence=0.75,
+            source="cook_feedback",
+            valid_for=86400.0 * 7,   # remember for 1 sim-week
+        )
+        self.log_event(
+            "cook_feedback",
+            f"Batch deviation for item {menu_item_id}: "
+            f"planned {planned:.0f}, actual {actual:.0f} ({direction}). "
+            "Memory updated.",
+            {"menu_item_id": menu_item_id, "actual": actual, "planned": planned},
+        )
+
+    def _learn_from_cook_waste(self, payload: Dict[str, Any]) -> None:
+        """Translate a cook-reported waste event into forecaster memory so
+        decide_batches can reduce planned quantities for that item."""
+        menu_item_id = payload.get("menu_item_id")
+        waste_type = str(payload.get("waste_type") or "overproduction")
+        qty = float(payload.get("qty") or 0.0)
+        if not menu_item_id or qty <= 0:
+            return
+        self._remember(
+            scope_type="menu_item",
+            scope_ref=str(menu_item_id),
+            insight={
+                "title": f"Cook-reported {waste_type} waste",
+                "waste_type": waste_type,
+                "qty": qty,
+                "action": "reduce_batch_qty",
+                "reason": payload.get("reason", ""),
+            },
+            evidence={"waste_payload": payload},
+            confidence=0.80 if waste_type == "overproduction" else 0.60,
+            source="cook_feedback",
+            valid_for=86400.0 * 3,   # 3 sim-days
+        )
+        self.log_event(
+            "cook_feedback",
+            f"Cook waste recorded: {qty:.1f} × item {menu_item_id} ({waste_type}). "
+            "Forecaster memory updated to reduce future batches.",
+            {"menu_item_id": menu_item_id, "qty": qty, "waste_type": waste_type},
+        )
 
     # ------------------------------------------------------------------
     # Memory and context

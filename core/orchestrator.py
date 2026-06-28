@@ -67,6 +67,7 @@ def _signal_to_dict(sig: Signal) -> Dict[str, Any]:
         "dedup_key": sig.dedup_key,
         "status": sig.status,
         "correlation_id": sig.correlation_id,
+        "target_agents": sig.target_agents,
     }
 
 
@@ -193,35 +194,46 @@ class Orchestrator:
 
     def on_signal(self, signal: Signal) -> None:
         """Fan a signal out to every agent whose groups intersect the
-        signal's ``groups`` (§14.4)."""
+        signal's ``groups`` (§14.4).
+
+        When ``signal.target_agents`` is set (named routing, added in
+        Stream A), agents are also selected by exact name match — this
+        is a union with the normal group-intersection path so agents can
+        receive a signal even if they are not subscribed to the signal's
+        group (useful for voice-planner directed activation).
+        """
         signal_groups = set(signal.groups or [])
+        named_targets: set[str] = set(signal.target_agents or [])
         routed = False
         for agent in self.agents:
-            if signal_groups.intersection(set(agent.subscribed_groups)):
-                routed = True
-                started = time.perf_counter()
-                try:
-                    agent.on_signal(signal)
-                except Exception as exc:  # noqa: BLE001 - isolate agent failures.
-                    duration_ms = (time.perf_counter() - started) * 1000.0
-                    self.bus.record_delivery(
-                        signal,
-                        consumer=agent.name,
-                        delivery_kind="agent",
-                        status="failed",
-                        duration_ms=duration_ms,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                    logger.exception("Agent %s failed handling %s", agent.name, signal.type)
-                else:
-                    duration_ms = (time.perf_counter() - started) * 1000.0
-                    self.bus.record_delivery(
-                        signal,
-                        consumer=agent.name,
-                        delivery_kind="agent",
-                        status="ack",
-                        duration_ms=duration_ms,
-                    )
+            by_group = bool(signal_groups.intersection(set(agent.subscribed_groups)))
+            by_name = agent.name in named_targets
+            if not (by_group or by_name):
+                continue
+            routed = True
+            started = time.perf_counter()
+            try:
+                agent.on_signal(signal)
+            except Exception as exc:  # noqa: BLE001 - isolate agent failures.
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                self.bus.record_delivery(
+                    signal,
+                    consumer=agent.name,
+                    delivery_kind="agent",
+                    status="failed",
+                    duration_ms=duration_ms,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                logger.exception("Agent %s failed handling %s", agent.name, signal.type)
+            else:
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                self.bus.record_delivery(
+                    signal,
+                    consumer=agent.name,
+                    delivery_kind="agent",
+                    status="ack",
+                    duration_ms=duration_ms,
+                )
         if not routed:
             self.bus.record_delivery(
                 signal,

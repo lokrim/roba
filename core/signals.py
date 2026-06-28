@@ -60,6 +60,8 @@ class SignalType(str, Enum):
     CUSTOMER_FEEDBACK_NOTE = "CUSTOMER_FEEDBACK_NOTE"
     COMPETITOR_NOTE = "COMPETITOR_NOTE"
     OPERATIONAL_BRIEFING = "OPERATIONAL_BRIEFING"
+    # Cook-reported batch progress (Stream B3): actual qty cooked, waste, status.
+    BATCH_PROGRESS = "BATCH_PROGRESS"
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +239,11 @@ SIGNAL_REGISTRY: Dict[SignalType, Dict[str, Any]] = {
         "groups": ["human", "frontend"],
         "priority": 1,
         "default_ttl_sim_s": 7200.0,
+    },
+    SignalType.BATCH_PROGRESS: {
+        "groups": ["kitchen", "forecasting", "inventory", "human", "frontend"],
+        "priority": 3,
+        "default_ttl_sim_s": 14400.0,          # 4h
     },
 }
 
@@ -556,6 +563,18 @@ class OperationalBriefingPayload(BaseModel):
     confidence: float = 0.0
 
 
+class BatchProgressPayload(BaseModel):
+    """Cook-reported update to a batch (Stream B3)."""
+    batch_id: int
+    menu_item_id: int
+    actual_made_qty: float
+    planned_qty: Optional[float] = None         # for delta reconciliation
+    sold_qty: Optional[float] = None
+    wasted_qty: Optional[float] = None
+    status: str = "cooked"                      # cooked | served | wasted
+    source: str = "cook"                        # cook | system
+
+
 # Convenience map: SignalType -> its payload model.
 SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.DEMAND_FORECAST: DemandForecastPayload,
@@ -592,4 +611,5 @@ SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.CUSTOMER_FEEDBACK_NOTE: CustomerFeedbackNotePayload,
     SignalType.COMPETITOR_NOTE: CompetitorNotePayload,
     SignalType.OPERATIONAL_BRIEFING: OperationalBriefingPayload,
+    SignalType.BATCH_PROGRESS: BatchProgressPayload,
 }

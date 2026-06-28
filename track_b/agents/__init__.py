@@ -58,10 +58,10 @@ def register(
     )
     optimizer = InventoryOptimizer(
         bus, db_session_factory, ws_broadcast=ws_broadcast,
-        procurement=procurement, approvals=approvals,
+        procurement=procurement, approvals=approvals, llm=llm,
     )
     market = MarketSpectator(bus, db_session_factory, ws_broadcast=ws_broadcast, calls=calls)
-    handlers = ApprovalHandlers(bus, procurement, optimizer)
+    handlers = ApprovalHandlers(bus, procurement, optimizer, db_session_factory=db_session_factory)
 
     for agent in (ledger, optimizer, market):
         orchestrator.register_agent(agent)
@@ -82,6 +82,12 @@ def register(
         optimizer.reorder_check,
         interval_sim_s=config.FORECAST_INTERVAL_SIM_S,
         name="optimizer_reorder_check",
+    )
+    orchestrator.register(
+        "interval",
+        optimizer.llm_optimize,
+        interval_sim_s=config.FORECAST_INTERVAL_SIM_S * 2,
+        name="optimizer_llm_pass",
     )
     orchestrator.register(
         "interval",

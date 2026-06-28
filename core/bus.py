@@ -114,6 +114,7 @@ class SignalBus:
         dedup_key: Optional[str] = None,
         correlation_id: Optional[str] = None,
         now: Optional[float] = None,
+        target_agents: Optional[List[str]] = None,
     ) -> Optional[Signal]:
         """Emit a signal, applying registry defaults and §14 safety rules.
 
@@ -180,6 +181,8 @@ class SignalBus:
                     existing.priority = priority
                     existing.groups = list(groups)
                     existing.source = source
+                    if target_agents is not None:
+                        existing.target_agents = list(target_agents)
                     session.commit()
                     session.refresh(existing)
                     session.expunge(existing)
@@ -203,6 +206,7 @@ class SignalBus:
                 dedup_key=dedup_key,
                 status="live",
                 correlation_id=correlation_id,
+                target_agents=list(target_agents) if target_agents else None,
             )
             session.add(signal)
             session.commit()

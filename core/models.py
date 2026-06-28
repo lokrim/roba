@@ -296,8 +296,10 @@ class Batch(Base):
     actual_made_qty = mapped_column(Float)
     sold_qty = mapped_column(Float)
     wasted_qty = mapped_column(Float)
-    status = mapped_column(String)             # decided | prepping | ready | served | expired
+    status = mapped_column(String)             # decided | approved | prepping | ready | served | expired
     by = mapped_column(String)                 # agent | human
+    approval_id = mapped_column(ForeignKey("approval_requests.id"), nullable=True)
+    cooked_at = mapped_column(Float, nullable=True)     # sim_time when cook marked it done
 
     def __repr__(self):
         return (f"<Batch id={self.id} menu_item_id={self.menu_item_id} "
@@ -491,6 +493,53 @@ class DemandForecasterMemory(Base):
                 f"scope_type={self.scope_type!r} scope_ref={self.scope_ref!r}>")
 
 
+class VoicePlan(Base):
+    """A pending voice-planner plan (Stream B §voice-plan).
+
+    Persists the plan until the user confirms or cancels it.  Auto-approved
+    plans (mode="auto") are inserted already ``status="applied"``.
+    """
+    __tablename__ = "voice_plans"
+
+    plan_id = mapped_column(String, primary_key=True)
+    role = mapped_column(String)                # manager | cook
+    mode = mapped_column(String)                # confirm | auto
+    raw_text = mapped_column(Text)
+    plan = mapped_column(JSON)                  # the full plan dict
+    status = mapped_column(String, default="pending")  # pending | applied | cancelled | superseded
+    created_at = mapped_column(Float)
+    applied_at = mapped_column(Float)
+
+    def __repr__(self):
+        return (f"<VoicePlan plan_id={self.plan_id!r} role={self.role!r} "
+                f"status={self.status!r}>")
+
+
+class InventoryOptimizerMemory(Base):
+    """LLM-backed procurement memory for the Inventory Optimizer (Stream E).
+
+    Mirrors DemandForecasterMemory but scoped to inventory / procurement
+    observations (e.g. recurring spoilage → reduce PO qty, supplier lead-time
+    drift, deal-effectiveness feedback).
+    """
+    __tablename__ = "inventory_optimizer_memory"
+
+    id = _pk()
+    scope_type = mapped_column(String)          # global | ingredient | supplier | menu_item
+    scope_ref = mapped_column(String)
+    insight = mapped_column(JSON)
+    evidence = mapped_column(JSON)
+    confidence = mapped_column(Float)
+    created_at = mapped_column(Float)
+    last_seen_at = mapped_column(Float)
+    valid_until = mapped_column(Float)
+    source = mapped_column(String)              # deterministic | llm | cook_feedback
+
+    def __repr__(self):
+        return (f"<InventoryOptimizerMemory id={self.id} "
+                f"scope_type={self.scope_type!r} scope_ref={self.scope_ref!r}>")
+
+
 class Signal(Base):
     __tablename__ = "signals"
 
@@ -507,6 +556,10 @@ class Signal(Base):
     dedup_key = mapped_column(String)
     status = mapped_column(String)             # live | consumed | expired
     correlation_id = mapped_column(String)
+    # Optional named-agent routing (Stream A §signal-target-agents).
+    # When set, the orchestrator delivers the signal to those agents BY NAME
+    # (in addition to normal group routing).  Nullable → zero migration cost.
+    target_agents = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
         Index("ix_signals_status", "status"),
