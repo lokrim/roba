@@ -350,6 +350,7 @@ async def live_bridge(
     voice_processor: Any,
     role: str = "manager",
     mode: str = "confirm",
+    mic_mode: str = "ptt",
 ) -> None:
     """Bridge a client WebSocket to a Vertex AI Live session.
 
@@ -357,6 +358,13 @@ async def live_bridge(
     1. ``_client_to_gemini``: reads from the client WS and writes to the Live session.
     2. ``_gemini_to_client``: reads from the Live session and writes to the client WS.
     Tool calls from the model are executed server-side and results fed back.
+
+    mic_mode="ptt"          Disables automatic VAD so that push-to-talk turns are
+                            committed immediately by explicit activity_start /
+                            activity_end markers rather than waiting for a trailing
+                            silence gap that PTT never produces.
+    mic_mode="conversation" Uses Gemini's default automatic VAD; the mic stays open
+                            and Gemini detects turn boundaries by itself.
 
     Exits cleanly on client disconnect, session end, or any unrecoverable error.
     """
@@ -386,12 +394,25 @@ async def live_bridge(
     except Exception:  # noqa: BLE001
         pass
 
+    # Push-to-talk: disable automatic VAD so that explicit activity_start /
+    # activity_end markers commit the turn immediately.  With auto-VAD on
+    # (the default), audio_stream_end is NOT a hard turn commit — Gemini waits
+    # for a trailing silence gap that PTT never produces, so the first turn hangs
+    # until the *next* press provides the gap, replaying the previous utterance.
+    # Conversation mode keeps auto-VAD (realtime_input_config=None → default).
+    realtime_input_config: Optional[Any] = None
+    if mic_mode == "ptt":
+        realtime_input_config = _gtypes.RealtimeInputConfig(
+            automatic_activity_detection=_gtypes.AutomaticActivityDetection(disabled=True),
+        )
+
     live_config = _gtypes.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=system_instruction,
         tools=_TOOLS,  # type: ignore[arg-type]
         input_audio_transcription=_gtypes.AudioTranscriptionConfig(),
         output_audio_transcription=_gtypes.AudioTranscriptionConfig(),
+        realtime_input_config=realtime_input_config,
     )
 
     # ``client.aio.live.connect(...)`` only builds the async context manager;
@@ -488,8 +509,15 @@ async def _client_to_gemini(
                 except json.JSONDecodeError:
                     continue
                 msg_type = msg.get("type")
-                if msg_type == "end_of_turn":
-                    # Signal that the audio stream for this turn is done.
+                if msg_type == "activity_start":
+                    # Push-to-talk: user pressed the button — tell Gemini speech began.
+                    await session.send_realtime_input(activity_start=_gtypes.ActivityStart())
+                elif msg_type == "activity_end":
+                    # Push-to-talk: user released — commit the turn NOW, no VAD gap needed.
+                    await session.send_realtime_input(activity_end=_gtypes.ActivityEnd())
+                elif msg_type == "end_of_turn":
+                    # Legacy / fallback: send audio_stream_end (only effective when
+                    # auto-VAD is enabled; PTT sessions now use activity_end instead).
                     await session.send_realtime_input(audio_stream_end=True)
                 elif msg_type == "text_input":
                     text = str(msg.get("text") or "")

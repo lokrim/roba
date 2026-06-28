@@ -237,10 +237,12 @@ export function useVoiceLive(role: string): VoiceLiveHook {
       clearThinkingTimer();
       client.disconnect();
     };
-    // Reconnect on role change only.  mode/micMode are pushed via setters on
-    // the live client instead of reconnecting.
+    // Reconnect when role OR micMode changes.  The Live session's VAD config is
+    // fixed at connect time (PTT disables auto-VAD, conversation enables it), so
+    // switching mic mode requires a new session.  MicModeToggle is disabled while
+    // state === "listening", so this never reconnects mid-turn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [role]);
+  }, [role, micMode]);
 
   const startListening = useCallback(async () => {
     if (!clientRef.current) return;
@@ -286,7 +288,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const setMicMode = useCallback((m: MicMode) => {
     writeMicMode(m);
     _setMicMode(m);
-    clientRef.current?.setMicMode(m);
+    // No setMicMode call on the client: the reconnect triggered by the micMode
+    // dep in the connect effect below builds a fresh session with the new config.
   }, []);
 
   const clearTranscript = useCallback(() => setTranscript([]), []);

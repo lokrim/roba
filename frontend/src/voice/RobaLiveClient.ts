@@ -67,6 +67,10 @@ export class RobaLiveClient {
   private _micSession = 0;
   // True if at least one audio chunk was sent during the current mic session.
   private _audioSentThisTurn = false;
+  // Callback set by stopListening(); invoked by the worklet "flushed" sentinel
+  // (or the 250 ms fallback timer) to guarantee activity_end is sent AFTER all
+  // audio has been written to the socket.
+  private _finalizeStop: (() => void) | null = null;
 
   constructor(role = "manager", mode = "confirm", micMode: "ptt" | "conversation" = "ptt") {
     this.role = role;
@@ -100,7 +104,7 @@ export class RobaLiveClient {
   async connect(): Promise<void> {
     const base = window.location.host;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${base}/ws/voice/live?role=${this.role}&mode=${this.mode}`;
+    const url = `${proto}://${base}/ws/voice/live?role=${this.role}&mode=${this.mode}&mic_mode=${this._micMode}`;
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
 
@@ -178,8 +182,18 @@ export class RobaLiveClient {
       const node = new AudioWorkletNode(ctx, "mic-processor");
 
       node.port.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
-        if (typeof e.data === "string") return; // control messages
+        if (typeof e.data === "string") {
+          // "flushed" sentinel: the worklet has drained its buffer — safe to
+          // send activity_end and tear down the audio graph in order.
+          if (e.data === "flushed") this._finalizeStop?.();
+          return;
+        }
         if (this.ws?.readyState === WebSocket.OPEN) {
+          // In PTT mode, signal speech start to Gemini with the very first chunk
+          // so the server knows to begin buffering this turn (VAD is disabled).
+          if (this._micMode === "ptt" && !this._audioSentThisTurn) {
+            this.ws.send(JSON.stringify({ type: "activity_start" }));
+          }
           this.ws.send(e.data as ArrayBuffer);
           this._audioSentThisTurn = true;
         }
@@ -212,29 +226,59 @@ export class RobaLiveClient {
     // Increment session id so any in-flight startListening bails on its next check.
     this._micSession++;
 
-    // Ask the worklet to flush its partial buffer before we disconnect it.
-    try { this.workletNode?.port.postMessage("flush"); } catch { /* ignore */ }
+    // Capture graph refs locally so finalize() can't race with a new startListening.
+    const micSource = this.micSource;
+    const workletNode = this.workletNode;
+    const micStream = this.micStream;
+    const audioCtx = this.audioCtx;
+    const audioSentThisTurn = this._audioSentThisTurn;
 
-    this.micSource?.disconnect();
-    this.workletNode?.disconnect();
-    this.micStream?.getTracks().forEach((t) => t.stop());
-    this.audioCtx?.close();
+    // Clear instance fields immediately so the next startListening starts clean.
     this.micSource = null;
     this.workletNode = null;
     this.micStream = null;
     this.audioCtx = null;
-
-    // In push-to-talk mode, send end_of_turn only when audio was actually captured.
-    // In conversation mode, Gemini's auto-VAD handles turn boundaries — never send
-    // end_of_turn on client stop (the conversation just ends cleanly).
-    if (
-      this._micMode === "ptt" &&
-      this._audioSentThisTurn &&
-      this.ws?.readyState === WebSocket.OPEN
-    ) {
-      this.ws.send(JSON.stringify({ type: "end_of_turn" }));
-    }
     this._audioSentThisTurn = false;
+
+    // finalize() tears down the audio graph and — crucially — sends activity_end
+    // AFTER all buffered audio has been flushed, so Gemini receives audio before
+    // the turn-end marker (not the reverse).  A `done` flag prevents double-run.
+    let done = false;
+    const finalize = () => {
+      if (done) return;
+      done = true;
+      this._finalizeStop = null;
+
+      micSource?.disconnect();
+      workletNode?.disconnect();
+      micStream?.getTracks().forEach((t) => t.stop());
+      audioCtx?.close();
+
+      // In PTT mode, activity_end is the hard turn commit (VAD is disabled).
+      // Only send it if audio was actually captured this press.
+      // In conversation mode, Gemini's auto-VAD handles turn ends — we just
+      // close the mic silently.
+      if (
+        this._micMode === "ptt" &&
+        audioSentThisTurn &&
+        this.ws?.readyState === WebSocket.OPEN
+      ) {
+        this.ws.send(JSON.stringify({ type: "activity_end" }));
+      }
+    };
+
+    if (workletNode) {
+      // Ask the worklet to drain its partial buffer first.  It will post a
+      // "flushed" string sentinel when done; the onmessage handler above calls
+      // finalize() then.  The 250 ms fallback covers the rare case where the
+      // sentinel is lost (e.g. the worklet was already torn down).
+      this._finalizeStop = finalize;
+      try { workletNode.port.postMessage("flush"); } catch { /* already stopped */ }
+      setTimeout(finalize, 250);
+    } else {
+      // No worklet — nothing to flush, finalize immediately.
+      finalize();
+    }
   }
 
   // ---------------------------------------------------------------------------

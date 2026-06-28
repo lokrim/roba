@@ -29,14 +29,19 @@ class MicProcessor extends AudioWorkletProcessor {
   }
 
   _flush() {
-    if (this._buffer.length === 0) return;
-    const chunk = this._buffer.splice(0);
-    const pcm = new Int16Array(chunk.length);
-    for (let i = 0; i < chunk.length; i++) {
-      const clamped = Math.max(-1, Math.min(1, chunk[i]));
-      pcm[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    // Drain any partial buffer accumulated since the last full chunk.
+    if (this._buffer.length > 0) {
+      const chunk = this._buffer.splice(0);
+      const pcm = new Int16Array(chunk.length);
+      for (let i = 0; i < chunk.length; i++) {
+        const c = Math.max(-1, Math.min(1, chunk[i]));
+        pcm[i] = c < 0 ? c * 0x8000 : c * 0x7fff;
+      }
+      this.port.postMessage(pcm.buffer, [pcm.buffer]);
     }
-    this.port.postMessage(pcm.buffer, [pcm.buffer]);
+    // Always post the sentinel so stopListening() knows the flush is complete
+    // and can safely send activity_end *after* all audio has gone out.
+    this.port.postMessage("flushed");
   }
 
   process(inputs) {
