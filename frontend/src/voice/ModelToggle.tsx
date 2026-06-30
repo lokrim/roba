@@ -8,23 +8,8 @@
 const MODELS: Array<{ id: string; label: string; description: string }> = [
   {
     id: "gemini-live-2.5-flash-native-audio",
-    label: "Flash Native Audio",
-    description: "Natural voice, fast (default)",
-  },
-  {
-    id: "gemini-2.5-flash-preview-native-audio-dialog",
-    label: "Flash Dialog Preview",
-    description: "Smarter tool-use, natural voice",
-  },
-  {
-    id: "gemini-2.5-flash",
-    label: "Flash 2.5 (text)",
-    description: "Half-cascade — best tool understanding",
-  },
-  {
-    id: "gemini-2.5-pro",
-    label: "Pro 2.5 (text)",
-    description: "Highest quality, slowest",
+    label: "Flash 2.5 Native Audio",
+    description: "Natural voice, fast (Vertex AI Live)",
   },
 ];
 

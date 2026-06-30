@@ -58,11 +58,9 @@ _RESPONSE_TIMEOUT_S = 20.0
 _CONNECT_TIMEOUT_S = 10.0
 
 # Models the UI may select via the model= query param.
+# These must be actual Vertex AI Live API model IDs (use `client.models.list()` to verify).
 _ALLOWED_LIVE_MODELS = {
-    "gemini-live-2.5-flash-native-audio",   # natural voice, default
-    "gemini-2.5-flash-preview-native-audio-dialog",  # smarter tool-use
-    "gemini-2.5-flash",                    # half-cascade (text reasoning)
-    "gemini-2.5-pro",                      # highest quality
+    "gemini-live-2.5-flash-native-audio",   # native voice, GA on Vertex
 }
 
 _DISCONNECT_EXC_NAMES = {
