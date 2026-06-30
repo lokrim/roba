@@ -275,12 +275,71 @@ class VoiceActions:
 
     def disable_menu_item(
         self,
-        item_name: str,
+        item_name: str = "",
         reason: str = "voice request",
         *,
+        category: Optional[str] = None,
+        name_contains: Optional[str] = None,
         mode: str = "confirm",
     ) -> Dict[str, Any]:
-        """Disable a menu item (sticky manual block)."""
+        """Disable a menu item (sticky manual block).
+
+        When ``category`` or ``name_contains`` is given, disables ALL active
+        matching items in bulk (returns list of names affected).
+        """
+        # ── Bulk path ────────────────────────────────────────────────────────
+        if category or name_contains:
+            from .models import MenuItem, MenuToggle
+            from .signals import SignalType
+
+            session = self.db_session_factory()
+            try:
+                q = session.query(MenuItem).filter(MenuItem.active == 1)
+                if category:
+                    q = q.filter(MenuItem.category.ilike(f"%{category}%"))
+                if name_contains:
+                    q = q.filter(MenuItem.name.ilike(f"%{name_contains}%"))
+                matched = q.all()
+            finally:
+                session.close()
+
+            if not matched:
+                return {"need": "item_name", "question": f"No active items found matching that filter."}
+
+            item_ids = [(int(mi.id), str(mi.name)) for mi in matched]
+            matched_names = [name for _, name in item_ids]
+
+            def _apply_bulk():
+                from .models import MenuItem, MenuToggle
+                from .signals import SignalType
+                now = float(self.bus.sim_time)
+                session = self.db_session_factory()
+                try:
+                    for iid, iname in item_ids:
+                        item = session.get(MenuItem, iid)
+                        if item and item.active:
+                            item.active = 0
+                            session.add(MenuToggle(
+                                menu_item_id=iid,
+                                action="disable",
+                                reason=reason,
+                                reason_code="manual",
+                                triggered_by="voice",
+                                sim_time=now,
+                                active=1,
+                            ))
+                    session.commit()
+                finally:
+                    session.close()
+                for iid, _ in item_ids:
+                    self.hub_broadcast("menu_toggled", {"menu_item_id": iid, "action": "disable"})
+                return {"ok": True, "items": matched_names, "action": "disabled", "count": len(matched_names)}
+
+            label = ", ".join(matched_names[:3]) + (f" and {len(matched_names)-3} more" if len(matched_names) > 3 else "")
+            hr = f"Disable {len(matched_names)} item(s): {label}."
+            return self._stage_or_apply(mode, _apply_bulk, human_readable=hr)
+
+        # ── Single-item path ─────────────────────────────────────────────────
         item_id, resolved_name = self._resolve_menu_item(item_name)
         if item_id is None:
             return {"need": "item_name", "question": f"I couldn't find '{item_name}' on the menu. Which dish did you mean?"}
@@ -324,16 +383,78 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Disable {resolved_name}?",
+            human_readable=f"Disable {resolved_name} on the menu.",
         )
 
     def enable_menu_item(
         self,
-        item_name: str,
+        item_name: str = "",
         *,
+        category: Optional[str] = None,
+        name_contains: Optional[str] = None,
         mode: str = "confirm",
     ) -> Dict[str, Any]:
-        """Re-enable a menu item — clears all blocks including manual."""
+        """Re-enable a menu item — clears all blocks including manual.
+
+        When ``category`` or ``name_contains`` is given, enables ALL matching
+        disabled items in bulk.
+        """
+        # ── Bulk path ────────────────────────────────────────────────────────
+        if category or name_contains:
+            from .models import MenuItem, MenuToggle
+
+            session = self.db_session_factory()
+            try:
+                q = session.query(MenuItem).filter(MenuItem.active == 0)
+                if category:
+                    q = q.filter(MenuItem.category.ilike(f"%{category}%"))
+                if name_contains:
+                    q = q.filter(MenuItem.name.ilike(f"%{name_contains}%"))
+                matched = q.all()
+            finally:
+                session.close()
+
+            if not matched:
+                return {"need": "item_name", "question": "No disabled items found matching that filter."}
+
+            item_ids = [(int(mi.id), str(mi.name)) for mi in matched]
+            matched_names = [name for _, name in item_ids]
+
+            def _apply_bulk_enable():
+                from .models import MenuItem, MenuToggle
+                from .signals import SignalType
+                now = float(self.bus.sim_time)
+                session = self.db_session_factory()
+                try:
+                    for iid, iname in item_ids:
+                        item = session.get(MenuItem, iid)
+                        if item and not item.active:
+                            item.active = 1
+                            session.query(MenuToggle).filter(
+                                MenuToggle.menu_item_id == iid,
+                                MenuToggle.active == 1,
+                            ).update({MenuToggle.active: 0})
+                            session.add(MenuToggle(
+                                menu_item_id=iid,
+                                action="enable",
+                                reason="manual voice enable",
+                                reason_code="manual",
+                                triggered_by="voice",
+                                sim_time=now,
+                                active=1,
+                            ))
+                    session.commit()
+                finally:
+                    session.close()
+                for iid, _ in item_ids:
+                    self.hub_broadcast("menu_toggled", {"menu_item_id": iid, "action": "enable"})
+                return {"ok": True, "items": matched_names, "action": "enabled", "count": len(matched_names)}
+
+            label = ", ".join(matched_names[:3]) + (f" and {len(matched_names)-3} more" if len(matched_names) > 3 else "")
+            hr = f"Re-enable {len(matched_names)} item(s): {label}."
+            return self._stage_or_apply(mode, _apply_bulk_enable, human_readable=hr)
+
+        # ── Single-item path ─────────────────────────────────────────────────
         item_id, resolved_name = self._resolve_menu_item(item_name)
         if item_id is None:
             return {"need": "item_name", "question": f"I couldn't find '{item_name}' on the menu."}
@@ -382,7 +503,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Re-enable {resolved_name}?",
+            human_readable=f"Re-enable {resolved_name} on the menu.",
         )
 
     def adjust_inventory(
@@ -453,12 +574,8 @@ class VoiceActions:
                 "unit": ing_unit,
             }
 
-        if set_to is not None:
-            op = f"Set {ing_name} to {set_to} {unit or ''}".strip() + "?"
-        else:
-            direction = "Add" if (delta or 0) > 0 else "Remove"
-            op = f"{direction} {abs(delta or 0)} {unit or ''} {ing_name}?".strip()
-        return self._stage_or_apply(mode, _apply, human_readable=op)
+        op = f"Set {ing_name} to {set_to}" if set_to is not None else f"Add {delta} to {ing_name}"
+        return self._stage_or_apply(mode, _apply, human_readable=f"{op} in inventory.")
 
     def record_spoilage(
         self,
@@ -531,7 +648,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Mark {qty_str} {ing_name} as spoiled?",
+            human_readable=f"Mark {qty_str} {ing_name} as spoiled and update inventory.",
         )
 
     def confirm_batch_cooked(
@@ -576,7 +693,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Mark {item_name} batch cooked — {effective_qty:.0f} made?",
+            human_readable=f"Mark {item_name} batch as cooked ({effective_qty:.0f} made).",
         )
 
     def record_waste(
@@ -607,7 +724,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Record {qty} × {resolved_name} as {cause}?",
+            human_readable=f"Record {qty} × {resolved_name} as waste ({cause}).",
         )
 
     def set_staff_attendance(
@@ -687,7 +804,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Mark {names} as {status}?",
+            human_readable=f"Mark {names} as {status}.",
         )
 
     def run_forecast(self) -> Dict[str, Any]:
@@ -759,7 +876,18 @@ class VoiceActions:
                 "status": "approval_requested",
             }
         # Always staged regardless of mode.
-        return self._stage_or_apply("confirm", _apply, human_readable=f"Call {target} — {purpose}?")
+        return self._stage_or_apply("confirm", _apply, human_readable=f"Request call to {target} ({purpose}).")
+
+    def consult_reasoner(self, question: str, context: Optional[str] = None) -> Dict[str, Any]:
+        """Consult the background reasoning model for complex decisions."""
+        from . import reasoner
+        # Inject slim operational context if none provided.
+        if not context:
+            try:
+                context = f"Sim time: {self.bus.sim_time:.0f}s"
+            except Exception:  # noqa: BLE001
+                pass
+        return reasoner.consult(question, context)
 
     # -----------------------------------------------------------------------
     # Staging (confirm/auto mode)
@@ -793,7 +921,7 @@ class VoiceActions:
     ) -> Dict[str, Any]:
         if mode == "auto":
             result = fn()
-            return {"status": "applied", **result}
+            return {"status": "applied", "summary": human_readable, **result}
         # Confirm mode: stage it.
         action_id = str(uuid.uuid4())
         self._pending[action_id] = {"fn": fn, "human_readable": human_readable}

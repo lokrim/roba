@@ -240,26 +240,34 @@ _TOOLS: list[dict[str, Any]] = [
                 "description": (
                     "Disable (turn off) a menu item so it cannot be ordered. "
                     "This is a manual sticky disable — it stays off until explicitly re-enabled. "
-                    "Use this when the manager says 'disable X', 'take X off the menu', etc."
+                    "Use this when the manager says 'disable X', 'take X off the menu', etc. "
+                    "Pass category to bulk-disable all active items in a category (e.g. 'pasta'). "
+                    "Pass name_contains to bulk-disable all active items whose name contains that string."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "item_name": {"type": "string", "description": "The dish name to disable."},
+                        "item_name": {"type": "string", "description": "The dish name to disable (single item)."},
+                        "category": {"type": "string", "description": "Bulk: disable all active items in this category."},
+                        "name_contains": {"type": "string", "description": "Bulk: disable all active items whose name contains this string."},
                         "reason": {"type": "string", "description": "Optional reason for the disable."},
                     },
-                    "required": ["item_name"],
                 },
             },
             {
                 "name": "enable_menu_item",
-                "description": "Re-enable a disabled menu item. Clears all blocks (including manual and stock-based).",
+                "description": (
+                    "Re-enable a disabled menu item. Clears all blocks (including manual and stock-based). "
+                    "Pass category to bulk-enable all disabled items in a category. "
+                    "Pass name_contains to bulk-enable all disabled items whose name contains that string."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "item_name": {"type": "string", "description": "The dish name to re-enable."},
+                        "item_name": {"type": "string", "description": "The dish name to re-enable (single item)."},
+                        "category": {"type": "string", "description": "Bulk: re-enable all disabled items in this category."},
+                        "name_contains": {"type": "string", "description": "Bulk: re-enable all disabled items whose name contains this string."},
                     },
-                    "required": ["item_name"],
                 },
             },
             {
@@ -408,7 +416,29 @@ _TOOLS: list[dict[str, Any]] = [
                 },
             },
         ]
-    }
+    },
+    {
+        "function_declarations": [
+            {
+                "name": "consult_reasoner",
+                "description": (
+                    "Consult a superior reasoning model for complex trade-off decisions or recommendations. "
+                    "Use when: (1) user asks 'what should I do?' or 'what do you recommend?'; "
+                    "(2) multiple constraints conflict (low stock + unstaffed station); "
+                    "(3) you face a trade-off with no obvious right answer. "
+                    "Returns a decisive, actionable recommendation you can speak aloud."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The specific question or dilemma to reason about."},
+                        "context": {"type": "string", "description": "Relevant facts: inventory levels, staff status, active dishes, etc."},
+                    },
+                    "required": ["question"],
+                },
+            }
+        ]
+    },
 ]
 
 
@@ -417,109 +447,128 @@ _TOOLS: list[dict[str, Any]] = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 _FEW_SHOTS = """
-## Examples
-
-[AUTO MODE — act immediately, no permission needed]
+## Examples (utterance → tool call → spoken reply)
 
 User: "How many tomatoes do we have?"
 → get_inventory(item_name="tomato")
-→ "4,200 grams."
+→ "We have 4,200 grams of tomatoes."
 
-User: "All tomatoes spoiled."
+User: "Disable all pasta items."
+→ get_menu(filter="all")  [to get the list]
+→ disable_menu_item(category="pasta")
+→ [confirm mode] "I'll disable all 4 pasta dishes — confirm?"
+→ [after confirm] "Done — Spaghetti Carbonara, Tagliatelle, Cacio e Pepe, and Pappardelle have been disabled."
+→ [auto mode] "Disabled all 4 pasta dishes."
+
+User: [holds button, says nothing / unclear mumble]
+→ [NO tool call]
+→ "What would you like me to do?"
+
+User: "Disable Margherita Pizza."
+→ disable_menu_item(item_name="Margherita Pizza")
+→ [confirm mode] "I'll disable Margherita Pizza — confirm?"
+→ [after confirm] "Margherita Pizza has been disabled."
+→ [auto mode] "Margherita Pizza is now disabled."
+
+User: "All tomatoes in the inventory have spoiled."
 → record_spoilage(ingredient_name="tomato", all_stock=true)
-→ "Done — tomatoes zeroed. Margherita and Bruschetta auto-disabled."
+→ [after applied] "Done. Tomato stock zeroed. Margherita Pizza and Bruschetta have been automatically disabled."
 
-User: "Disable Margherita."
-→ disable_menu_item(item_name="Margherita Pizza")
-→ "Margherita disabled."
-
-User: "Head chef is leaving sick."
+User: "The head chef is sick."
+→ get_staff()  [to confirm who the head chef is]
 → set_staff_attendance(staff_name_or_role="head chef", status="sick")
-→ "Marco marked sick. Pasta station unstaffed — Carbonara and Tagliatelle disabled."
+→ "Marco (head chef) is now marked sick. The Pasta station is unstaffed — Spaghetti Carbonara and Tagliatelle have been automatically disabled."
 
-[CONFIRM MODE — call the tool, speak human_readable verbatim, wait]
-
-User: "Disable Margherita."
-→ disable_menu_item(item_name="Margherita Pizza")
-→ tool returns {requires_approval: true, human_readable: "Disable Margherita Pizza?"}
-→ "Disable Margherita Pizza?"   ← speak ONLY this, nothing more
-
-User: "Head chef is leaving sick."
-→ set_staff_attendance(staff_name_or_role="head chef", status="sick")
-→ tool returns {requires_approval: true, human_readable: "Mark Marco as sick?"}
-→ "Mark Marco as sick?"
+User: "We're low on tomatoes and the pasta chef just left — what should I prioritize?"
+→ consult_reasoner(question="Low on tomatoes and pasta chef absent — what should the manager prioritize?", context="Tomatoes below safety stock; pasta station unstaffed.")
+→ "Given both constraints, I'd 86 the pasta dishes first since the station is unstaffed anyway, then alert your tomato supplier. That preserves tomatoes for the non-pasta dishes still running."
 
 User: "What's selling most in the last 3 hours?"
 → get_pos_stats(window="3h")
-→ "Margherita Pizza — 24 orders. Tiramisu second with 18."
+→ "Top seller: Margherita Pizza with 24 orders, then Tiramisu with 18."
 
-User: "Tomato prices from all suppliers?"
+User: "What are the tomato prices from all our suppliers?"
 → get_supplier_prices(ingredient_name="tomato")
-→ "FreshFarms €2.50/kg, MedSupply €2.20/kg."
+→ "FreshFarms charges €2.50/kg for tomatoes; MedSupply charges €2.20/kg but has limited availability."
+
+User: "What dish is the most hated right now?"
+→ get_reviews(sort="most_hated")
+→ "Based on recent reviews, Tiramisu has the lowest ratings, with customers citing it as too sweet."
 """
 
-_BASE_RULES = """\
-CORE RULES:
-1. ALWAYS call a tool before answering any factual question. Never guess.
-2. TRUTHFULNESS: State ONLY what the tool result confirms. If a tool returns an error, say so — never claim an action succeeded without a successful tool result.
-3. CONCISENESS: Answer the specific question asked. Never recite entire lists when a specific answer was requested.
-4. MISSING ARGS: If a tool returns {"need": ...}, ask the user for that one piece of info only.
-"""
-
-_AUTO_MODE_RULE = """\
-MODE = AUTO: Call write tools immediately without asking permission. After the tool returns, \
-briefly state what was done. Never say "I'll do X" before doing it — just do it and confirm.
-"""
-
-_CONFIRM_MODE_RULE = """\
-MODE = CONFIRM: Call the write tool. If it returns requires_approval=true, \
-speak ONLY the human_readable field verbatim as your reply — nothing else, no preamble, \
-no "manager", no "approval", no formalities. It's already a short question. \
-Wait for the human to say yes/no, then call confirm_plan or cancel_plan accordingly.
-"""
-
-def _make_prompt(role: str, mode: str) -> str:
-    mode_rule = _AUTO_MODE_RULE if mode == "auto" else _CONFIRM_MODE_RULE
-    if role == "cook":
-        return (
-            "You are Roba, the AI kitchen desk. Concise kitchen-friendly replies — one or two sentences.\n\n"
-            + _BASE_RULES
-            + mode_rule + "\n"
-            "TOOL GUIDE:\n"
-            "• Batch status → get_batches(status='approved,decided')\n"
-            "• Did we cook X → get_batches(dish=..., status='ready')\n"
-            "• Mark cooked → confirm_batch_cooked(dish_or_batch=..., actual_qty=...)\n"
-            "• Waste (dish) → record_waste(item_name=..., qty=..., cause=...)\n"
-            "• Ingredient spoiled → record_spoilage(ingredient_name=..., all_stock=...)\n"
-            "• Inventory check → get_inventory(item_name=...)\n\n"
-            "BATCH STATES: approved=cook now; decided=needs approval; ready=already cooked; skipped=skip.\n\n"
-            + _FEW_SHOTS
-        )
-    return (
-        "You are Roba, the AI operations desk for this restaurant — you answer questions AND record updates.\n\n"
-        + _BASE_RULES
-        + mode_rule + "\n"
+_SYSTEM_INSTRUCTIONS: Dict[str, str] = {
+    "manager": (
+        "You are Roba, the AI operations desk for this restaurant. "
+        "You are a TWO-WAY interface: you answer questions AND record operational updates.\n\n"
+        "CORE RULES:\n"
+        "1. ALWAYS call a tool before answering any factual question. Never guess or answer from memory.\n"
+        "2. TRUTHFULNESS: State ONLY what the tool result confirms. If a tool returns an error, say so — "
+        "never claim an action succeeded without a successful tool result.\n"
+        "3. CONCISENESS: Answer the specific question asked. Never recite entire inventory lists, "
+        "whole forecasts, or long reports when a specific answer was requested.\n"
+        "4. MISSING ARGS: If a tool returns {'need': ...}, ask the user for that specific piece of info.\n"
+        "5. MODES:\n"
+        "   CONFIRM MODE: Call the write tool (it stages the action and shows a confirmation card on-screen). "
+        "Then speak exactly ONE short sentence: '[Action summary] — confirm?' and wait. "
+        "When the user says yes/confirm/go ahead, call confirm_plan(plan_id=...). "
+        "Never ask a 'manager' or anyone else — the person speaking to you IS the authority.\n"
+        "   AUTO MODE: Write tools apply immediately. Speak ONE short sentence of what was done. "
+        "Never ask for confirmation.\n"
+        "6. ACTIONS vs READS: If the user's request is an ACTION (disable, enable, set, mark, adjust, 86, "
+        "turn off, remove), you MUST call the matching WRITE tool. Never respond to an action request by "
+        "listing items — that is always wrong. If you receive an empty or unclear utterance, ask ONE short "
+        "clarifying question. Do NOT recite inventory or the menu to fill silence.\n\n"
         "TOOL GUIDE:\n"
         "• Inventory quantity → get_inventory(item_name=...)\n"
         "• Inventory expiry → get_inventory(sort='expiring_soonest')\n"
         "• Forecast → get_forecast(item_name=..., daypart=...)\n"
         "• Batch status → get_batches(status=..., dish=...)\n"
         "• What's disabled → get_menu(filter='disabled')\n"
+        "• All menu items → get_menu(filter='all')\n"
         "• Sales / top sellers → get_pos_stats(window=..., item_name=...)\n"
         "• Competitor promos → get_competitors()\n"
         "• Review sentiment → get_reviews(sort='most_hated')\n"
         "• Staff presence → get_staff()\n"
         "• Supplier prices → get_supplier_prices(ingredient_name=...)\n"
         "• Spoilage (ingredient) → record_spoilage(ingredient_name=..., all_stock=...)\n"
-        "• Disable/enable dish → disable_menu_item / enable_menu_item\n"
+        "• Disable/enable dish → disable_menu_item / enable_menu_item (supports category= or name_contains= for bulk)\n"
         "• Staff sick/leave → set_staff_attendance(staff_name_or_role=..., status=...)\n"
         "• Adjust stock → adjust_inventory(ingredient_name=..., set_to=... or delta=...)\n"
         "• Trigger agents → run_forecast / run_inventory_optimizer / run_competitor_scan / process_reviews\n"
-        "• Outbound call → request_outbound_call (always staged for approval)\n\n"
+        "• Outbound call → request_outbound_call (always requires approval)\n"
+        "• Complex trade-off → consult_reasoner(question=..., context=...)\n\n"
         "BATCH STATUS VOCABULARY: 'decided'=awaiting approval; 'approved'=ready to cook; "
         "'ready'=cooked; 'skipped'=decided to skip.\n\n"
+        "ESCALATION — call consult_reasoner when:\n"
+        "• You must choose between competing priorities (e.g. scarce ingredient AND unstaffed station)\n"
+        "• The user asks 'what should I do?' / 'what do you recommend?' / 'what's the right call?'\n"
+        "• You face a trade-off (raise price vs. 86 the dish; skip a batch vs. rush order)\n"
+        "• The situation has multiple interacting constraints you cannot resolve with a single tool\n"
+        "When using consult_reasoner, say a short filler ('Let me think on that...') before calling.\n\n"
         + _FEW_SHOTS
-    )
+    ),
+    "cook": (
+        "You are Roba, the AI kitchen desk. Concise kitchen-friendly replies (1-2 sentences max).\n\n"
+        "CORE RULES:\n"
+        "1. ALWAYS call a tool first. Never guess.\n"
+        "2. TRUTHFULNESS: Say only what the tool confirms.\n"
+        "3. CONCISENESS: Kitchen staff are busy. One or two sentences.\n"
+        "4. MISSING ARGS: If a tool returns {'need': ...}, ask the user for that specific piece of info.\n"
+        "5. MODES: CONFIRM MODE: stage the write tool and say '[summary] — confirm?'. "
+        "AUTO MODE: apply immediately and confirm in one sentence.\n"
+        "6. ACTIONS vs READS: If the request is an ACTION (mark cooked, record waste, record spoilage), "
+        "call the matching WRITE tool immediately. Never list items to fill silence — ask ONE short question.\n\n"
+        "TOOL GUIDE:\n"
+        "• Batch status → get_batches(status='approved,decided')\n"
+        "• Did we cook X → get_batches(dish=..., status='ready')\n"
+        "• Mark cooked → confirm_batch_cooked(dish_or_batch=..., actual_qty=...)\n"
+        "• Waste (dish) → record_waste(item_name=..., qty=..., cause=...)\n"
+        "• Ingredient spoiled → record_spoilage(ingredient_name=..., all_stock=...)\n"
+        "• Inventory check → get_inventory(item_name=...)\n\n"
+        "BATCH STATES: approved=cook now; decided=needs approval; ready=already cooked; skipped=skip.\n\n"
+        + _FEW_SHOTS
+    ),
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -576,7 +625,7 @@ async def live_bridge(
     if model and model in _ALLOWED_LIVE_MODELS:
         live_model = model
 
-    system_instruction = _make_prompt(role, mode)
+    system_instruction = _SYSTEM_INSTRUCTIONS.get(role, _SYSTEM_INSTRUCTIONS["manager"])
 
     # Slim injected context: just key numbers so the model uses tools for details.
     try:
@@ -719,6 +768,15 @@ async def _client_to_gemini(
                                 websocket,
                                 {"type": "tool_result", "tool": msg_type, "result": result},
                             )
+                            # Emit applied frame so the confirm card dismisses.
+                            if isinstance(result, dict) and result.get("status") == "applied":
+                                applied_frame = {
+                                    "type": "applied",
+                                    "tool": msg_type,
+                                    "summary": str(result.get("summary", result.get("human_readable", "Done."))),
+                                    "result": result,
+                                }
+                                await _safe_send_json(websocket, applied_frame)
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("voice %s failed: %s", msg_type, exc)
     except asyncio.CancelledError:
@@ -742,6 +800,7 @@ class _TurnBuffer:
         self.roba: list[str] = []
         self._user_turn_id: str = str(uuid.uuid4())
         self._roba_turn_id: str = str(uuid.uuid4())
+        self._user_finalized: bool = False
 
     def new_user_turn(self) -> str:
         self._user_turn_id = str(uuid.uuid4())
@@ -762,6 +821,7 @@ class _TurnBuffer:
         text = self.cumulative(role)
         if role == "user":
             self.user = []
+            self._user_finalized = True
         else:
             self.roba = []
         return text
@@ -854,8 +914,10 @@ async def _handle_chunk(
     if sc is not None:
         # User STT partial — accumulate and emit partial frame.
         if sc.input_transcription and sc.input_transcription.text:
-            if not buffers.user:
+            if buffers._user_finalized and not buffers.user:
+                # New utterance after a completed turn — get a fresh turn_id.
                 buffers.new_user_turn()
+                buffers._user_finalized = False
             buffers.user.append(sc.input_transcription.text)
             await _emit_partial(websocket, "user", buffers)
 
@@ -866,8 +928,6 @@ async def _handle_chunk(
         elif chunk.text:
             roba_text = chunk.text
         if roba_text:
-            # Flush user first so user line appears complete before roba's.
-            await _flush_transcript(websocket, "user", buffers)
             if not buffers.roba:
                 buffers.new_roba_turn()
             buffers.roba.append(roba_text)
@@ -905,6 +965,28 @@ async def _handle_chunk(
                 })
             except Exception:
                 pass
+            # Emit plan_preview or applied frames so the frontend card updates.
+            if isinstance(result, dict) and result.get("status") == "pending":
+                plan_id = str(result.get("plan_id", ""))
+                human_readable = str(result.get("human_readable", ""))
+                plan_preview_frame = {
+                    "type": "plan_preview",
+                    "plan": {
+                        "plan_id": plan_id,
+                        "human_readable": human_readable,
+                        "summary": human_readable,
+                        "routes": [{"summary": human_readable, "target_agents": ["menu"]}],
+                    },
+                }
+                await _safe_send_json(websocket, plan_preview_frame)
+            elif isinstance(result, dict) and result.get("status") == "applied":
+                applied_frame = {
+                    "type": "applied",
+                    "tool": fn_call.name,
+                    "summary": str(result.get("summary", result.get("human_readable", "Done."))),
+                    "result": result,
+                }
+                await _safe_send_json(websocket, applied_frame)
 
 
 async def _execute_tool(
@@ -1005,6 +1087,8 @@ async def _execute_tool(
                 va.disable_menu_item,
                 item_name=str(args.get("item_name", "")),
                 reason=str(args.get("reason", "voice request")),
+                category=args.get("category") or None,
+                name_contains=args.get("name_contains") or None,
                 mode=mode,
             )
 
@@ -1014,6 +1098,8 @@ async def _execute_tool(
             return await asyncio.to_thread(
                 va.enable_menu_item,
                 item_name=str(args.get("item_name", "")),
+                category=args.get("category") or None,
+                name_contains=args.get("name_contains") or None,
                 mode=mode,
             )
 
@@ -1114,6 +1200,15 @@ async def _execute_tool(
             if va is not None:
                 return await asyncio.to_thread(va.cancel_pending, plan_id)
             return await asyncio.to_thread(voice_processor.cancel, plan_id)
+
+        if name == "consult_reasoner":
+            if va:
+                return await asyncio.to_thread(
+                    va.consult_reasoner,
+                    question=str(args.get("question", "")),
+                    context=args.get("context"),
+                )
+            return {"error": "VoiceActions not available"}
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("voice_live tool %s failed: %s", name, exc)
