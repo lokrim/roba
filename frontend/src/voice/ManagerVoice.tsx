@@ -5,6 +5,7 @@ import { MicButton } from "./MicButton";
 import { PlanConfirmCard } from "./PlanConfirmCard";
 import { ModeToggle } from "./ModeToggle";
 import { MicModeToggle } from "./MicModeToggle";
+import { ModelToggle } from "./ModelToggle";
 import { apiGet, apiPost } from "../api";
 import type { ApprovalRequest } from "../types";
 
@@ -138,6 +139,10 @@ export function ManagerVoice() {
         <div className="flex items-center justify-between">
           <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Mic mode</span>
           <MicModeToggle micMode={live.micMode} onChange={live.setMicMode} disabled={live.state === "listening"} />
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Voice model</span>
+          <ModelToggle voiceModel={live.voiceModel} onChange={live.setVoiceModel} disabled={live.state === "listening"} />
         </div>
       </div>
 

@@ -642,6 +642,118 @@ class InventoryLedger(BaseAgent):
             {"ingredient_id": spec["ingredient_id"], "lot_id": spec["id"], "cost": cost},
         )
 
+    # -- voice-driven ingredient waste (called by VoiceActions) -----------
+
+    def apply_ingredient_waste(
+        self,
+        ingredient_id: int,
+        qty: Optional[float] = None,
+        *,
+        all_stock: bool = False,
+        waste_type: str = "spoilage",
+        reason: str = "voice spoilage report",
+    ) -> Dict[str, Any]:
+        """Deplete ingredient stock and record waste.  Called by VoiceActions.
+
+        Parameters
+        ----------
+        ingredient_id:
+            The ingredient to deplete.
+        qty:
+            How much to deplete.  If None and ``all_stock=True``, depletes
+            the entire on_hand_cached balance (i.e. sets to zero).
+        all_stock:
+            When True, interpret as "spoil all" — use the current on_hand balance.
+        waste_type:
+            One of "spoilage" | "overproduction" | "expiry" | "prep_error".
+        reason:
+            Human-readable reason stored in WasteEvent and ledger row.
+
+        Returns
+        -------
+        dict with ingredient_id, on_hand_before, on_hand_after, depleted, unit.
+        """
+        now = self.sim_time
+        session = self.db_session_factory()
+        try:
+            level = self._get_or_create_level(session, ingredient_id)
+            on_hand_before = float(level.on_hand_cached or 0.0)
+            ing = session.get(Ingredient, ingredient_id)
+            unit = str(ing.base_unit or "each") if ing else "each"
+            if all_stock or qty is None:
+                depleted = on_hand_before
+            else:
+                depleted = min(float(qty), on_hand_before)
+        finally:
+            session.close()
+
+        if depleted <= 0:
+            return {
+                "ingredient_id": ingredient_id,
+                "on_hand_before": on_hand_before,
+                "on_hand_after": on_hand_before,
+                "depleted": 0.0,
+                "unit": unit,
+            }
+
+        # Deplete FIFO via existing mechanism.
+        self._deplete_fifo(ingredient_id, depleted, "waste", None, now)
+
+        # Re-read balance after depletion.
+        session = self.db_session_factory()
+        try:
+            level = self._get_or_create_level(session, ingredient_id)
+            on_hand_after = float(level.on_hand_cached or 0.0)
+            # Write a WasteEvent with ingredient_id set (unlike the dish-waste path).
+            we = WasteEvent(
+                waste_type=waste_type,
+                ingredient_id=ingredient_id,
+                menu_item_id=None,
+                lot_id=None,
+                qty=depleted,
+                unit=unit,
+                cost=None,
+                reason=reason,
+                sim_time=now,
+                source="voice",
+            )
+            session.add(we)
+            session.commit()
+            we_id = we.id
+        finally:
+            session.close()
+
+        self.broadcast(
+            "inventory_updated", {"ingredient_id": ingredient_id, "on_hand": on_hand_after}
+        )
+        self.emit(
+            SignalType.WASTE_EVENT,
+            {
+                "waste_type": waste_type,
+                "ingredient_id": ingredient_id,
+                "menu_item_id": None,
+                "qty": depleted,
+                "unit": unit,
+                "reason": reason,
+                "source": "voice",
+                "waste_event_id": we_id,
+            },
+            source="voice",
+            groups=["inventory", "procurement", "human"],
+        )
+        self.log_event(
+            "waste",
+            f"Voice spoilage: {depleted:.1f} {unit} of ingredient {ingredient_id} marked as {waste_type}.",
+            {"ingredient_id": ingredient_id, "depleted": depleted, "on_hand_after": on_hand_after},
+        )
+        return {
+            "ingredient_id": ingredient_id,
+            "on_hand_before": on_hand_before,
+            "on_hand_after": on_hand_after,
+            "depleted": depleted,
+            "unit": unit,
+        }
+
     # -- receipts (called by Procurement) ----------------------------------
 
     def receive(self, po_id: int) -> None:

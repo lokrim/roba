@@ -381,6 +381,7 @@ class MenuToggle(Base):
     menu_item_id = mapped_column(ForeignKey("menu_items.id"))
     action = mapped_column(String)             # disable | enable
     reason = mapped_column(String)
+    reason_code = mapped_column(String, nullable=True)  # out_of_stock | station_unstaffed | manual
     triggered_by = mapped_column(String)
     sim_time = mapped_column(Float)
     active = mapped_column(Integer)            # bool 0/1

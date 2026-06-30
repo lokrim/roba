@@ -156,6 +156,7 @@ class AppContext:
         self.orchestrator: Optional[Orchestrator] = None
         self.llm: Optional[LLMProvider] = None
         self.voice: Optional[VoiceProcessor] = None
+        self.voice_actions: Optional[Any] = None  # VoiceActions dispatch seam
         self.seeder: Optional[Seeder] = None
         self.weather: Optional[WeatherProvider] = None
         self.calls: Optional[CallSubsystem] = None
@@ -342,6 +343,27 @@ def _bootstrap() -> None:
     ctx.formatter = formatter
     ctx.pos = pos
     ctx.scenarios = scenarios
+
+    # Create the VoiceActions dispatch seam. Agent refs are optional; if a
+    # track didn't register, the relevant VoiceActions methods return an error.
+    try:
+        from .voice_actions import VoiceActions
+        track_b = ctx.tracks.get("track_b") or {}
+        ctx.voice_actions = VoiceActions(
+            bus=bus,
+            db_session_factory=factory,
+            hub_broadcast=sink,
+            voice_processor=voice,
+            ledger=track_b.get("ledger"),
+            optimizer=track_b.get("optimizer"),
+            staff_agent=ctx.track_a.get("staff"),
+            forecaster=ctx.track_a.get("forecaster"),
+            forecast_jobs=ctx.forecast_jobs,
+            competitor_agent=ctx.track_a.get("competitor"),
+            review_agent=ctx.track_a.get("reviews"),
+        )
+    except Exception:  # noqa: BLE001 — VoiceActions failure must not break startup
+        logger.exception("VoiceActions failed to initialize — voice writes will be unavailable")
 
 
 def _register_tracks(demo_mode: str, **ctx_kwargs: Any) -> None:
@@ -1532,6 +1554,7 @@ class VoiceClarifyBody(BaseModel):
 
 class VoiceSettingsBody(BaseModel):
     default_mode: str = "confirm"
+    voice_model: Optional[str] = None
 
 
 @app.post("/api/voice/plan")
@@ -1563,14 +1586,23 @@ def voice_clarify(body: VoiceClarifyBody) -> Dict[str, Any]:
 
 @app.get("/api/settings/voice")
 def get_voice_settings() -> Dict[str, Any]:
-    return {"default_mode": config.VOICE_DEFAULT_MODE}
+    return {
+        "default_mode": config.VOICE_DEFAULT_MODE,
+        "voice_model": config.GEMINI_LIVE_MODEL,
+    }
 
 
 @app.post("/api/settings/voice")
 def set_voice_settings(body: VoiceSettingsBody) -> Dict[str, Any]:
     import core.config as _cfg
+    from .voice_live import _ALLOWED_LIVE_MODELS
     _cfg.VOICE_DEFAULT_MODE = body.default_mode
-    return {"default_mode": _cfg.VOICE_DEFAULT_MODE}
+    if body.voice_model and body.voice_model in _ALLOWED_LIVE_MODELS:
+        _cfg.GEMINI_LIVE_MODEL = body.voice_model
+    return {
+        "default_mode": _cfg.VOICE_DEFAULT_MODE,
+        "voice_model": _cfg.GEMINI_LIVE_MODEL,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1901,6 +1933,7 @@ async def voice_live_endpoint(
     role: str = Query("manager"),
     mode: str = Query("confirm"),
     mic_mode: str = Query("ptt"),
+    model: Optional[str] = Query(None),
 ) -> None:
     """Gemini Live API bridge (Stream B5).
 
@@ -1910,11 +1943,20 @@ async def voice_live_endpoint(
     mic_mode="ptt"          Automatic VAD disabled; turns are delimited by
                             explicit activity_start / activity_end frames.
     mic_mode="conversation" Default automatic VAD; Gemini detects turn ends.
+    model=<id>              Override the live model (validated against allowlist).
     """
     await websocket.accept()
     try:
         from .voice_live import live_bridge
-        await live_bridge(websocket, ctx.voice, role=role, mode=mode, mic_mode=mic_mode)
+        await live_bridge(
+            websocket,
+            ctx.voice,
+            role=role,
+            mode=mode,
+            mic_mode=mic_mode,
+            model=model,
+            voice_actions=ctx.voice_actions,
+        )
     except Exception:  # noqa: BLE001
         logger.exception("voice live endpoint error")
     finally:

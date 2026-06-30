@@ -1,22 +1,31 @@
 """Vertex AI Live API bridge for the Roba voice interface.
 
 Architecture:
-  Browser ⟷ our WS /ws/voice/live?role=<role>&mode=<mode>
+  Browser ⟷ our WS /ws/voice/live?role=<role>&mode=<mode>&mic_mode=<mic_mode>&model=<model>
            ⟷ Vertex AI Live session (google-genai SDK, vertexai=True)
 
 The browser sends binary PCM16 @16kHz audio frames and optional JSON control
 frames.  We relay audio to the Live session and forward audio output + transcript
-events back.  Tool calls from the model (process_note, confirm_plan, etc.) are
-executed server-side and their results returned to the session.
+events back.
 
-Falls back gracefully: when ``GOOGLE_CLOUD_PROJECT`` is unresolvable (no env var
-and no ``roba.json``) or the genai import fails, the WS immediately sends
-``{"type":"unavailable"}`` so the client can degrade to text + browser speech
-synthesis.
+Tool calls from the model are dispatched to ``VoiceActions`` — the single
+deterministic dispatch seam.  The old ``process_note`` / ``VoiceProcessor.plan``
+double-LLM path is NOT used for live voice; it remains only behind the text REST
+endpoints.
+
+Transcript streaming:
+  Each turn gets a stable ``turn_id``.  Partial transcript frames are emitted
+  as the model speaks/listens (cumulative text, same turn_id, final=False).
+  A final flush emits final=True so the frontend can freeze the bubble.
 
 Authentication: service-account JSON at ``roba.json`` (repo root) or the path in
 ``GOOGLE_APPLICATION_CREDENTIALS``, falling back to Application Default Credentials.
 Handled by ``core.vertex.build_genai_client()``.
+
+Model selection:
+  • Default: ``GEMINI_LIVE_MODEL`` from config / env.
+  • Override: ``model`` query param on the WS URL (validated against allowlist).
+  • Allowed models listed in ``_ALLOWED_LIVE_MODELS``.
 
 Audio spec (mandated by the Live API):
   • Browser → server: 16 kHz, mono, 16-bit LE PCM
@@ -38,26 +47,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any, Dict, Optional
 
 from .config import GEMINI_LIVE_MODEL
 
 logger = logging.getLogger(__name__)
 
-# How long (seconds) we wait for the Live session to produce a response
-# before we log a heartbeat.  A silent user is normal in a voice session, so
-# this is NOT fatal — we just keep listening.
 _RESPONSE_TIMEOUT_S = 20.0
-# Live API connection attempt timeout — guards ONLY the __aenter__ network IO,
-# never the session lifetime.
 _CONNECT_TIMEOUT_S = 10.0
 
-# Exception type names that mean "the client (or the Live peer) hung up".
-# Clients routinely open the voice WS on page load and tear it down moments
-# later — React strict-mode double-mount, a quick navigation, or switching
-# role — which races our connect handshake.  These are expected, not errors,
-# so we log them quietly without a traceback.  Matched by name to avoid
-# importing uvicorn/websockets internals.
+# Models the UI may select via the model= query param.
+_ALLOWED_LIVE_MODELS = {
+    "gemini-live-2.5-flash-native-audio",   # natural voice, default
+    "gemini-2.5-flash-preview-native-audio-dialog",  # smarter tool-use
+    "gemini-2.5-flash",                    # half-cascade (text reasoning)
+    "gemini-2.5-pro",                      # highest quality
+}
+
 _DISCONNECT_EXC_NAMES = {
     "WebSocketDisconnect",
     "ClientDisconnected",
@@ -68,18 +75,12 @@ _DISCONNECT_EXC_NAMES = {
 
 
 def _is_disconnect(exc: BaseException) -> bool:
-    """True if ``exc`` represents a normal client/peer disconnect."""
     if type(exc).__name__ in _DISCONNECT_EXC_NAMES:
         return True
-    # google-genai raises APIError with code 1000 on a normal session close.
     return getattr(exc, "code", None) == 1000
 
 
 async def _safe_send_json(websocket: Any, payload: Dict[str, Any]) -> bool:
-    """Send a JSON frame, returning False if the client has gone away.
-
-    A disconnect here is expected (see _DISCONNECT_EXC_NAMES) and never raises.
-    """
     try:
         await websocket.send_json(payload)
         return True
@@ -90,260 +91,419 @@ async def _safe_send_json(websocket: Any, payload: Dict[str, Any]) -> bool:
             logger.warning("websocket send failed: %s", exc)
         return False
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Tool schema declarations (sent to Vertex AI Live in LiveConnectConfig)
+# Tool schema declarations
 # ──────────────────────────────────────────────────────────────────────────────
 
 _TOOLS: list[dict[str, Any]] = [
     {
         "function_declarations": [
-            {
-                "name": "process_note",
-                "description": (
-                    "Process a spoken operational note from the restaurant staff. "
-                    "Returns a human-readable summary of what Roba understood and "
-                    "what signal or action will be created."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "The verbatim transcription of the spoken note.",
-                        }
-                    },
-                    "required": ["text"],
-                },
-            },
-            {
-                "name": "confirm_plan",
-                "description": "Apply a pending plan that the user has confirmed.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "plan_id": {"type": "string", "description": "The plan_id to apply."}
-                    },
-                    "required": ["plan_id"],
-                },
-            },
-            {
-                "name": "cancel_plan",
-                "description": "Cancel a pending plan that the user rejected.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "plan_id": {"type": "string", "description": "The plan_id to cancel."}
-                    },
-                    "required": ["plan_id"],
-                },
-            },
-            {
-                "name": "mark_batch_cooked",
-                "description": "Record that the cook has finished cooking a batch.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "item_name": {
-                            "type": "string",
-                            "description": "The dish name that was cooked.",
-                        },
-                        "actual_qty": {
-                            "type": "number",
-                            "description": "How many portions were actually made.",
-                        },
-                    },
-                    "required": ["item_name", "actual_qty"],
-                },
-            },
-            {
-                "name": "report_waste",
-                "description": (
-                    "Report that food was thrown away. If the cause is unclear, "
-                    "ask the cook a follow-up question before calling this."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "item_name": {"type": "string"},
-                        "qty": {"type": "number"},
-                        "cause": {
-                            "type": "string",
-                            "enum": ["overproduction", "spoilage", "prep_error"],
-                        },
-                    },
-                    "required": ["item_name", "qty", "cause"],
-                },
-            },
-            {
-                "name": "request_competitor_call",
-                "description": (
-                    "Request an approval-gated call to a competitor or supplier. "
-                    "Only available to the manager role."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {"type": "string", "description": "Name of the competitor or supplier."},
-                        "counterparty_type": {
-                            "type": "string",
-                            "enum": ["competitor", "supplier"],
-                        },
-                        "purpose": {"type": "string"},
-                    },
-                    "required": ["target", "counterparty_type", "purpose"],
-                },
-            },
-            {
-                "name": "get_kitchen_status",
-                "description": (
-                    "Look up the CURRENT, live state of the restaurant to answer a factual question. "
-                    "Use this before answering ANY question about whether a dish's batch was prepared "
-                    "or cooked, whether a batch should be cooked, how many portions were made, what "
-                    "has been approved or is pending, forecasts, or inventory levels. "
-                    "Never guess or answer from memory — always call this tool first."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dish": {
-                            "type": "string",
-                            "description": (
-                                "Optional: the dish name or number (e.g. '3', '#3', 'Margherita', 'dish 3'). "
-                                "Provide this when the question is about a specific dish."
-                            ),
-                        },
-                        "topic": {
-                            "type": "string",
-                            "enum": ["all", "batches", "approvals", "forecast", "inventory"],
-                            "description": "What aspect to focus on. Default: 'all'.",
-                        },
-                    },
-                    "required": [],
-                },
-            },
-            # ── granular read-only data lookups ─────────────────────────────
-            # get_kitchen_status is the broad "live state" tool; these return
-            # focused, fresh data (with names and units) for specific domains.
+            # ── Read tools (never require confirmation) ────────────────────
             {
                 "name": "get_inventory",
                 "description": (
-                    "Look up current on-hand inventory. Returns ingredient names, "
-                    "quantities, and units (g, ml, or each). Use this to answer "
-                    "'how many/much X do we have'. Pass item_name to filter to one "
-                    "ingredient (e.g. 'tomato'). Always state the unit in your answer."
+                    "Look up current on-hand inventory with ingredient names, quantities, "
+                    "and units (g, ml, or each). Use this for ANY question about inventory "
+                    "quantities. Pass item_name to filter to one ingredient. "
+                    "Pass sort='expiring_soonest' to find items expiring earliest. "
+                    "ALWAYS state the unit (g/ml/each) in your answer — never read raw numbers."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "item_name": {
-                            "type": "string",
-                            "description": "Optional ingredient name to filter by, e.g. 'tomato'.",
-                        }
+                        "item_name": {"type": "string", "description": "Optional ingredient name filter, e.g. 'tomato'."},
+                        "sort": {"type": "string", "enum": ["expiring_soonest"], "description": "Sort mode."},
                     },
                 },
             },
             {
                 "name": "get_forecast",
                 "description": (
-                    "Look up the latest demand forecasts (expected quantities per "
-                    "menu item and daypart). Pass item_name to filter to one dish."
+                    "Look up demand forecasts (expected quantities per menu item and daypart). "
+                    "If no forecast exists, automatically runs the forecaster and returns fresh values. "
+                    "Pass item_name to filter to one dish. Pass daypart to filter (breakfast/lunch/dinner/etc)."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "item_name": {
-                            "type": "string",
-                            "description": "Optional menu item name to filter by.",
-                        }
+                        "item_name": {"type": "string", "description": "Optional menu item filter."},
+                        "daypart": {"type": "string", "description": "Optional daypart filter."},
                     },
                 },
             },
             {
-                "name": "get_competitors",
+                "name": "get_batches",
                 "description": (
-                    "Look up competitor profiles (rating, price tier, distance) and "
-                    "recent market-intelligence observations (opportunities/threats)."
+                    "Look up production batches. Use to answer: 'what batches are scheduled', "
+                    "'has X been cooked', 'what is approved but not confirmed'. "
+                    "status can be comma-separated, e.g. 'approved,decided' for upcoming. "
+                    "Batch states: approved=ready to cook, decided=awaiting approval, ready=cooked, skipped=skipped."
                 ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "description": "Filter by status (decided/approved/ready/skipped), comma-separated."},
+                        "dish": {"type": "string", "description": "Optional dish name filter."},
+                    },
+                },
+            },
+            {
+                "name": "get_menu",
+                "description": (
+                    "Look up menu items. Use filter='disabled' (default) to see which items are "
+                    "currently off and why, or filter='all' for all items."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filter": {"type": "string", "enum": ["disabled", "all"]},
+                    },
+                },
+            },
+            {
+                "name": "get_pos_stats",
+                "description": (
+                    "Look up POS sales data. Use for: 'what is selling most in the last 3 hours', "
+                    "'how many margheritas since 4pm', 'top items today'. "
+                    "window examples: '3h', '30m', '1d'. Pass item_name to filter to one dish."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "window": {"type": "string", "description": "Time window, e.g. '3h', '30m', '1d'."},
+                        "item_name": {"type": "string", "description": "Optional dish filter."},
+                    },
+                    "required": ["window"],
+                },
+            },
+            {
+                "name": "get_competitors",
+                "description": "Look up competitor profiles and recent market-intelligence observations (promotions, threats, opportunities).",
                 "parameters": {"type": "object", "properties": {}},
             },
             {
                 "name": "get_reviews",
-                "description": "Look up recent customer reviews and derived insights.",
-                "parameters": {"type": "object", "properties": {}},
+                "description": (
+                    "Look up recent customer reviews and insights. "
+                    "Pass sort='most_hated' to find the most negatively-reviewed dishes."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sort": {"type": "string", "enum": ["most_hated"]},
+                    },
+                },
             },
             {
                 "name": "get_staff",
-                "description": "Look up the staff roster and which stations each person covers.",
+                "description": "Look up the staff roster, roles, and which stations each person covers.",
                 "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "get_supplier_prices",
+                "description": (
+                    "Look up supplier prices and availability for ingredients. "
+                    "Pass ingredient_name to filter, e.g. 'tomato' returns all supplier prices for tomatoes."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ingredient_name": {"type": "string", "description": "Optional ingredient filter."},
+                    },
+                },
             },
             {
                 "name": "get_signals",
-                "description": (
-                    "Look up the currently-active operational signals on the bus "
-                    "(constraints, demand forecasts, alerts, etc.)."
-                ),
+                "description": "Look up currently-active operational signals (constraints, alerts, demand forecasts).",
                 "parameters": {"type": "object", "properties": {}},
             },
             {
-                "name": "get_batches",
+                "name": "get_kitchen_status",
                 "description": (
-                    "Look up upcoming and in-progress production batches (planned "
-                    "quantities, status, serve windows)."
+                    "Broad live-state lookup. Use for overall kitchen overview, "
+                    "pending approvals, or when a more specific tool isn't the right fit."
                 ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dish": {"type": "string", "description": "Optional dish name or number."},
+                        "topic": {"type": "string", "enum": ["all", "batches", "approvals", "forecast", "inventory"]},
+                    },
+                },
+            },
+
+            # ── Write tools (confirm/auto governed; outbound call always staged) ──
+            {
+                "name": "disable_menu_item",
+                "description": (
+                    "Disable (turn off) a menu item so it cannot be ordered. "
+                    "This is a manual sticky disable — it stays off until explicitly re-enabled. "
+                    "Use this when the manager says 'disable X', 'take X off the menu', etc."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "item_name": {"type": "string", "description": "The dish name to disable."},
+                        "reason": {"type": "string", "description": "Optional reason for the disable."},
+                    },
+                    "required": ["item_name"],
+                },
+            },
+            {
+                "name": "enable_menu_item",
+                "description": "Re-enable a disabled menu item. Clears all blocks (including manual and stock-based).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "item_name": {"type": "string", "description": "The dish name to re-enable."},
+                    },
+                    "required": ["item_name"],
+                },
+            },
+            {
+                "name": "adjust_inventory",
+                "description": (
+                    "Add to or set the inventory quantity for an ingredient. "
+                    "Use set_to to set an exact quantity, or delta to add (positive) or subtract (negative). "
+                    "Example: 'we just got 5kg of tomatoes' → delta=5000, unit='g', ingredient_name='tomato'. "
+                    "Always specify the unit."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ingredient_name": {"type": "string"},
+                        "set_to": {"type": "number", "description": "Set on_hand to exactly this amount."},
+                        "delta": {"type": "number", "description": "Add/subtract this amount (positive=add, negative=remove)."},
+                        "unit": {"type": "string", "description": "Unit, e.g. 'g', 'ml', 'each'."},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["ingredient_name"],
+                },
+            },
+            {
+                "name": "record_spoilage",
+                "description": (
+                    "Mark an INGREDIENT (not a dish) as spoiled. Reduces inventory, logs waste for the "
+                    "forecaster and optimizer, and automatically disables dishes that needed that ingredient. "
+                    "Use for: 'all tomatoes are spoiled', 'the mozzarella went bad', '2kg of flour spoiled'. "
+                    "Set all_stock=true when EVERYTHING of that ingredient is gone."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ingredient_name": {"type": "string", "description": "The spoiled ingredient, e.g. 'tomato'."},
+                        "qty": {"type": "number", "description": "How much spoiled (in the ingredient's base unit). Omit when all_stock=true."},
+                        "all_stock": {"type": "boolean", "description": "True if ALL of this ingredient has spoiled."},
+                    },
+                    "required": ["ingredient_name"],
+                },
+            },
+            {
+                "name": "confirm_batch_cooked",
+                "description": (
+                    "Record that a batch has been cooked. Use for: 'I cooked the margherita batch', "
+                    "'batch done, made 18'. Provide the dish name or batch id."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dish_or_batch": {"type": "string", "description": "Dish name or batch id (e.g. '#5' or 'Margherita')."},
+                        "actual_qty": {"type": "number", "description": "How many were actually made (optional, defaults to planned qty)."},
+                    },
+                    "required": ["dish_or_batch"],
+                },
+            },
+            {
+                "name": "record_waste",
+                "description": (
+                    "Record that a dish/batch was thrown away (overproduction, prep error, etc.). "
+                    "For INGREDIENT spoilage, use record_spoilage instead."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "item_name": {"type": "string"},
+                        "qty": {"type": "number"},
+                        "cause": {"type": "string", "enum": ["overproduction", "spoilage", "prep_error"]},
+                    },
+                    "required": ["item_name", "qty", "cause"],
+                },
+            },
+            {
+                "name": "set_staff_attendance",
+                "description": (
+                    "Update a staff member's attendance status. The system will automatically "
+                    "disable or re-enable dishes based on station coverage after the update. "
+                    "Use for: 'head chef is sick', 'Marco is on leave today', 'chef is back'. "
+                    "staff_name_or_role can be a name ('Marco') or a role ('head chef', 'cook')."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "staff_name_or_role": {"type": "string", "description": "Staff name or role."},
+                        "status": {"type": "string", "enum": ["sick", "leave", "present"]},
+                        "daypart": {"type": "string", "description": "Optional daypart restriction."},
+                    },
+                    "required": ["staff_name_or_role", "status"],
+                },
+            },
+            {
+                "name": "run_forecast",
+                "description": "Trigger the demand forecaster to generate fresh forecasts.",
                 "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "run_inventory_optimizer",
+                "description": "Trigger the inventory optimizer to run a fresh analysis.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "run_competitor_scan",
+                "description": "Trigger a competitor market poll to get the latest competitor data.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "process_reviews",
+                "description": "Process unprocessed customer reviews and generate insights.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "request_outbound_call",
+                "description": (
+                    "Request an approval-gated outbound call to a competitor or supplier. "
+                    "Always requires manager approval before it proceeds."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "description": "Name of the competitor or supplier."},
+                        "counterparty_type": {"type": "string", "enum": ["competitor", "supplier"]},
+                        "purpose": {"type": "string"},
+                    },
+                    "required": ["target", "counterparty_type", "purpose"],
+                },
+            },
+            {
+                "name": "confirm_plan",
+                "description": "Apply a pending action that the user has confirmed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "plan_id": {"type": "string"},
+                    },
+                    "required": ["plan_id"],
+                },
+            },
+            {
+                "name": "cancel_plan",
+                "description": "Cancel a pending action that the user rejected.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "plan_id": {"type": "string"},
+                    },
+                    "required": ["plan_id"],
+                },
             },
         ]
     }
 ]
 
-# System instructions per role.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# System prompts
+# ──────────────────────────────────────────────────────────────────────────────
+
+_FEW_SHOTS = """
+## Examples (utterance → tool call → spoken reply)
+
+User: "How many tomatoes do we have?"
+→ get_inventory(item_name="tomato")
+→ "We have 4,200 grams of tomatoes."
+
+User: "All tomatoes in the inventory have spoiled."
+→ record_spoilage(ingredient_name="tomato", all_stock=true)
+→ "Done. I've zeroed the tomato stock and recorded the spoilage. Margherita Pizza and Bruschetta have been automatically disabled since they require tomatoes."
+
+User: "Disable Margherita Pizza."
+→ disable_menu_item(item_name="Margherita Pizza")
+→ [in confirm mode] "I'll disable Margherita Pizza. Confirm?"
+→ [after confirm] "Margherita Pizza has been disabled."
+
+User: "The head chef is leaving, he's sick."
+→ get_staff() [to resolve who the head chef is]
+→ set_staff_attendance(staff_name_or_role="head chef", status="sick")
+→ "Marco (head chef) has been marked as sick. The Pasta station is now unstaffed — Spaghetti Carbonara and Tagliatelle have been automatically disabled."
+
+User: "What's selling most in the last 3 hours?"
+→ get_pos_stats(window="3h")
+→ "The top seller in the last 3 hours is Margherita Pizza with 24 orders, followed by Tiramisu with 18."
+
+User: "What are the tomato prices from all our suppliers?"
+→ get_supplier_prices(ingredient_name="tomato")
+→ "FreshFarms charges €2.50/kg for tomatoes; MedSupply charges €2.20/kg but has limited availability."
+
+User: "What dish is the most hated right now?"
+→ get_reviews(sort="most_hated")
+→ "Based on recent reviews, Tiramisu has the lowest ratings, with customers citing it as too sweet."
+"""
+
 _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
     "manager": (
         "You are Roba, the AI operations desk for this restaurant. "
-        "You are a TWO-WAY interface: you BOTH answer questions about current restaurant state "
-        "AND record operational updates from the manager. "
-        "\n\nANSWERING QUESTIONS: For any factual question about current state — whether a batch "
-        "was cooked, what is approved or pending, demand forecasts, inventory, competitor intel — "
-        "ALWAYS call a read tool first, then answer from its result. Never guess. "
-        "Use get_kitchen_status for batch/approval/overall state; for a focused lookup you may "
-        "call get_inventory, get_forecast, get_competitors, get_reviews, get_staff, get_signals, "
-        "or get_batches. When reporting an inventory quantity, always include its unit (g, ml, or "
-        "each) and never read a raw number as an item count. "
-        "\n\nRECORDING UPDATES: When the manager reports something (a constraint, a decision, a "
-        "competitor note), call process_note with the exact transcription. "
-        "Always confirm back in plain language what action will be taken and ask for confirmation "
-        "in confirm-first mode before applying it. "
-        "For outbound calls to competitors or suppliers, use request_competitor_call to create "
-        "an approval-gated request. "
-        "\n\nBATCH STATUS VOCABULARY (use these terms exactly): "
-        "state=awaiting_approval means the batch is not yet cleared to cook; "
-        "state=ready_to_cook means it is approved and should be cooked now; "
-        "state=cooked means it has already been prepared (status=ready in the system); "
-        "state=skipped means the batch decision was to skip it. "
-        "The system never uses 'prepping' or 'served' as batch states. "
-        "\n\nKeep responses concise and actionable."
+        "You are a TWO-WAY interface: you answer questions AND record operational updates.\n\n"
+        "CORE RULES:\n"
+        "1. ALWAYS call a tool before answering any factual question. Never guess or answer from memory.\n"
+        "2. TRUTHFULNESS: State ONLY what the tool result confirms. If a tool returns an error, say so — "
+        "never claim an action succeeded without a successful tool result.\n"
+        "3. CONCISENESS: Answer the specific question asked. Never recite entire inventory lists, "
+        "whole forecasts, or long reports when a specific answer was requested.\n"
+        "4. MISSING ARGS: If a tool returns {'need': ...}, ask the user for that specific piece of info.\n"
+        "5. READS NEVER CONFIRM: Read tools apply instantly. Write tools follow confirm/auto mode.\n\n"
+        "TOOL GUIDE:\n"
+        "• Inventory quantity → get_inventory(item_name=...)\n"
+        "• Inventory expiry → get_inventory(sort='expiring_soonest')\n"
+        "• Forecast → get_forecast(item_name=..., daypart=...)\n"
+        "• Batch status → get_batches(status=..., dish=...)\n"
+        "• What's disabled → get_menu(filter='disabled')\n"
+        "• Sales / top sellers → get_pos_stats(window=..., item_name=...)\n"
+        "• Competitor promos → get_competitors()\n"
+        "• Review sentiment → get_reviews(sort='most_hated')\n"
+        "• Staff presence → get_staff()\n"
+        "• Supplier prices → get_supplier_prices(ingredient_name=...)\n"
+        "• Spoilage (ingredient) → record_spoilage(ingredient_name=..., all_stock=...)\n"
+        "• Disable/enable dish → disable_menu_item / enable_menu_item\n"
+        "• Staff sick/leave → set_staff_attendance(staff_name_or_role=..., status=...)\n"
+        "• Adjust stock → adjust_inventory(ingredient_name=..., set_to=... or delta=...)\n"
+        "• Trigger agents → run_forecast / run_inventory_optimizer / run_competitor_scan / process_reviews\n"
+        "• Outbound call → request_outbound_call (always requires approval)\n\n"
+        "BATCH STATUS VOCABULARY: 'decided'=awaiting approval; 'approved'=ready to cook; "
+        "'ready'=cooked; 'skipped'=decided to skip.\n\n"
+        + _FEW_SHOTS
     ),
     "cook": (
-        "You are Roba, the AI kitchen desk. "
-        "You are a TWO-WAY interface: you BOTH answer questions about batch state and "
-        "AND record what the cook has done. "
-        "\n\nANSWERING QUESTIONS: For any question about whether a batch was cooked, "
-        "what needs to be cooked, what is approved or pending — ALWAYS call get_kitchen_status "
-        "first, then answer from its result. Never guess. For focused lookups you may also call "
-        "get_inventory, get_batches, get_forecast, or get_signals. Always include units (g, ml, "
-        "each) when reporting an inventory quantity. "
-        "\n\nRECORDING UPDATES: When the cook reports completing a batch, call mark_batch_cooked. "
-        "When they report throwing food away, call report_waste. "
-        "If the cause of waste is unclear, always ask before reporting. "
-        "\n\nBATCH STATUS VOCABULARY: "
-        "ready_to_cook = approved and should be cooked now; "
-        "cooked = already prepared (status=ready); "
-        "awaiting_approval = waiting for manager sign-off; "
-        "skipped = decided not to cook. "
-        "\n\nKeep responses brief and kitchen-friendly — one or two sentences max."
+        "You are Roba, the AI kitchen desk. Concise kitchen-friendly replies (1-2 sentences max).\n\n"
+        "CORE RULES:\n"
+        "1. ALWAYS call a tool first. Never guess.\n"
+        "2. TRUTHFULNESS: Say only what the tool confirms.\n"
+        "3. CONCISENESS: Kitchen staff are busy. One or two sentences.\n\n"
+        "TOOL GUIDE:\n"
+        "• Batch status → get_batches(status='approved,decided')\n"
+        "• Did we cook X → get_batches(dish=..., status='ready')\n"
+        "• Mark cooked → confirm_batch_cooked(dish_or_batch=..., actual_qty=...)\n"
+        "• Waste (dish) → record_waste(item_name=..., qty=..., cause=...)\n"
+        "• Ingredient spoiled → record_spoilage(ingredient_name=..., all_stock=...)\n"
+        "• Inventory check → get_inventory(item_name=...)\n\n"
+        "BATCH STATES: approved=cook now; decided=needs approval; ready=already cooked; skipped=skip.\n\n"
+        + _FEW_SHOTS
     ),
 }
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bridge
+# ──────────────────────────────────────────────────────────────────────────────
 
 async def live_bridge(
     websocket: Any,
@@ -351,22 +511,19 @@ async def live_bridge(
     role: str = "manager",
     mode: str = "confirm",
     mic_mode: str = "ptt",
+    model: Optional[str] = None,
+    voice_actions: Optional[Any] = None,
 ) -> None:
     """Bridge a client WebSocket to a Vertex AI Live session.
 
-    Spawns two tasks:
-    1. ``_client_to_gemini``: reads from the client WS and writes to the Live session.
-    2. ``_gemini_to_client``: reads from the Live session and writes to the client WS.
-    Tool calls from the model are executed server-side and results fed back.
-
-    mic_mode="ptt"          Disables automatic VAD so that push-to-talk turns are
-                            committed immediately by explicit activity_start /
-                            activity_end markers rather than waiting for a trailing
-                            silence gap that PTT never produces.
-    mic_mode="conversation" Uses Gemini's default automatic VAD; the mic stays open
-                            and Gemini detects turn boundaries by itself.
-
-    Exits cleanly on client disconnect, session end, or any unrecoverable error.
+    Parameters
+    ----------
+    voice_processor:
+        Legacy VoiceProcessor — used for read delegates when voice_actions is None.
+    voice_actions:
+        VoiceActions instance.  If None, falls back to voice_processor methods.
+    model:
+        Live model override (validated against _ALLOWED_LIVE_MODELS).
     """
     from . import vertex
 
@@ -385,21 +542,20 @@ async def live_bridge(
         await _safe_send_json(websocket, {"type": "unavailable", "reason": str(exc)})
         return
 
+    # Resolve the model.
+    live_model = GEMINI_LIVE_MODEL
+    if model and model in _ALLOWED_LIVE_MODELS:
+        live_model = model
+
     system_instruction = _SYSTEM_INSTRUCTIONS.get(role, _SYSTEM_INSTRUCTIONS["manager"])
 
-    # Append live restaurant context to the system prompt.
+    # Slim injected context: just key numbers so the model uses tools for details.
     try:
-        context = voice_processor._restaurant_context_for_prompt()
-        system_instruction = system_instruction + f"\n\nRestaurant context:\n{context}"
+        slim_ctx = _build_slim_context(voice_processor)
+        system_instruction = system_instruction + f"\n\nCurrent context (use tools for full data):\n{slim_ctx}"
     except Exception:  # noqa: BLE001
         pass
 
-    # Push-to-talk: disable automatic VAD so that explicit activity_start /
-    # activity_end markers commit the turn immediately.  With auto-VAD on
-    # (the default), audio_stream_end is NOT a hard turn commit — Gemini waits
-    # for a trailing silence gap that PTT never produces, so the first turn hangs
-    # until the *next* press provides the gap, replaying the previous utterance.
-    # Conversation mode keeps auto-VAD (realtime_input_config=None → default).
     realtime_input_config: Optional[Any] = None
     if mic_mode == "ptt":
         realtime_input_config = _gtypes.RealtimeInputConfig(
@@ -415,13 +571,7 @@ async def live_bridge(
         realtime_input_config=realtime_input_config,
     )
 
-    # ``client.aio.live.connect(...)`` only builds the async context manager;
-    # the real TCP/TLS handshake happens at ``__aenter__``.  Enter it manually
-    # so the timeout wraps ONLY the handshake.  (A ``async with asyncio.timeout``
-    # around the whole ``async with connect_ctx as session`` body would also
-    # time-bound the entire conversation, killing every session after
-    # _CONNECT_TIMEOUT_S — which is exactly the "always times out" bug.)
-    connect_ctx = client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config)
+    connect_ctx = client.aio.live.connect(model=live_model, config=live_config)
     try:
         async with asyncio.timeout(_CONNECT_TIMEOUT_S):
             session = await connect_ctx.__aenter__()
@@ -435,18 +585,17 @@ async def live_bridge(
         return
 
     try:
-        # If the client already went away during the handshake, exit quietly.
         if not await _safe_send_json(
-            websocket, {"type": "connected", "model": GEMINI_LIVE_MODEL}
+            websocket, {"type": "connected", "model": live_model}
         ):
             return
 
         task_c2g = asyncio.create_task(
-            _client_to_gemini(websocket, session, voice_processor),
+            _client_to_gemini(websocket, session, voice_processor, voice_actions),
             name="voice_live_c2g",
         )
         task_g2c = asyncio.create_task(
-            _gemini_to_client(websocket, session, voice_processor, role, mode),
+            _gemini_to_client(websocket, session, voice_processor, role, mode, voice_actions),
             name="voice_live_g2c",
         )
         done, pending = await asyncio.wait(
@@ -476,17 +625,9 @@ async def live_bridge(
 
 
 async def _client_to_gemini(
-    websocket: Any, session: Any, voice_processor: Any
+    websocket: Any, session: Any, voice_processor: Any, voice_actions: Optional[Any]
 ) -> None:
-    """Read frames from the browser WS and relay to the Vertex AI Live session.
-
-    Binary frames → PCM16 audio (send_realtime_input).
-    JSON control frames:
-      end_of_turn   → audio_stream_end signal to the session.
-      text_input    → send_client_content text turn.
-      confirm_plan  → execute voice_processor.confirm and return tool_result.
-      cancel_plan   → execute voice_processor.cancel and return tool_result.
-    """
+    """Read frames from the browser WS and relay to the Live session."""
     from google.genai import types as _gtypes
 
     try:
@@ -494,7 +635,7 @@ async def _client_to_gemini(
             try:
                 data = await websocket.receive()
             except Exception:
-                return  # client disconnected
+                return
 
             if "bytes" in data and data["bytes"]:
                 await session.send_realtime_input(
@@ -510,14 +651,10 @@ async def _client_to_gemini(
                     continue
                 msg_type = msg.get("type")
                 if msg_type == "activity_start":
-                    # Push-to-talk: user pressed the button — tell Gemini speech began.
                     await session.send_realtime_input(activity_start=_gtypes.ActivityStart())
                 elif msg_type == "activity_end":
-                    # Push-to-talk: user released — commit the turn NOW, no VAD gap needed.
                     await session.send_realtime_input(activity_end=_gtypes.ActivityEnd())
                 elif msg_type == "end_of_turn":
-                    # Legacy / fallback: send audio_stream_end (only effective when
-                    # auto-VAD is enabled; PTT sessions now use activity_end instead).
                     await session.send_realtime_input(audio_stream_end=True)
                 elif msg_type == "text_input":
                     text = str(msg.get("text") or "")
@@ -527,25 +664,31 @@ async def _client_to_gemini(
                             turn_complete=True,
                         )
                 elif msg_type in ("confirm_plan", "cancel_plan"):
-                    # The client Confirm/Cancel buttons send these frames; execute
-                    # the plan action and relay the result back to the browser so
-                    # the plan card can clear and the transcript can update.
+                    # Confirm/Cancel buttons from the browser UI.
                     plan_id = str(msg.get("plan_id") or "")
                     if plan_id:
                         try:
                             if msg_type == "confirm_plan":
-                                result = await asyncio.to_thread(
-                                    voice_processor.confirm, plan_id
-                                )
-                                tool = "confirm_plan"
+                                if voice_actions is not None:
+                                    result = await asyncio.to_thread(
+                                        voice_actions.execute_pending, plan_id
+                                    )
+                                else:
+                                    result = await asyncio.to_thread(
+                                        voice_processor.confirm, plan_id
+                                    )
                             else:
-                                result = await asyncio.to_thread(
-                                    voice_processor.cancel, plan_id
-                                )
-                                tool = "cancel_plan"
+                                if voice_actions is not None:
+                                    result = await asyncio.to_thread(
+                                        voice_actions.cancel_pending, plan_id
+                                    )
+                                else:
+                                    result = await asyncio.to_thread(
+                                        voice_processor.cancel, plan_id
+                                    )
                             await _safe_send_json(
                                 websocket,
-                                {"type": "tool_result", "tool": tool, "result": result},
+                                {"type": "tool_result", "tool": msg_type, "result": result},
                             )
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("voice %s failed: %s", msg_type, exc)
@@ -553,21 +696,41 @@ async def _client_to_gemini(
         pass
 
 
-class _TurnBuffer:
-    """Accumulates streamed transcription so we emit one complete line per turn.
+# ──────────────────────────────────────────────────────────────────────────────
+# Transcript buffering with partial streaming
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Vertex AI Live streams transcription as many small deltas.  Rather than
-    forward each as its own bubble, we buffer per role and flush a single
-    finished line at the turn boundary (final-only display).
+class _TurnBuffer:
+    """Accumulates and streams transcript per turn.
+
+    Generates a stable ``turn_id`` per turn and emits cumulative partial frames
+    as text arrives, then a final frame at the turn boundary.  The frontend can
+    do in-place replacement by (role, turn_id).
     """
 
     def __init__(self) -> None:
         self.user: list[str] = []
         self.roba: list[str] = []
+        self._user_turn_id: str = str(uuid.uuid4())
+        self._roba_turn_id: str = str(uuid.uuid4())
+
+    def new_user_turn(self) -> str:
+        self._user_turn_id = str(uuid.uuid4())
+        return self._user_turn_id
+
+    def new_roba_turn(self) -> str:
+        self._roba_turn_id = str(uuid.uuid4())
+        return self._roba_turn_id
+
+    def turn_id(self, role: str) -> str:
+        return self._user_turn_id if role == "user" else self._roba_turn_id
+
+    def cumulative(self, role: str) -> str:
+        parts = self.user if role == "user" else self.roba
+        return "".join(parts).strip()
 
     def take(self, role: str) -> str:
-        parts = self.user if role == "user" else self.roba
-        text = "".join(parts).strip()
+        text = self.cumulative(role)
         if role == "user":
             self.user = []
         else:
@@ -575,14 +738,30 @@ class _TurnBuffer:
         return text
 
 
+async def _emit_partial(websocket: Any, role: str, buffers: "_TurnBuffer") -> None:
+    """Emit a partial (in-progress) transcript frame for in-place display."""
+    text = buffers.cumulative(role)
+    if text:
+        await _safe_send_json(websocket, {
+            "type": "transcript",
+            "role": role,
+            "text": text,
+            "turn_id": buffers.turn_id(role),
+            "final": False,
+        })
+
+
 async def _flush_transcript(websocket: Any, role: str, buffers: "_TurnBuffer") -> None:
-    """Emit the buffered text for ``role`` as one final transcript line."""
+    """Emit the buffered text as a FINAL transcript line."""
     text = buffers.take(role)
     if text:
-        await _safe_send_json(
-            websocket,
-            {"type": "transcript", "role": role, "text": text, "final": True},
-        )
+        await _safe_send_json(websocket, {
+            "type": "transcript",
+            "role": role,
+            "text": text,
+            "turn_id": buffers.turn_id(role),
+            "final": True,
+        })
 
 
 async def _gemini_to_client(
@@ -591,18 +770,9 @@ async def _gemini_to_client(
     voice_processor: Any,
     role: str,
     mode: str,
+    voice_actions: Optional[Any],
 ) -> None:
-    """Read from the Vertex AI Live session and relay audio/events to the browser WS.
-
-    session.receive() yields chunks until turn_complete, then raises
-    StopAsyncIteration.  We wrap it in a ``while True`` loop for multi-turn.
-    Each chunk is inspected for:
-      chunk.data  → binary audio PCM16 @ 24kHz → send to browser as bytes
-      chunk.text  → text content → send as transcript frame
-      chunk.server_content.input_transcription  → what the user said
-      chunk.server_content.output_transcription → what Roba said
-      chunk.tool_call.function_calls  → execute server-side, return results
-    """
+    """Read from the Vertex AI Live session and relay audio/events to the browser."""
     from google.genai import types as _gtypes
 
     buffers = _TurnBuffer()
@@ -613,21 +783,17 @@ async def _gemini_to_client(
                     async for chunk in session.receive():
                         await _handle_chunk(
                             chunk, websocket, session, voice_processor,
-                            role, mode, _gtypes, buffers,
+                            role, mode, _gtypes, buffers, voice_actions,
                         )
             except asyncio.TimeoutError:
-                # No model output for a while — a silent user is normal in a
-                # voice session, so keep listening instead of tearing it down.
                 logger.debug("Vertex AI Live idle (no output in %.0fs)", _RESPONSE_TIMEOUT_S)
                 continue
             except StopAsyncIteration:
-                # Normal end of a turn — loop for the next one.
                 continue
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 if _is_disconnect(exc):
-                    # The Live peer (or client) closed the session normally.
                     logger.info("Vertex AI Live session closed: %s", exc)
                     return
                 logger.exception("Vertex AI Live receive error: %s", exc)
@@ -646,9 +812,9 @@ async def _handle_chunk(
     mode: str,
     _gtypes: Any,
     buffers: "_TurnBuffer",
+    voice_actions: Optional[Any],
 ) -> None:
     """Process one LiveServerMessage chunk."""
-    # Binary audio (shortcut .data property concatenates all inline_data parts).
     if chunk.data:
         try:
             await websocket.send_bytes(chunk.data)
@@ -657,30 +823,30 @@ async def _handle_chunk(
 
     sc = chunk.server_content
     if sc is not None:
-        # Accumulate streamed transcription; we emit one complete line per turn
-        # (final-only) rather than forwarding every partial fragment.
+        # User STT partial — accumulate and emit partial frame.
         if sc.input_transcription and sc.input_transcription.text:
+            if not buffers.user:
+                buffers.new_user_turn()
             buffers.user.append(sc.input_transcription.text)
+            await _emit_partial(websocket, "user", buffers)
 
-        # Roba's words come either as output_transcription (AUDIO mode) or
-        # chunk.text (TEXT-modality fallback).
+        # Roba TTS text — accumulate and emit partial frame.
         roba_text = None
         if sc.output_transcription and sc.output_transcription.text:
             roba_text = sc.output_transcription.text
         elif chunk.text:
             roba_text = chunk.text
         if roba_text:
-            # The user's turn is over once Roba starts replying — flush it first
-            # so the user line appears as a complete sentence before Roba's.
+            # Flush user first so user line appears complete before roba's.
             await _flush_transcript(websocket, "user", buffers)
+            if not buffers.roba:
+                buffers.new_roba_turn()
             buffers.roba.append(roba_text)
+            await _emit_partial(websocket, "roba", buffers)
 
-        # Turn boundaries: flush finished lines, and signal turn completion so
-        # the client can stop showing "speaking" and re-arm.
         if getattr(sc, "generation_complete", False):
             await _flush_transcript(websocket, "roba", buffers)
         if getattr(sc, "interrupted", False):
-            # Barge-in: tell the browser to stop playback and resume listening.
             await _flush_transcript(websocket, "user", buffers)
             await _flush_transcript(websocket, "roba", buffers)
             await _safe_send_json(websocket, {"type": "interrupted"})
@@ -689,11 +855,9 @@ async def _handle_chunk(
             await _flush_transcript(websocket, "roba", buffers)
             await _safe_send_json(websocket, {"type": "turn_complete"})
 
-    # Tool calls from the model.
     if chunk.tool_call:
         for fn_call in (chunk.tool_call.function_calls or []):
-            result = await _execute_tool(fn_call, voice_processor, role, mode)
-            # Return the result to Gemini so it can speak the outcome.
+            result = await _execute_tool(fn_call, voice_processor, role, mode, voice_actions)
             try:
                 await session.send_tool_response(
                     function_responses=_gtypes.FunctionResponse(
@@ -704,7 +868,6 @@ async def _handle_chunk(
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("send_tool_response failed: %s", exc)
-            # Also tell the browser UI so it can render the plan card etc.
             try:
                 await websocket.send_json({
                     "type": "tool_result",
@@ -720,96 +883,256 @@ async def _execute_tool(
     voice_processor: Any,
     role: str,
     mode: str,
+    voice_actions: Optional[Any],
 ) -> Dict[str, Any]:
-    """Execute a Vertex AI Live tool call server-side and return the result dict."""
+    """Execute a tool call via VoiceActions (primary) or VoiceProcessor (fallback reads)."""
     name = str(fn_call.name or "")
     args = dict(fn_call.args or {})
     logger.debug("voice_live tool call: %s(%s)", name, args)
 
+    va = voice_actions  # may be None in tests / legacy mode
+
     try:
-        # ── read-only lookups ───────────────────────────────────────────────
-        # All run synchronous DB queries; offload to a worker thread so the
-        # audio relay loop is never blocked.
+        # ── Read tools ────────────────────────────────────────────────────
+        if name == "get_inventory":
+            if va:
+                return await asyncio.to_thread(
+                    va.get_inventory,
+                    item_name=args.get("item_name") or None,
+                    sort=args.get("sort") or None,
+                )
+            return await asyncio.to_thread(
+                voice_processor.query_inventory, args.get("item_name") or None
+            )
+
+        if name == "get_forecast":
+            if va:
+                return await asyncio.to_thread(
+                    va.get_forecast,
+                    item_name=args.get("item_name") or None,
+                    daypart=args.get("daypart") or None,
+                )
+            return await asyncio.to_thread(
+                voice_processor.query_forecast, args.get("item_name") or None
+            )
+
+        if name == "get_batches":
+            if va:
+                return await asyncio.to_thread(
+                    va.get_batches,
+                    status=args.get("status") or None,
+                    dish=args.get("dish") or None,
+                )
+            return await asyncio.to_thread(voice_processor.query_batches)
+
+        if name == "get_menu":
+            if va:
+                return await asyncio.to_thread(va.get_menu, filter=args.get("filter", "disabled"))
+            return {"error": "get_menu not available in legacy mode"}
+
+        if name == "get_pos_stats":
+            if va:
+                return await asyncio.to_thread(
+                    va.get_pos_stats,
+                    window=str(args.get("window", "3h")),
+                    item_name=args.get("item_name") or None,
+                )
+            return {"error": "get_pos_stats not available in legacy mode"}
+
+        if name == "get_competitors":
+            return await asyncio.to_thread(voice_processor.query_competitors)
+
+        if name == "get_reviews":
+            if va:
+                return await asyncio.to_thread(va.get_reviews, sort=args.get("sort") or None)
+            return await asyncio.to_thread(voice_processor.query_reviews)
+
+        if name == "get_staff":
+            return await asyncio.to_thread(voice_processor.query_staff)
+
+        if name == "get_supplier_prices":
+            if va:
+                return await asyncio.to_thread(
+                    va.get_supplier_prices,
+                    ingredient_name=args.get("ingredient_name") or None,
+                )
+            return {"error": "get_supplier_prices not available in legacy mode"}
+
+        if name == "get_signals":
+            return await asyncio.to_thread(voice_processor.query_signals)
+
         if name == "get_kitchen_status":
             return await asyncio.to_thread(
                 voice_processor.kitchen_status,
                 dish=args.get("dish") or None,
                 topic=str(args.get("topic", "all")),
             )
-        if name == "get_inventory":
-            return await asyncio.to_thread(
-                voice_processor.query_inventory, args.get("item_name") or None
-            )
-        if name == "get_forecast":
-            return await asyncio.to_thread(
-                voice_processor.query_forecast, args.get("item_name") or None
-            )
-        if name == "get_competitors":
-            return await asyncio.to_thread(voice_processor.query_competitors)
-        if name == "get_reviews":
-            return await asyncio.to_thread(voice_processor.query_reviews)
-        if name == "get_staff":
-            return await asyncio.to_thread(voice_processor.query_staff)
-        if name == "get_signals":
-            return await asyncio.to_thread(voice_processor.query_signals)
-        if name == "get_batches":
-            return await asyncio.to_thread(voice_processor.query_batches)
 
-        # ── write / action tools ────────────────────────────────────────────
-        # voice_processor.plan() runs a synchronous LLM extraction; offload it
-        # too so it can't stall the event loop (and the audio stream).
-        if name == "process_note":
-            result = await asyncio.to_thread(
-                voice_processor.plan, args.get("text", ""), role=role, mode=mode
+        # ── Write tools (mode governed) ───────────────────────────────────
+        if name == "disable_menu_item":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.disable_menu_item,
+                item_name=str(args.get("item_name", "")),
+                reason=str(args.get("reason", "voice request")),
+                mode=mode,
             )
-            return {
-                "plan_id": result.get("plan_id"),
-                "human_readable": result.get("human_readable", ""),
-                "status": result.get("status", "pending"),
-                "requires_approval": result.get("requires_approval", False),
-                "clarification": result.get("clarification"),
-            }
+
+        if name == "enable_menu_item":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.enable_menu_item,
+                item_name=str(args.get("item_name", "")),
+                mode=mode,
+            )
+
+        if name == "adjust_inventory":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.adjust_inventory,
+                ingredient_name=str(args.get("ingredient_name", "")),
+                set_to=args.get("set_to"),
+                delta=args.get("delta"),
+                unit=args.get("unit") or None,
+                reason=str(args.get("reason", "voice adjustment")),
+                mode=mode,
+            )
+
+        if name == "record_spoilage":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.record_spoilage,
+                ingredient_name=str(args.get("ingredient_name", "")),
+                qty=args.get("qty"),
+                all_stock=bool(args.get("all_stock", False)),
+                mode=mode,
+            )
+
+        if name == "confirm_batch_cooked":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.confirm_batch_cooked,
+                dish_or_batch=str(args.get("dish_or_batch", "")),
+                actual_qty=args.get("actual_qty"),
+                mode=mode,
+            )
+
+        if name == "record_waste":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.record_waste,
+                item_name=str(args.get("item_name", "")),
+                qty=float(args.get("qty", 0)),
+                cause=str(args.get("cause", "overproduction")),
+                mode=mode,
+            )
+
+        if name == "set_staff_attendance":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.set_staff_attendance,
+                staff_name_or_role=str(args.get("staff_name_or_role", "")),
+                status=str(args.get("status", "sick")),
+                daypart=args.get("daypart") or None,
+                mode=mode,
+            )
+
+        if name == "run_forecast":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(va.run_forecast)
+
+        if name == "run_inventory_optimizer":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(va.run_inventory_optimizer)
+
+        if name == "run_competitor_scan":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(va.run_competitor_scan)
+
+        if name == "process_reviews":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(va.process_reviews)
+
+        if name == "request_outbound_call":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.request_outbound_call,
+                target=str(args.get("target", "")),
+                counterparty_type=str(args.get("counterparty_type", "competitor")),
+                purpose=str(args.get("purpose", "")),
+            )
 
         if name == "confirm_plan":
-            return await asyncio.to_thread(
-                voice_processor.confirm, str(args.get("plan_id", ""))
-            )
+            plan_id = str(args.get("plan_id", ""))
+            if va is not None:
+                return await asyncio.to_thread(va.execute_pending, plan_id)
+            return await asyncio.to_thread(voice_processor.confirm, plan_id)
 
         if name == "cancel_plan":
-            return await asyncio.to_thread(
-                voice_processor.cancel, str(args.get("plan_id", ""))
-            )
-
-        if name == "mark_batch_cooked":
-            item_name = str(args.get("item_name", ""))
-            qty = float(args.get("actual_qty", 0))
-            text = f"I cooked the {item_name} batch, made {qty:.0f}"
-            result = await asyncio.to_thread(
-                voice_processor.plan, text, role="cook", mode="auto"
-            )
-            return {"status": "applied", "summary": result.get("summary", "")}
-
-        if name == "report_waste":
-            item_name = str(args.get("item_name", ""))
-            qty = float(args.get("qty", 0))
-            cause = str(args.get("cause", "overproduction"))
-            text = f"I threw away {qty:.0f} {item_name} because of {cause}"
-            result = await asyncio.to_thread(
-                voice_processor.plan, text, role="cook", mode="auto"
-            )
-            return {"status": "applied", "summary": result.get("summary", "")}
-
-        if name == "request_competitor_call":
-            target = str(args.get("target", ""))
-            purpose = str(args.get("purpose", ""))
-            text = f"call {target}: {purpose}"
-            result = await asyncio.to_thread(
-                voice_processor.plan, text, role="manager", mode="confirm"
-            )
-            return {"status": result.get("status", "pending"), "plan_id": result.get("plan_id")}
+            plan_id = str(args.get("plan_id", ""))
+            if va is not None:
+                return await asyncio.to_thread(va.cancel_pending, plan_id)
+            return await asyncio.to_thread(voice_processor.cancel, plan_id)
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("voice_live tool %s failed: %s", name, exc)
         return {"error": str(exc)}
 
     return {"error": f"Unknown tool: {name}"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Slim context builder (replaces the giant blob)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_slim_context(voice_processor: Any) -> str:
+    """Build a minimal context string; the model uses tools for details."""
+    import json as _json
+    try:
+        bus = voice_processor.bus
+        now = float(bus.sim_time)
+        h = int(now // 3600) % 24
+        m = int((now % 3600) // 60)
+        clock = f"{h:02d}:{m:02d}"
+
+        from .models import MenuItem, Attendance
+        from core.clock import SECONDS_PER_DAY
+        from track_a.agents.forecaster import current_daypart
+        daypart = current_daypart(now)
+        day = int(now // SECONDS_PER_DAY)
+
+        session = voice_processor.db_session_factory()
+        try:
+            menu_count = session.query(MenuItem).filter(MenuItem.active == 1).count()
+            disabled_count = session.query(MenuItem).filter(MenuItem.active == 0).count()
+            from .models import Staff
+            staff_total = session.query(Staff).filter(Staff.active == 1).count()
+            staff_out = session.query(Attendance).filter(
+                Attendance.date_sim_day == day,
+                Attendance.status.in_(["sick", "leave"]),
+            ).count()
+        finally:
+            session.close()
+
+        return _json.dumps({
+            "clock": clock,
+            "daypart": daypart,
+            "menu_active": menu_count,
+            "menu_disabled": disabled_count,
+            "staff_available": staff_total - staff_out,
+            "note": "Use tools for detailed data — inventory levels, forecasts, batches, etc.",
+        })
+    except Exception:  # noqa: BLE001
+        return "{}"

@@ -13,6 +13,10 @@
  *                    sends end_of_turn when released. Enters "thinking" on stop.
  *   - "conversation" Active conversation. Mic stays open; Gemini's auto-VAD
  *                    detects turn ends. Tap once to start, tap again to end.
+ *
+ * Voice model (persisted in localStorage as "roba.voice.model"):
+ *   - Passed as ?model= in the WS URL.
+ *   - Reconnects automatically when changed via setVoiceModel().
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -31,9 +35,14 @@ export type VoiceState =
 export type MicMode = "ptt" | "conversation";
 
 export interface TranscriptLine {
+  /** Stable per-session ID used for React keys. */
   id: string;
   role: "user" | "roba";
   text: string;
+  /** Stable per-turn identifier from the server — used for in-place update. */
+  turn_id: string;
+  /** True once the server has finalised this line. */
+  final: boolean;
 }
 
 export interface VoiceLiveHook {
@@ -58,6 +67,9 @@ export interface VoiceLiveHook {
   // Mic interaction mode
   micMode: MicMode;
   setMicMode: (m: MicMode) => void;
+  // Live model (reconnects on change)
+  voiceModel: string | undefined;
+  setVoiceModel: (m: string | undefined) => void;
 }
 
 const CONNECT_TIMEOUT_MS = 8_000;   // "connecting" → "unavailable"
@@ -66,6 +78,7 @@ const CONNECT_TIMEOUT_MS = 8_000;   // "connecting" → "unavailable"
 const THINKING_TIMEOUT_MS = 30_000; // "thinking" → "ready" + error msg
 
 const MIC_MODE_KEY = "roba.voice.micMode";
+const VOICE_MODEL_KEY = "roba.voice.model";
 
 let _lineId = 0;
 function nextId() {
@@ -86,9 +99,57 @@ function writeMicMode(m: MicMode) {
   try { localStorage.setItem(MIC_MODE_KEY, m); } catch { /* ignore */ }
 }
 
+function readVoiceModel(): string | undefined {
+  try {
+    return localStorage.getItem(VOICE_MODEL_KEY) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeVoiceModel(m: string | undefined) {
+  try {
+    if (m) localStorage.setItem(VOICE_MODEL_KEY, m);
+    else localStorage.removeItem(VOICE_MODEL_KEY);
+  } catch { /* ignore */ }
+}
+
+/**
+ * Merge an incoming transcript event into the current line array.
+ *
+ * Logic:
+ *   - If a line with the same turn_id already exists: update its text (and
+ *     final flag). The id (React key) stays stable.
+ *   - Otherwise: append a new line with a fresh id.
+ *   - Cap at 200 lines.
+ */
+function mergeTranscriptLine(
+  prev: TranscriptLine[],
+  role: "user" | "roba",
+  text: string,
+  turn_id: string,
+  final: boolean,
+): TranscriptLine[] {
+  const idx = prev.findLastIndex(
+    (l) => l.role === role && l.turn_id === turn_id,
+  );
+  if (idx >= 0) {
+    // In-place update (same turn_id).
+    const updated = [...prev];
+    updated[idx] = { ...updated[idx], text, final };
+    return updated.slice(-200);
+  }
+  // New turn — append.
+  return [
+    ...prev.slice(-199),
+    { id: nextId(), role, text, turn_id, final },
+  ];
+}
+
 export function useVoiceLive(role: string): VoiceLiveHook {
   const [mode, setMode] = useState<string>("confirm");
   const [micMode, _setMicMode] = useState<MicMode>(readMicMode);
+  const [voiceModel, _setVoiceModel] = useState<string | undefined>(readVoiceModel);
   const [state, setState] = useState<VoiceState>("idle");
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const [pendingPlan, setPendingPlan] = useState<PlanResult | null>(null);
@@ -100,9 +161,11 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const connectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const thinkingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const micModeRef = useRef<MicMode>(micMode);
+  const voiceModelRef = useRef<string | undefined>(voiceModel);
 
-  // Keep the ref in sync so callbacks close over the latest micMode value.
+  // Keep refs in sync so callbacks close over the latest values.
   micModeRef.current = micMode;
+  voiceModelRef.current = voiceModel;
 
   function clearConnectTimer() {
     if (connectTimerRef.current) {
@@ -129,9 +192,9 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     }
   }, []);
 
-  // Connect (or reconnect) when role changes.
+  // Connect (or reconnect) when role, micMode, or voiceModel changes.
   useEffect(() => {
-    const client = new RobaLiveClient(role, mode, micModeRef.current);
+    const client = new RobaLiveClient(role, mode, micModeRef.current, voiceModelRef.current);
     clientRef.current = client;
     setState("connecting");
     setLastError(null);
@@ -164,10 +227,11 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           }
           break;
         case "transcript": {
-          setTranscript((prev) => [
-            ...prev.slice(-199),
-            { id: nextId(), role: ev.role, text: ev.text },
-          ]);
+          // In-place merge: update the existing bubble for this turn_id,
+          // or append a new one. No more fragment spam.
+          setTranscript((prev) =>
+            mergeTranscriptLine(prev, ev.role, ev.text, ev.turn_id, ev.final),
+          );
           if (ev.role === "roba") {
             clearThinkingTimer();
             setState("speaking");
@@ -237,12 +301,12 @@ export function useVoiceLive(role: string): VoiceLiveHook {
       clearThinkingTimer();
       client.disconnect();
     };
-    // Reconnect when role OR micMode changes.  The Live session's VAD config is
-    // fixed at connect time (PTT disables auto-VAD, conversation enables it), so
-    // switching mic mode requires a new session.  MicModeToggle is disabled while
-    // state === "listening", so this never reconnects mid-turn.
+    // Reconnect when role, micMode, or voiceModel changes. The Live session's
+    // VAD config is fixed at connect time (PTT disables auto-VAD, conversation
+    // enables it), so switching mic mode requires a new session. MicModeToggle
+    // is disabled while state === "listening", so this never reconnects mid-turn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [role, micMode]);
+  }, [role, micMode, voiceModel]);
 
   const startListening = useCallback(async () => {
     if (!clientRef.current) return;
@@ -292,6 +356,12 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     // dep in the connect effect below builds a fresh session with the new config.
   }, []);
 
+  const setVoiceModel = useCallback((m: string | undefined) => {
+    writeVoiceModel(m);
+    _setVoiceModel(m);
+    // Reconnect is triggered by the voiceModel dep in the connect effect.
+  }, []);
+
   const clearTranscript = useCallback(() => setTranscript([]), []);
   const clearStatus = useCallback(() => setLastStatus(null), []);
 
@@ -313,5 +383,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     setMode,
     micMode,
     setMicMode,
+    voiceModel,
+    setVoiceModel,
   };
 }

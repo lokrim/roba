@@ -9,9 +9,9 @@
  */
 
 export type LiveClientEvent =
-  | { type: "connected" }
+  | { type: "connected"; model?: string }
   | { type: "unavailable"; reason?: string }
-  | { type: "transcript"; role: "user" | "roba"; text: string }
+  | { type: "transcript"; role: "user" | "roba"; text: string; turn_id: string; final: boolean }
   | { type: "plan_preview"; plan: PlanResult }
   | { type: "tool_result"; tool: string; result: unknown }
   | { type: "applied"; plan_id: string; signal_ids: string[] }
@@ -72,10 +72,17 @@ export class RobaLiveClient {
   // audio has been written to the socket.
   private _finalizeStop: (() => void) | null = null;
 
-  constructor(role = "manager", mode = "confirm", micMode: "ptt" | "conversation" = "ptt") {
+  private _model: string | undefined;
+
+  constructor(role = "manager", mode = "confirm", micMode: "ptt" | "conversation" = "ptt", model?: string) {
     this.role = role;
     this.mode = mode;
     this._micMode = micMode;
+    this._model = model;
+  }
+
+  setModel(model: string | undefined) {
+    this._model = model;
   }
 
   on(handler: EventHandler): () => void {
@@ -104,7 +111,13 @@ export class RobaLiveClient {
   async connect(): Promise<void> {
     const base = window.location.host;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${base}/ws/voice/live?role=${this.role}&mode=${this.mode}&mic_mode=${this._micMode}`;
+    const params = new URLSearchParams({
+      role: this.role,
+      mode: this.mode,
+      mic_mode: this._micMode,
+    });
+    if (this._model) params.set("model", this._model);
+    const url = `${proto}://${base}/ws/voice/live?${params.toString()}`;
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
 
@@ -314,7 +327,7 @@ export class RobaLiveClient {
   private handleJson(msg: Record<string, unknown>) {
     const t = msg.type as string;
     if (t === "connected") {
-      this.emit({ type: "connected" });
+      this.emit({ type: "connected", model: msg.model as string | undefined });
     } else if (t === "unavailable") {
       this.emit({ type: "unavailable", reason: msg.reason as string | undefined });
     } else if (t === "transcript") {
@@ -322,6 +335,8 @@ export class RobaLiveClient {
         type: "transcript",
         role: (msg.role as "user" | "roba") ?? "roba",
         text: String(msg.text ?? ""),
+        turn_id: String(msg.turn_id ?? `fallback-${Date.now()}`),
+        final: Boolean(msg.final),
       });
     } else if (t === "tool_result") {
       const tool = String(msg.tool ?? "");
