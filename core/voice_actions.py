@@ -244,15 +244,13 @@ class VoiceActions:
         try:
             ingredients = {int(ing.id): ing for ing in session.query(Ingredient).all()}
             suppliers = {int(s.id): s for s in session.query(Supplier).all()}
-            rows = []
+            all_rows = []
             for cat in session.query(SupplierCatalog).all():
                 ing = ingredients.get(int(cat.ingredient_id or 0))
                 sup = suppliers.get(int(cat.supplier_id or 0))
                 if not ing or not sup:
                     continue
-                if ingredient_name and ingredient_name.lower() not in str(ing.name or "").lower():
-                    continue
-                rows.append({
+                all_rows.append({
                     "ingredient": ing.name,
                     "supplier": sup.name,
                     "price": float(cat.current_price) if cat.current_price is not None else None,
@@ -261,6 +259,20 @@ class VoiceActions:
                 })
         finally:
             session.close()
+
+        if ingredient_name:
+            needle = ingredient_name.strip().lower()
+            # 1. Try exact match first.
+            exact = [r for r in all_rows if str(r.get("ingredient") or "").lower() == needle]
+            if exact:
+                rows = exact
+            else:
+                # 2. Fall back to substring match.
+                rows = [r for r in all_rows if needle in str(r.get("ingredient") or "").lower()]
+                if not rows:
+                    rows = all_rows  # no match → return everything
+        else:
+            rows = all_rows
         return {"prices": rows, "count": len(rows)}
 
     def get_signals(self) -> Dict[str, Any]:
@@ -972,10 +984,38 @@ class VoiceActions:
         return None, None
 
     def _resolve_staff(self, name_or_role: str) -> List[Dict[str, Any]]:
-        """Resolve a staff name or role to a list of staff dicts.
+        """Resolve one or more staff names/roles to a list of staff dicts.
+
+        Accepts comma-separated, 'and'-separated, or '&'-separated lists.
+        Returns deduplicated results across all fragments.
+        """
+        import re
+        raw = name_or_role.strip()
+        fragments = [
+            f.strip()
+            for f in re.split(r",\s*|\s+and\s+|\s*&\s*", raw, flags=re.IGNORECASE)
+            if f.strip()
+        ]
+
+        if len(fragments) <= 1:
+            # Single name or role — use original logic.
+            return self._resolve_single_staff(raw)
+
+        # Multiple fragments — resolve each and deduplicate by id.
+        seen_ids: set = set()
+        results = []
+        for fragment in fragments:
+            for staff_dict in self._resolve_single_staff(fragment):
+                if staff_dict["id"] not in seen_ids:
+                    seen_ids.add(staff_dict["id"])
+                    results.append(staff_dict)
+        return results
+
+    def _resolve_single_staff(self, name_or_role: str) -> List[Dict[str, Any]]:
+        """Resolve a single staff name or role to a list of staff dicts.
 
         Tries exact name match, then partial name, then role match.
-        Returns a list so "all cooks" or a role with multiple people works.
+        Returns a list so a role with multiple people works.
         """
         from .models import Staff, StaffStation
         needle = name_or_role.strip().lower()
