@@ -190,6 +190,7 @@ def _ensure_settings_singleton(session: Any) -> models.SimSettings:
             daypart_curve=None,
             channel_mix=dict(config.CHANNEL_MIX),
             anomaly_injections=None,
+            availability_oos_mode=config.AVAILABILITY_OOS_MODE,
         )
         session.add(settings)
         try:
@@ -498,6 +499,14 @@ class PosBody(BaseModel):
     channel_mix: Optional[Dict[str, Any]] = None
     daypart_curve: Optional[Dict[str, Any]] = None
     anomaly_injections: Optional[List[Dict[str, Any]]] = None
+    availability_oos_mode: Optional[str] = None  # "threshold" | "zero"
+
+    @field_validator("availability_oos_mode")
+    @classmethod
+    def _validate_oos_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("threshold", "zero"):
+            raise ValueError("availability_oos_mode must be 'threshold' or 'zero'")
+        return v
 
 
 class InventorySignalPolicyBody(BaseModel):
@@ -653,6 +662,7 @@ def sim_pos(body: PosBody) -> Dict[str, Any]:
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(status_code=422, detail="No POS settings provided")
+    oos_mode_changed = "availability_oos_mode" in updates
     with db.DB_LOCK:
         session = db.new_session()
         try:
@@ -661,9 +671,25 @@ def sim_pos(body: PosBody) -> Dict[str, Any]:
                 setattr(settings, field, value)
             session.commit()
             session.refresh(settings)
-            return _row_to_dict(settings)
+            result = _row_to_dict(settings)
         finally:
             session.close()
+
+    # When the OOS mode changes, recompute availability immediately so the
+    # new mode is reflected without waiting for the next stock event.
+    if oos_mode_changed and ctx.bus is not None:
+        try:
+            from .availability import recompute_availability
+            recompute_availability(
+                db.new_session,
+                ctx.bus,
+                ctx.hub.broadcast,
+                agent_name="settings_oos_mode",
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("availability recompute after oos_mode change failed", exc_info=True)
+
+    return result
 
 
 @app.get("/api/runtime/inventory-signal-policy")

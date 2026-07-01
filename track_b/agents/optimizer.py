@@ -340,43 +340,15 @@ class InventoryOptimizer(BaseAgent):
         return margin * float(velocity)
 
     def _disable(self, menu_item_id: int, ingredient_id: int) -> None:
-        now = self.sim_time
-        session = self.db_session_factory()
-        try:
-            item = session.get(MenuItem, menu_item_id)
-            if item is None or item.active == 0:
-                return
-            item.active = 0
-            session.add(
-                MenuToggle(
-                    menu_item_id=menu_item_id,
-                    action="disable",
-                    reason=f"ingredient {ingredient_id} at risk of running out before resupply",
-                    triggered_by=self.name,
-                    sim_time=now,
-                    active=1,
-                )
-            )
-            session.commit()
-        finally:
-            session.close()
+        """Disable a menu item by delegating to the deterministic resolver.
 
+        Previously this wrote NULL-coded MenuToggle rows directly, bypassing the
+        resolver and creating permanent locks.  Now it delegates to ``_maybe_toggle``
+        (which calls ``recompute_availability``) so the block is idempotent and
+        tracked with the correct ``out_of_stock`` reason_code.
+        """
         self._toggle_cause[menu_item_id] = ingredient_id
-        self.emit(
-            SignalType.MENU_TOGGLE,
-            {
-                "menu_item_id": menu_item_id,
-                "action": "disable",
-                "reason": f"ingredient {ingredient_id} at risk of running out before resupply",
-            },
-            dedup_key=f"toggle:{menu_item_id}",
-        )
-        self.broadcast("menu_toggled", {"menu_item_id": menu_item_id, "action": "disable"})
-        self.log_event(
-            "menu_toggle",
-            f"Disabled menu item {menu_item_id}: ingredient {ingredient_id} at risk.",
-            {"menu_item_id": menu_item_id, "ingredient_id": ingredient_id},
-        )
+        self._maybe_toggle(ingredient_id, projected_runout=float(self.sim_time))
 
     def _reenable(self, menu_item_id: int, ingredient_id: Optional[int] = None) -> None:
         # Delegate to the deterministic resolver; it auto-re-enables dishes when

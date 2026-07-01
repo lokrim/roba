@@ -936,6 +936,7 @@ class SimSettings(Base):
     daypart_curve = mapped_column(JSON)
     channel_mix = mapped_column(JSON)
     anomaly_injections = mapped_column(JSON)
+    availability_oos_mode = mapped_column(String, default="threshold")  # "threshold" | "zero"
 
     def __repr__(self):
         return (f"<SimSettings id={self.id} base_orders_per_day={self.base_orders_per_day} "

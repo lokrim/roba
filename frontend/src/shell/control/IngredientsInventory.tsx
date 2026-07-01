@@ -10,6 +10,58 @@ interface LevelRow extends InventoryLevel {
   patch?: Partial<InventoryLevel>;
 }
 
+type OosMode = "threshold" | "zero";
+
+function OosModeToggle() {
+  const [oosMode, setOosMode] = useState<OosMode>("threshold");
+
+  useEffect(() => {
+    apiGet<{ availability_oos_mode?: OosMode }>("/api/sim/pos")
+      .then((data) => {
+        if (data.availability_oos_mode === "zero" || data.availability_oos_mode === "threshold") {
+          setOosMode(data.availability_oos_mode);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  async function handleOosModeChange(mode: OosMode) {
+    setOosMode(mode);
+    try {
+      await apiPatch("/api/sim/pos", { availability_oos_mode: mode });
+    } catch {
+      // revert on error
+      setOosMode((prev) => (prev === mode ? (mode === "threshold" ? "zero" : "threshold") : prev));
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-3 text-sm">
+      <span className="text-text/60">Disable items when ingredient is</span>
+      <label className="flex items-center gap-1 cursor-pointer">
+        <input
+          type="radio"
+          name="oos_mode"
+          value="threshold"
+          checked={oosMode === "threshold"}
+          onChange={() => void handleOosModeChange("threshold")}
+        />
+        <span className="text-text/80">at/below threshold</span>
+      </label>
+      <label className="flex items-center gap-1 cursor-pointer">
+        <input
+          type="radio"
+          name="oos_mode"
+          value="zero"
+          checked={oosMode === "zero"}
+          onChange={() => void handleOosModeChange("zero")}
+        />
+        <span className="text-text/80">at zero only</span>
+      </label>
+    </div>
+  );
+}
+
 function IngredientsTable() {
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
 
@@ -191,6 +243,7 @@ function LotsView() {
 export function IngredientsInventory() {
   return (
     <div className="space-y-8">
+      <OosModeToggle />
       <IngredientsTable />
       <InventoryLevelsEditor />
       <LotsView />
