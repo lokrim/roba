@@ -218,6 +218,7 @@ export function CookVoice() {
   async function handleClarify(planId: string, answer: string) {
     try {
       await apiPost("/api/voice/clarify", { plan_id: planId, answer });
+      live.setDone("Clarification submitted.");
     } catch { /* ignore */ }
   }
 

@@ -9,7 +9,7 @@
  */
 
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { ChefHat, LayoutDashboard, Mic, UserCog } from "lucide-react";
 import { ManagerVoice } from "./ManagerVoice";
 import { CookVoice } from "./CookVoice";
@@ -58,7 +58,16 @@ function RoleButton({
 }
 
 export default function VoicePage() {
-  const [role, setRole] = useState<Role | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initial = searchParams.get("role");
+  const [role, setRole] = useState<Role | null>(
+    initial === "cook" || initial === "manager" ? initial : null
+  );
+
+  const handleRoleSelect = (r: Role) => {
+    setRole(r);
+    setSearchParams({ role: r });
+  };
 
   return (
     <div className="min-h-screen bg-primary text-text">
@@ -78,7 +87,7 @@ export default function VoicePage() {
         <div className="flex items-center gap-2">
           {role && (
             <button
-              onClick={() => setRole(null)}
+              onClick={() => { setRole(null); setSearchParams({}); }}
               className="rounded-md px-2.5 py-1 text-xs font-medium text-text/50 hover:bg-muted/50 hover:text-text"
             >
               Switch role
@@ -111,7 +120,7 @@ export default function VoicePage() {
                 label="Manager"
                 description="Full Roba console, competitor intel, approvals"
                 selected={role === "manager"}
-                onClick={setRole}
+                onClick={handleRoleSelect}
               />
               <RoleButton
                 role="cook"
@@ -119,7 +128,7 @@ export default function VoicePage() {
                 label="Kitchen"
                 description="Next batch queue, mark cooked, report waste"
                 selected={role === "cook"}
-                onClick={setRole}
+                onClick={handleRoleSelect}
               />
             </div>
             <p className="text-center text-xs text-text/30">
