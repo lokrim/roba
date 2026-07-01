@@ -22,6 +22,7 @@ interface PlanConfirmCardProps {
   onConfirm: (planId: string) => void;
   onCancel: (planId: string) => void;
   onClarify?: (planId: string, answer: string) => void;
+  status?: "pending" | "done" | "cancelled";
 }
 
 function AgentChip({ name }: { name: string }) {
@@ -38,6 +39,7 @@ export function PlanConfirmCard({
   onConfirm,
   onCancel,
   onClarify,
+  status = "pending",
 }: PlanConfirmCardProps) {
   const planId = plan.plan_id ?? "";
 
@@ -72,8 +74,9 @@ export function PlanConfirmCard({
           {clarification ? "Roba Needs to Know" : "Roba's Plan"}
         </span>
         <button
-          onClick={() => onCancel(planId)}
-          className="rounded-full p-1 text-accent/50 hover:bg-accent/20 hover:text-accent transition-colors"
+          onClick={() => status === "pending" && onCancel(planId)}
+          disabled={status !== "pending"}
+          className="rounded-full p-1 text-accent/50 hover:bg-accent/20 hover:text-accent transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
           aria-label="Dismiss"
         >
           <X size={16} />
@@ -132,24 +135,36 @@ export function PlanConfirmCard({
           </div>
         )}
 
-        {/* Confirm / Cancel actions */}
+        {/* Confirm / Cancel actions — or done/cancelled badge */}
         {!clarification && (
           <div className="flex gap-3 pt-1">
-            <button
-              onClick={() => onConfirm(planId)}
-              disabled={!planId}
-              className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-accent px-4 py-3.5 text-base font-semibold text-white shadow hover:bg-accent/90 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              <Check size={18} />
-              Confirm
-            </button>
-            <button
-              onClick={() => onCancel(planId)}
-              className="flex items-center gap-2 rounded-xl border-2 border-muted bg-surface px-4 py-3.5 text-base font-medium text-text/70 hover:bg-muted/50 active:scale-[0.98] transition-all"
-            >
-              <X size={18} />
-              Cancel
-            </button>
+            {status === "done" ? (
+              <div className="flex items-center gap-2 text-green-400 font-semibold text-lg">
+                <Check className="w-5 h-5" /> Done
+              </div>
+            ) : status === "cancelled" ? (
+              <div className="flex items-center gap-2 text-red-400 font-semibold text-lg">
+                <X className="w-5 h-5" /> Cancelled
+              </div>
+            ) : (
+              <>
+                <button
+                  onClick={() => onConfirm(planId)}
+                  disabled={!planId}
+                  className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-accent px-4 py-3.5 text-base font-semibold text-white shadow hover:bg-accent/90 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Check size={18} />
+                  Confirm
+                </button>
+                <button
+                  onClick={() => onCancel(planId)}
+                  className="flex items-center gap-2 rounded-xl border-2 border-muted bg-surface px-4 py-3.5 text-base font-medium text-text/70 hover:bg-muted/50 active:scale-[0.98] transition-all"
+                >
+                  <X size={18} />
+                  Cancel
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
