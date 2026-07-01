@@ -114,6 +114,10 @@ PROMO_SLOW_MOVER_PCT = int(os.getenv("PROMO_SLOW_MOVER_PCT", "15"))
 # Vertex AI Live API (Stream B5)
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio")
 
+# Availability OOS mode: "threshold" (disabled when on_hand ≤ safety_stock/reorder_point)
+#                        "zero"      (disabled only when on_hand ≤ 0)
+AVAILABILITY_OOS_MODE = "threshold"
+
 # Vertex AI auth / project
 GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "roba.json")
