@@ -45,6 +45,14 @@ export interface TranscriptLine {
   final: boolean;
 }
 
+export interface RawFrame {
+  ts: string;        // hh:mm:ss timestamp
+  role: "user" | "roba";
+  text: string;
+  turn_id: string;
+  final: boolean;
+}
+
 export interface VoiceLiveHook {
   state: VoiceState;
   transcript: TranscriptLine[];
@@ -73,6 +81,11 @@ export interface VoiceLiveHook {
   // Live model (reconnects on change)
   voiceModel: string | undefined;
   setVoiceModel: (m: string | undefined) => void;
+  // Card status for done/cancelled badge
+  cardStatus: "pending" | "done" | "cancelled";
+  // Raw transcript frames for developer portal
+  rawFrames: RawFrame[];
+  clearRawFrames: () => void;
 }
 
 const CONNECT_TIMEOUT_MS = 8_000;   // "connecting" → "unavailable"
@@ -160,10 +173,13 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastStatus, setLastStatus] = useState<Record<string, unknown> | null>(null);
   const [lastApplied, setLastApplied] = useState<{ summary: string; tool: string } | null>(null);
+  const [cardStatus, setCardStatus] = useState<"pending" | "done" | "cancelled">("pending");
+  const [rawFrames, setRawFrames] = useState<RawFrame[]>([]);
 
   const clientRef = useRef<RobaLiveClient | null>(null);
   const connectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const thinkingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cardDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const micModeRef = useRef<MicMode>(micMode);
   const voiceModelRef = useRef<string | undefined>(voiceModel);
 
@@ -181,6 +197,12 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     if (thinkingTimerRef.current) {
       clearTimeout(thinkingTimerRef.current);
       thinkingTimerRef.current = null;
+    }
+  }
+  function clearCardDismissTimer() {
+    if (cardDismissTimerRef.current) {
+      clearTimeout(cardDismissTimerRef.current);
+      cardDismissTimerRef.current = null;
     }
   }
 
@@ -231,6 +253,10 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           }
           break;
         case "transcript": {
+          // Push raw frame (every partial and final, verbatim) before merging.
+          const now = new Date();
+          const ts = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`;
+          setRawFrames(prev => [...prev.slice(-199), { ts, role: ev.role, text: ev.text, turn_id: ev.turn_id, final: ev.final }]);
           // In-place merge: update the existing bubble for this turn_id,
           // or append a new one. No more fragment spam.
           setTranscript((prev) =>
@@ -244,19 +270,27 @@ export function useVoiceLive(role: string): VoiceLiveHook {
         }
         case "plan_preview":
           clearThinkingTimer();
+          clearCardDismissTimer();
+          setCardStatus("pending");
           setPendingPlan(ev.plan);
           setClarification(ev.plan.clarification ?? null);
           setState("ready");
           break;
         case "applied":
           clearThinkingTimer();
-          setPendingPlan(null);
-          setClarification(null);
           if (ev.summary) {
             setLastApplied({ summary: ev.summary, tool: ev.tool ?? "" });
             // Auto-dismiss after 4 seconds
             setTimeout(() => setLastApplied(null), 4000);
           }
+          // Show done badge on the confirm card, then auto-dismiss after 2.5s
+          setCardStatus("done");
+          clearCardDismissTimer();
+          cardDismissTimerRef.current = setTimeout(() => {
+            setPendingPlan(null);
+            setClarification(null);
+            setCardStatus("pending");
+          }, 2500);
           setState("ready");
           break;
         case "tool_result":
@@ -308,6 +342,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
       unsub();
       clearConnectTimer();
       clearThinkingTimer();
+      clearCardDismissTimer();
       client.disconnect();
     };
     // Reconnect when role, micMode, or voiceModel changes. The Live session's
@@ -320,6 +355,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const startListening = useCallback(async () => {
     if (!clientRef.current) return;
     clearThinkingTimer();
+    clearCardDismissTimer();
+    setCardStatus("pending");
     setLastError(null);
     setState("listening");
     await clientRef.current.startListening();
@@ -341,6 +378,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     (text: string) => {
       if (!clientRef.current) return;
       clientRef.current.sendText(text);
+      clearCardDismissTimer();
+      setCardStatus("pending");
       setStateWithTimeout("thinking");
     },
     [setStateWithTimeout],
@@ -348,14 +387,24 @@ export function useVoiceLive(role: string): VoiceLiveHook {
 
   const confirmPlan = useCallback((planId: string) => {
     clientRef.current?.confirmPlan(planId);
-    setPendingPlan(null);
-    setClarification(null);
+    setCardStatus("done");
+    clearCardDismissTimer();
+    cardDismissTimerRef.current = setTimeout(() => {
+      setPendingPlan(null);
+      setClarification(null);
+      setCardStatus("pending");
+    }, 2500);
   }, []);
 
   const cancelPlan = useCallback((planId: string) => {
     clientRef.current?.cancelPlan(planId);
-    setPendingPlan(null);
-    setClarification(null);
+    setCardStatus("cancelled");
+    clearCardDismissTimer();
+    cardDismissTimerRef.current = setTimeout(() => {
+      setPendingPlan(null);
+      setClarification(null);
+      setCardStatus("pending");
+    }, 2500);
   }, []);
 
   const setMicMode = useCallback((m: MicMode) => {
@@ -374,6 +423,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const clearTranscript = useCallback(() => setTranscript([]), []);
   const clearStatus = useCallback(() => setLastStatus(null), []);
   const clearLastApplied = useCallback(() => setLastApplied(null), []);
+  const clearRawFrames = useCallback(() => setRawFrames([]), []);
 
   return {
     state,
@@ -397,5 +447,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     setMicMode,
     voiceModel,
     setVoiceModel,
+    cardStatus,
+    rawFrames,
+    clearRawFrames,
   };
 }

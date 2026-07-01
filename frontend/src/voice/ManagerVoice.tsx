@@ -95,6 +95,7 @@ function TextFallback({ onSend }: { onSend: (text: string) => void }) {
 export function ManagerVoice() {
   const live = useVoiceLive("manager");
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [showDev, setShowDev] = useState(false);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -185,11 +186,12 @@ export function ManagerVoice() {
           onConfirm={live.confirmPlan}
           onCancel={live.cancelPlan}
           onClarify={handleClarify}
+          status={live.cardStatus}
         />
       )}
 
       {/* Auto-mode done card — brief confirmation of what was just applied */}
-      {live.lastApplied && (
+      {!live.pendingPlan && live.lastApplied && (
         <div className="flex items-center gap-3 rounded-xl border border-green-500/30 bg-green-500/5 px-4 py-3 text-sm text-text">
           <Check size={16} className="shrink-0 text-green-500" />
           <span className="flex-1">{live.lastApplied.summary}</span>
@@ -236,12 +238,20 @@ export function ManagerVoice() {
         <section>
           <div className="mb-2 flex items-center justify-between">
             <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Transcript</span>
-            <button onClick={live.clearTranscript} className="text-xs text-text/30 hover:text-text/60">
-              Clear
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowDev(v => !v)}
+                className={`px-2 py-1 text-xs rounded border ${showDev ? "bg-zinc-700 border-zinc-500 text-white" : "border-zinc-600 text-zinc-400 hover:text-zinc-200"}`}
+              >
+                Dev
+              </button>
+              <button onClick={live.clearTranscript} className="text-xs text-text/30 hover:text-text/60">
+                Clear
+              </button>
+            </div>
           </div>
           <div className="max-h-52 overflow-y-auto rounded-lg border border-muted/40 bg-surface/50 p-3 space-y-2">
-            {live.transcript.slice(-12).map((line) => (
+            {live.transcript.slice(-20).map((line) => (
               <div key={line.id} className={line.role === "user" ? "text-right" : "text-left"}>
                 <span
                   className={[
@@ -255,6 +265,28 @@ export function ManagerVoice() {
             ))}
             <div ref={transcriptEndRef} />
           </div>
+          {showDev && (
+            <section className="mt-2 border border-zinc-700 rounded-lg bg-zinc-950 p-2">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-zinc-400 font-mono">Raw transcript frames ({live.rawFrames.length})</span>
+                <button onClick={live.clearRawFrames} className="text-xs text-zinc-500 hover:text-zinc-300">Clear</button>
+              </div>
+              <div className="max-h-64 overflow-y-auto space-y-0.5 font-mono text-xs">
+                {live.rawFrames.length === 0 && (
+                  <div className="text-zinc-600">No frames yet — speak something.</div>
+                )}
+                {live.rawFrames.map((f, i) => (
+                  <div key={i} className={`leading-tight ${f.role === "user" ? "text-blue-300" : "text-green-300"}`}>
+                    <span className="text-zinc-500">[{f.ts}]</span>{" "}
+                    <span className={f.final ? "font-semibold" : "opacity-70"}>[{f.role}]</span>{" "}
+                    {f.final ? "✓" : "…"}{" "}
+                    <span className="text-zinc-400">turn={f.turn_id.slice(0,8)}</span>{" "}
+                    "{f.text}"
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
         </section>
       )}
 
