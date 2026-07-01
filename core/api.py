@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 
 from . import config, db, models
@@ -204,9 +204,22 @@ def _ensure_settings_singleton(session: Any) -> models.SimSettings:
     return settings
 
 
+def _migrate_schema() -> None:
+    """Apply additive column migrations that create_all() cannot handle on existing tables."""
+    with db.engine.connect() as conn:
+        try:
+            conn.execute(text(
+                "ALTER TABLE sim_settings ADD COLUMN availability_oos_mode TEXT DEFAULT 'threshold'"
+            ))
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            pass  # column already exists
+
+
 def _bootstrap() -> None:
     """Create tables + singletons and wire every core object (§ app bootstrap)."""
     db.create_all()
+    _migrate_schema()
 
     factory = db.new_session
 
