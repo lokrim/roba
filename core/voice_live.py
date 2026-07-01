@@ -342,15 +342,18 @@ _TOOLS: list[dict[str, Any]] = [
             {
                 "name": "set_staff_attendance",
                 "description": (
-                    "Update a staff member's attendance status. The system will automatically "
+                    "Update one or more staff members' attendance status. The system will automatically "
                     "disable or re-enable dishes based on station coverage after the update. "
-                    "Use for: 'head chef is sick', 'Marco is on leave today', 'chef is back'. "
-                    "staff_name_or_role can be a name ('Marco') or a role ('head chef', 'cook')."
+                    "Use for: 'head chef is sick', 'Marco is on leave today', 'Mark and Giulia are off', 'chef is back'. "
+                    "staff_name_or_role accepts a single name, multiple names, or a role."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "staff_name_or_role": {"type": "string", "description": "Staff name or role."},
+                        "staff_name_or_role": {
+                            "type": "string",
+                            "description": "One or more staff names (comma-separated or 'and'-separated, e.g. 'Marco and Giulia') or a role.",
+                        },
                         "status": {"type": "string", "enum": ["sick", "leave", "present"]},
                         "daypart": {"type": "string", "description": "Optional daypart restriction."},
                     },
@@ -450,15 +453,14 @@ _FEW_SHOTS = """
 ## Examples (utterance → tool call → spoken reply)
 
 User: "How many tomatoes do we have?"
-→ get_inventory(item_name="tomato")
-→ "We have 4,200 grams of tomatoes."
+→ get_inventory(item_name="Tomato")
+→ "We have 12,000 grams of tomatoes."
 
 User: "Disable all pasta items."
-→ get_menu(filter="all")  [to get the list]
 → disable_menu_item(category="pasta")
-→ [confirm mode] "I'll disable all 4 pasta dishes — confirm?"
-→ [after confirm] "Done — Spaghetti Carbonara, Tagliatelle, Cacio e Pepe, and Pappardelle have been disabled."
-→ [auto mode] "Disabled all 4 pasta dishes."
+→ [confirm mode] "I'll disable all pasta dishes (Pasta Pomodoro and Spaghetti Carbonara) — a confirmation card is on screen."
+→ [after confirm] "Done — Pasta Pomodoro and Spaghetti Carbonara have been disabled."
+→ [auto mode] "Disabled all pasta dishes."
 
 User: [holds button, says nothing / unclear mumble]
 → [NO tool call]
@@ -466,34 +468,41 @@ User: [holds button, says nothing / unclear mumble]
 
 User: "Disable Margherita Pizza."
 → disable_menu_item(item_name="Margherita Pizza")
-→ [confirm mode] "I'll disable Margherita Pizza — confirm?"
+→ [confirm mode] "I'll disable Margherita Pizza — a confirmation card is on screen."
 → [after confirm] "Margherita Pizza has been disabled."
 → [auto mode] "Margherita Pizza is now disabled."
 
-User: "All tomatoes in the inventory have spoiled."
-→ record_spoilage(ingredient_name="tomato", all_stock=true)
-→ [after applied] "Done. Tomato stock zeroed. Margherita Pizza and Bruschetta have been automatically disabled."
+User: "All the tomatoes have spoiled."
+→ record_spoilage(ingredient_name="Tomato", all_stock=true)
+→ [confirm mode] "I'll zero the Tomato stock and auto-disable affected dishes — a confirmation card is on screen."
+→ [after applied] "Done. Tomato stock zeroed. Margherita Pizza, Pasta Pomodoro, and Bruschetta have been automatically disabled."
 
 User: "The head chef is sick."
 → get_staff()  [to confirm who the head chef is]
 → set_staff_attendance(staff_name_or_role="head chef", status="sick")
-→ "Marco (head chef) is now marked sick. The Pasta station is unstaffed — Spaghetti Carbonara and Tagliatelle have been automatically disabled."
+→ [confirm mode] "I'll mark Marco (head chef) as sick — a confirmation card is on screen."
+→ [after applied] "Marco is now marked sick. Giulia still covers Grill, so no dishes have been auto-disabled."
+
+User: "Mark Marco and Giulia as on leave today."
+→ set_staff_attendance(staff_name_or_role="Marco and Giulia", status="leave")
+→ [confirm mode] "I'll mark Marco and Giulia as on leave — a confirmation card is on screen."
+→ [after applied] "Marco and Giulia are now on leave. Grill station is unstaffed — Margherita Pizza and Garlic Bread have been automatically disabled."
 
 User: "We're low on tomatoes and the pasta chef just left — what should I prioritize?"
-→ consult_reasoner(question="Low on tomatoes and pasta chef absent — what should the manager prioritize?", context="Tomatoes below safety stock; pasta station unstaffed.")
-→ "Given both constraints, I'd 86 the pasta dishes first since the station is unstaffed anyway, then alert your tomato supplier. That preserves tomatoes for the non-pasta dishes still running."
+→ consult_reasoner(question="Low on tomatoes and pasta chef absent — what should the manager prioritize?", context="Tomatoes below safety stock; Pasta station understaffed.")
+→ "Given both constraints, I'd 86 the pasta dishes first since the station is short-staffed, then alert GreenFarm Produce for an emergency tomato order."
 
 User: "What's selling most in the last 3 hours?"
 → get_pos_stats(window="3h")
-→ "Top seller: Margherita Pizza with 24 orders, then Tiramisu with 18."
+→ "Top seller: Margherita Pizza with 24 orders, then Spaghetti Carbonara with 18."
 
 User: "What are the tomato prices from all our suppliers?"
-→ get_supplier_prices(ingredient_name="tomato")
-→ "FreshFarms charges €2.50/kg for tomatoes; MedSupply charges €2.20/kg but has limited availability."
+→ get_supplier_prices(ingredient_name="Tomato")
+→ "GreenFarm Produce charges €0.004 per gram for Tomato (5 kg packs), currently in stock."
 
 User: "What dish is the most hated right now?"
 → get_reviews(sort="most_hated")
-→ "Based on recent reviews, Tiramisu has the lowest ratings, with customers citing it as too sweet."
+→ "Based on recent reviews, Caesar Salad has the lowest ratings — customers say it was soggy and small."
 """
 
 _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
@@ -509,7 +518,7 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "4. MISSING ARGS: If a tool returns {'need': ...}, ask the user for that specific piece of info.\n"
         "5. MODES:\n"
         "   CONFIRM MODE: Call the write tool (it stages the action and shows a confirmation card on-screen). "
-        "Then speak exactly ONE short sentence: '[Action summary] — confirm?' and wait. "
+        "Then speak exactly ONE short sentence: '[Action summary] — a confirmation card is on screen.' and wait. "
         "When the user says yes/confirm/go ahead, call confirm_plan(plan_id=...). "
         "Never ask a 'manager' or anyone else — the person speaking to you IS the authority.\n"
         "   AUTO MODE: Write tools apply immediately. Speak ONE short sentence of what was done. "
@@ -517,7 +526,14 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "6. ACTIONS vs READS: If the user's request is an ACTION (disable, enable, set, mark, adjust, 86, "
         "turn off, remove), you MUST call the matching WRITE tool. Never respond to an action request by "
         "listing items — that is always wrong. If you receive an empty or unclear utterance, ask ONE short "
-        "clarifying question. Do NOT recite inventory or the menu to fill silence.\n\n"
+        "clarifying question. Do NOT recite inventory or the menu to fill silence.\n"
+        "7. NEVER ask the user for information they already gave. If they say 'all the tomatoes spoiled', "
+        "call record_spoilage(ingredient_name='Tomato', all_stock=True) immediately — do not ask 'which "
+        "ingredient?' or 'how much?'. Infer all_stock=True from words like 'all', 'everything', 'the whole', "
+        "'all of the', 'spoiled all', 'dropped all'.\n"
+        "8. NEVER claim an ingredient doesn't exist or suggest alternatives unless get_inventory returned zero "
+        "results. If the result has an exact or partial match, use it — do not narrate other rows as "
+        "'alternatives' to the one asked about.\n\n"
         "TOOL GUIDE:\n"
         "• Inventory quantity → get_inventory(item_name=...)\n"
         "• Inventory expiry → get_inventory(sort='expiring_soonest')\n"
@@ -554,10 +570,12 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "2. TRUTHFULNESS: Say only what the tool confirms.\n"
         "3. CONCISENESS: Kitchen staff are busy. One or two sentences.\n"
         "4. MISSING ARGS: If a tool returns {'need': ...}, ask the user for that specific piece of info.\n"
-        "5. MODES: CONFIRM MODE: stage the write tool and say '[summary] — confirm?'. "
+        "5. MODES: CONFIRM MODE: stage the write tool and say '[summary] — a confirmation card is on screen.'. "
         "AUTO MODE: apply immediately and confirm in one sentence.\n"
         "6. ACTIONS vs READS: If the request is an ACTION (mark cooked, record waste, record spoilage), "
-        "call the matching WRITE tool immediately. Never list items to fill silence — ask ONE short question.\n\n"
+        "call the matching WRITE tool immediately. Never list items to fill silence — ask ONE short question.\n"
+        "7. NEVER ask the user for information they already gave. If they say 'all the mozzarella went bad', "
+        "call record_spoilage(ingredient_name='Mozzarella', all_stock=True) immediately.\n\n"
         "TOOL GUIDE:\n"
         "• Batch status → get_batches(status='approved,decided')\n"
         "• Did we cook X → get_batches(dish=..., status='ready')\n"
@@ -777,6 +795,23 @@ async def _client_to_gemini(
                                     "result": result,
                                 }
                                 await _safe_send_json(websocket, applied_frame)
+                                # B2: Inject a spoken confirmation so Roba voices the result.
+                                try:
+                                    await session.send_client_content(
+                                        turns={"parts": [{"text": "(Action confirmed via the on-screen button. Reply in one short sentence confirming it's done — e.g. 'Done.' or 'Got it.' No more than 5 words.)"}]},
+                                        turn_complete=True,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass  # best-effort; the visual done card already showed
+                            elif isinstance(result, dict) and result.get("status") == "cancelled":
+                                # B2: Inject spoken cancellation.
+                                try:
+                                    await session.send_client_content(
+                                        turns={"parts": [{"text": "(Action cancelled via the on-screen button. Reply in one short sentence: 'Cancelled.' No more than 3 words.)"}]},
+                                        turn_complete=True,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass  # best-effort
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("voice %s failed: %s", msg_type, exc)
     except asyncio.CancelledError:
@@ -853,6 +888,30 @@ async def _flush_transcript(websocket: Any, role: str, buffers: "_TurnBuffer") -
         })
 
 
+def _merge_transcript_chunk(buf: list, incoming: str) -> None:
+    """Merge an incoming STT chunk into the running buffer.
+
+    Input transcription from Gemini Live sends cumulative text, so each
+    chunk often contains everything said so far. Detect this by checking
+    whether the incoming text starts with (or equals) the current buffer
+    content, and replace rather than append in that case.
+    """
+    incoming = incoming.strip()
+    if not incoming:
+        return
+    current = "".join(buf).strip()
+    if not current:
+        buf.append(incoming)
+        return
+    # Cumulative case: incoming extends or rewrites the current text.
+    if incoming.startswith(current) or current.startswith(incoming):
+        buf.clear()
+        buf.append(incoming)
+    else:
+        # True delta: append normally.
+        buf.append(" " + incoming)
+
+
 async def _gemini_to_client(
     websocket: Any,
     session: Any,
@@ -914,11 +973,11 @@ async def _handle_chunk(
     if sc is not None:
         # User STT partial — accumulate and emit partial frame.
         if sc.input_transcription and sc.input_transcription.text:
-            if buffers._user_finalized and not buffers.user:
-                # New utterance after a completed turn — get a fresh turn_id.
+            if not buffers.user:
+                # First chunk of a new utterance — always get a fresh turn_id.
                 buffers.new_user_turn()
                 buffers._user_finalized = False
-            buffers.user.append(sc.input_transcription.text)
+            _merge_transcript_chunk(buffers.user, sc.input_transcription.text)
             await _emit_partial(websocket, "user", buffers)
 
         # Roba TTS text — accumulate and emit partial frame.
@@ -934,6 +993,7 @@ async def _handle_chunk(
             await _emit_partial(websocket, "roba", buffers)
 
         if getattr(sc, "generation_complete", False):
+            await _flush_transcript(websocket, "user", buffers)
             await _flush_transcript(websocket, "roba", buffers)
         if getattr(sc, "interrupted", False):
             await _flush_transcript(websocket, "user", buffers)

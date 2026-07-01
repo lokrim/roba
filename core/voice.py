@@ -1123,8 +1123,15 @@ class VoiceProcessor:
         rows = all_rows
         if item_name:
             needle = item_name.strip().lower()
-            matched = [r for r in all_rows if needle in str(r["name"]).lower()]
-            rows = matched if matched else all_rows
+            # 1. Try exact match first.
+            exact = [r for r in all_rows if str(r.get("name", "")).lower() == needle]
+            if exact:
+                rows = exact
+            else:
+                # 2. Fall back to substring (partial) match.
+                rows = [r for r in all_rows if needle in str(r.get("name", "")).lower()]
+                if not rows:
+                    rows = all_rows  # no match at all → return full list
         return {"inventory": rows, "count": len(rows)}
 
     def query_forecast(self, item_name: Optional[str] = None) -> Dict[str, Any]:
@@ -1134,12 +1141,10 @@ class VoiceProcessor:
             item_names = {
                 int(mi.id): str(mi.name or "") for mi in session.query(MenuItem).all()
             }
-            rows: List[Dict[str, Any]] = []
+            all_rows: List[Dict[str, Any]] = []
             for fc in session.query(Forecast).order_by(Forecast.generated_at.desc()).all():
                 name = item_names.get(int(fc.menu_item_id), str(fc.menu_item_id))
-                if item_name and item_name.strip().lower() not in name.lower():
-                    continue
-                rows.append({
+                all_rows.append({
                     "menu_item": name,
                     "daypart": fc.daypart,
                     "forecast_qty": int(fc.forecast_qty or 0),
@@ -1152,10 +1157,24 @@ class VoiceProcessor:
                         float(fc.generated_at) if fc.generated_at is not None else None
                     ),
                 })
-                if len(rows) >= 40:
+                if len(all_rows) >= 200:
                     break
         finally:
             session.close()
+
+        rows = all_rows
+        if item_name:
+            needle = item_name.strip().lower()
+            # 1. Try exact match first.
+            exact = [r for r in all_rows if str(r.get("menu_item", "")).lower() == needle]
+            if exact:
+                rows = exact
+            else:
+                # 2. Fall back to substring match.
+                rows = [r for r in all_rows if needle in str(r.get("menu_item", "")).lower()]
+                if not rows:
+                    rows = all_rows  # no match → return everything
+        rows = rows[:40]
         return {"sim_time": float(self.bus.sim_time), "forecasts": rows, "count": len(rows)}
 
     def query_competitors(self) -> Dict[str, Any]:
