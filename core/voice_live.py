@@ -686,12 +686,13 @@ async def live_bridge(
         ):
             return
 
+        buffers = _TurnBuffer()
         task_c2g = asyncio.create_task(
-            _client_to_gemini(websocket, session, voice_processor, voice_actions),
+            _client_to_gemini(websocket, session, voice_processor, voice_actions, buffers),
             name="voice_live_c2g",
         )
         task_g2c = asyncio.create_task(
-            _gemini_to_client(websocket, session, voice_processor, role, mode, voice_actions),
+            _gemini_to_client(websocket, session, voice_processor, role, mode, voice_actions, buffers),
             name="voice_live_g2c",
         )
         done, pending = await asyncio.wait(
@@ -721,7 +722,8 @@ async def live_bridge(
 
 
 async def _client_to_gemini(
-    websocket: Any, session: Any, voice_processor: Any, voice_actions: Optional[Any]
+    websocket: Any, session: Any, voice_processor: Any, voice_actions: Optional[Any],
+    buffers: "_TurnBuffer",
 ) -> None:
     """Read frames from the browser WS and relay to the Live session."""
     from google.genai import types as _gtypes
@@ -747,9 +749,12 @@ async def _client_to_gemini(
                     continue
                 msg_type = msg.get("type")
                 if msg_type == "activity_start":
+                    buffers.start_user_turn()
                     await session.send_realtime_input(activity_start=_gtypes.ActivityStart())
                 elif msg_type == "activity_end":
                     await session.send_realtime_input(activity_end=_gtypes.ActivityEnd())
+                    await _flush_transcript(websocket, "user", buffers)
+                    buffers.close_user_turn()
                 elif msg_type == "end_of_turn":
                     await session.send_realtime_input(audio_stream_end=True)
                 elif msg_type == "text_input":
@@ -835,11 +840,21 @@ class _TurnBuffer:
         self.roba: list[str] = []
         self._user_turn_id: str = str(uuid.uuid4())
         self._roba_turn_id: str = str(uuid.uuid4())
-        self._user_finalized: bool = False
+        self._user_open: bool = False
 
     def new_user_turn(self) -> str:
         self._user_turn_id = str(uuid.uuid4())
         return self._user_turn_id
+
+    def start_user_turn(self) -> None:
+        """Called when user begins speaking (activity_start in PTT). Resets the user turn."""
+        self.user = []
+        self._user_turn_id = str(uuid.uuid4())
+        self._user_open = True
+
+    def close_user_turn(self) -> None:
+        """Mark the user turn as closed (called after flush on activity_end or turn_complete)."""
+        self._user_open = False
 
     def new_roba_turn(self) -> str:
         self._roba_turn_id = str(uuid.uuid4())
@@ -856,7 +871,6 @@ class _TurnBuffer:
         text = self.cumulative(role)
         if role == "user":
             self.user = []
-            self._user_finalized = True
         else:
             self.roba = []
         return text
@@ -919,11 +933,11 @@ async def _gemini_to_client(
     role: str,
     mode: str,
     voice_actions: Optional[Any],
+    buffers: "_TurnBuffer",
 ) -> None:
     """Read from the Vertex AI Live session and relay audio/events to the browser."""
     from google.genai import types as _gtypes
 
-    buffers = _TurnBuffer()
     try:
         while True:
             try:
@@ -973,10 +987,10 @@ async def _handle_chunk(
     if sc is not None:
         # User STT partial — accumulate and emit partial frame.
         if sc.input_transcription and sc.input_transcription.text:
-            if not buffers.user:
-                # First chunk of a new utterance — always get a fresh turn_id.
-                buffers.new_user_turn()
-                buffers._user_finalized = False
+            if not buffers._user_open:
+                # Conversation mode fallback (no activity_start/end frames):
+                # start a turn on first chunk if none is open
+                buffers.start_user_turn()
             _merge_transcript_chunk(buffers.user, sc.input_transcription.text)
             await _emit_partial(websocket, "user", buffers)
 
@@ -996,12 +1010,14 @@ async def _handle_chunk(
             await _flush_transcript(websocket, "user", buffers)
             await _flush_transcript(websocket, "roba", buffers)
         if getattr(sc, "interrupted", False):
-            await _flush_transcript(websocket, "user", buffers)
             await _flush_transcript(websocket, "roba", buffers)
             await _safe_send_json(websocket, {"type": "interrupted"})
         if getattr(sc, "turn_complete", False):
-            await _flush_transcript(websocket, "user", buffers)
             await _flush_transcript(websocket, "roba", buffers)
+            # In conversation mode, finalize user turn here (PTT already finalized on activity_end)
+            if buffers._user_open:
+                await _flush_transcript(websocket, "user", buffers)
+                buffers.close_user_turn()
             await _safe_send_json(websocket, {"type": "turn_complete"})
 
     if chunk.tool_call:

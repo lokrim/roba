@@ -645,6 +645,7 @@ class VoiceActions:
                 finally:
                     session.close()
             except Exception:  # noqa: BLE001
+                logger.warning("recompute_availability failed", exc_info=True)
                 disabled_names = []
             return {
                 "ok": True,
@@ -803,7 +804,7 @@ class VoiceActions:
                 finally:
                     session.close()
             except Exception:  # noqa: BLE001
-                pass
+                logger.warning("recompute_availability failed", exc_info=True)
             return {
                 "ok": True,
                 "updated": results,
@@ -912,7 +913,7 @@ class VoiceActions:
             return {"error": f"No pending action {action_id}"}
         try:
             result = entry["fn"]()
-            return {"status": "applied", "plan_id": action_id, **result}
+            return {"plan_id": action_id, **result, "status": "applied"}
         except Exception as e:  # noqa: BLE001
             logger.exception("VoiceActions: execute_pending %s failed", action_id)
             return {"error": str(e), "plan_id": action_id}

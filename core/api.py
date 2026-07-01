@@ -206,14 +206,17 @@ def _ensure_settings_singleton(session: Any) -> models.SimSettings:
 
 def _migrate_schema() -> None:
     """Apply additive column migrations that create_all() cannot handle on existing tables."""
+    migrations = [
+        ("sim_settings", "availability_oos_mode", "ALTER TABLE sim_settings ADD COLUMN availability_oos_mode TEXT DEFAULT 'threshold'"),
+        ("menu_toggles", "reason_code", "ALTER TABLE menu_toggles ADD COLUMN reason_code TEXT"),
+    ]
     with db.engine.connect() as conn:
-        try:
-            conn.execute(text(
-                "ALTER TABLE sim_settings ADD COLUMN availability_oos_mode TEXT DEFAULT 'threshold'"
-            ))
-            conn.commit()
-        except Exception:  # noqa: BLE001
-            pass  # column already exists
+        for table, column, ddl in migrations:
+            rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            existing_cols = {r[1] for r in rows}
+            if column not in existing_cols:
+                conn.execute(text(ddl))
+                conn.commit()
 
 
 def _bootstrap() -> None:
