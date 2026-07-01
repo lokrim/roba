@@ -64,6 +64,7 @@ export interface VoiceLiveHook {
   // Last applied action (auto-mode done card)
   lastApplied: { summary: string; tool: string } | null;
   clearLastApplied: () => void;
+  setDone: (summary: string) => void;
   // Confirm/auto mode (whether Roba asks for approval before acting)
   mode: string;
   setMode: (m: string) => void;
@@ -248,17 +249,16 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           setClarification(ev.plan.clarification ?? null);
           setState("ready");
           break;
-        case "applied":
+        case "applied": {
           clearThinkingTimer();
           setPendingPlan(null);
           setClarification(null);
-          if (ev.summary) {
-            setLastApplied({ summary: ev.summary, tool: ev.tool ?? "" });
-            // Auto-dismiss after 4 seconds
-            setTimeout(() => setLastApplied(null), 4000);
-          }
+          const summary = ev.summary || "Done.";
+          setLastApplied({ summary, tool: ev.tool ?? "" });
+          setTimeout(() => setLastApplied(null), 4000);
           setState("ready");
           break;
+        }
         case "tool_result":
           clearThinkingTimer();
           if (ev.tool === "get_kitchen_status" && ev.result) {
@@ -375,6 +375,11 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const clearStatus = useCallback(() => setLastStatus(null), []);
   const clearLastApplied = useCallback(() => setLastApplied(null), []);
 
+  const setDone = useCallback((summary: string) => {
+    setLastApplied({ summary, tool: "" });
+    setTimeout(() => setLastApplied(null), 4000);
+  }, []);
+
   return {
     state,
     transcript,
@@ -391,6 +396,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     clearStatus,
     lastApplied,
     clearLastApplied,
+    setDone,
     mode,
     setMode,
     micMode,

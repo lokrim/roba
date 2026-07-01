@@ -73,6 +73,8 @@ export class RobaLiveClient {
   private _finalizeStop: (() => void) | null = null;
 
   private _model: string | undefined;
+  private _lastUserTurnId = "";
+  private _lastRobaTurnId = "";
 
   constructor(role = "manager", mode = "confirm", micMode: "ptt" | "conversation" = "ptt", model?: string) {
     this.role = role;
@@ -160,6 +162,18 @@ export class RobaLiveClient {
 
   async startListening(): Promise<void> {
     if (this._listening) return;
+
+    // Browsers only expose mediaDevices on HTTPS or localhost (secure context).
+    if (!navigator.mediaDevices?.getUserMedia) {
+      this.emit({
+        type: "error",
+        message:
+          "Microphone requires HTTPS or localhost. Please open this page via https://… (accept the self-signed certificate warning).",
+      });
+      this._listening = false;
+      return;
+    }
+
     this._listening = true;
     this.stopPlayback(); // barge-in: stop Roba audio when user starts speaking
 
@@ -181,7 +195,8 @@ export class RobaLiveClient {
         return;
       }
 
-      ctx = new AudioContext({ sampleRate: 48000 });
+      const AC: typeof AudioContext = window.AudioContext ?? (window as any).webkitAudioContext;
+      ctx = new AC({ sampleRate: 48000 });
       await ctx.audioWorklet.addModule("/mic-processor.js");
 
       if (!this._listening || session !== this._micSession) {
@@ -331,11 +346,23 @@ export class RobaLiveClient {
     } else if (t === "unavailable") {
       this.emit({ type: "unavailable", reason: msg.reason as string | undefined });
     } else if (t === "transcript") {
+      const txRole = (msg.role as "user" | "roba") ?? "roba";
+      let turn_id: string;
+      if (msg.turn_id != null) {
+        turn_id = String(msg.turn_id);
+        // Store so we can fall back to it when subsequent chunks omit turn_id.
+        if (txRole === "user") this._lastUserTurnId = turn_id;
+        else this._lastRobaTurnId = turn_id;
+      } else {
+        // Reuse the last known turn_id for this role to keep the bubble stable.
+        const last = txRole === "user" ? this._lastUserTurnId : this._lastRobaTurnId;
+        turn_id = last || `fallback-${Date.now()}`;
+      }
       this.emit({
         type: "transcript",
-        role: (msg.role as "user" | "roba") ?? "roba",
+        role: txRole,
         text: String(msg.text ?? ""),
-        turn_id: String(msg.turn_id ?? `fallback-${Date.now()}`),
+        turn_id,
         final: Boolean(msg.final),
       });
     } else if (t === "plan_preview") {
@@ -412,7 +439,8 @@ export class RobaLiveClient {
 
   private playPcm(buffer: ArrayBuffer) {
     if (!this.playbackCtx) {
-      this.playbackCtx = new AudioContext({ sampleRate: 24000 });
+      const AC: typeof AudioContext = window.AudioContext ?? (window as any).webkitAudioContext;
+      this.playbackCtx = new AC({ sampleRate: 24000 });
       this.playbackTime = this.playbackCtx.currentTime;
     }
     // First audio of the turn → tell the UI Roba is speaking (clears "thinking").

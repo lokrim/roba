@@ -1,13 +1,15 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import basicSsl from "@vitejs/plugin-basic-ssl";
 
 // The browser always hits the frontend origin; Vite proxies API + WebSocket
 // to the backend service so there are no CORS/origin issues (00 §26.4).
 // All frontend calls use relative paths (/api/..., /ws) — never a hardcoded host.
+// basicSsl() enables HTTPS so navigator.mediaDevices is available on LAN devices.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), basicSsl()],
   server: {
-    host: true,
+    host: true,   // expose on all interfaces so other LAN devices can connect
     port: 5173,
     proxy: {
       "/api": {
