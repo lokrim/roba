@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from core.agent_base import BaseAgent
 from core.clock import SECONDS_PER_DAY
@@ -203,11 +206,8 @@ class StaffAgent(BaseAgent):
                     changed_station_ids=station_ids,
                     agent_name="staff_attendance",
                 )
-        except Exception as _exc:
-            import logging as _log
-            _log.getLogger(__name__).warning(
-                "availability cascade on attendance change failed: %s", _exc
-            )
+        except Exception:  # noqa: BLE001
+            logger.warning("recompute_availability failed", exc_info=True)
 
         return result
 

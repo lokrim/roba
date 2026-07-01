@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 
 from . import config, db, models
@@ -203,9 +203,25 @@ def _ensure_settings_singleton(session: Any) -> models.SimSettings:
     return settings
 
 
+def _migrate_schema() -> None:
+    """Apply additive column migrations that create_all() cannot handle on existing tables."""
+    migrations = [
+        ("sim_settings", "availability_oos_mode", "ALTER TABLE sim_settings ADD COLUMN availability_oos_mode TEXT DEFAULT 'threshold'"),
+        ("menu_toggles", "reason_code", "ALTER TABLE menu_toggles ADD COLUMN reason_code TEXT"),
+    ]
+    with db.engine.connect() as conn:
+        for table, column, ddl in migrations:
+            rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            existing_cols = {r[1] for r in rows}
+            if column not in existing_cols:
+                conn.execute(text(ddl))
+                conn.commit()
+
+
 def _bootstrap() -> None:
     """Create tables + singletons and wire every core object (§ app bootstrap)."""
     db.create_all()
+    _migrate_schema()
 
     factory = db.new_session
 
