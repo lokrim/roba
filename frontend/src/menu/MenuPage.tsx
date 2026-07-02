@@ -6,11 +6,11 @@ import { wsClient } from "../ws";
 
 // Public customer menu. Opens the shared WebSocket so it receives `menu_toggled`
 // events instantly when an ingredient is zeroed or a station goes unstaffed.
-// Also polls GET /api/menu at a 10s cadence as a safety net for brief WS outages.
+// Also polls GET /api/menu at a slow cadence as a safety net for brief WS outages.
 // Shows every item — active ones are orderable, inactive ones are greyed out as
 // "Sold out".
 
-const POLL_MS = 10_000;
+const POLL_MS = 60_000;
 
 function prettifySeedId(id: string | null | undefined): string {
   if (!id) return "Our Menu";
