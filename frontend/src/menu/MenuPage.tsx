@@ -4,12 +4,13 @@ import { apiGet } from "../api";
 import type { MenuItem, SimState, MenuToggleEvent } from "../types";
 import { wsClient } from "../ws";
 
-// Public customer menu. Subscribes to the `menu_toggled` WS event for instant
-// active/sold-out updates, and also polls GET /api/menu at a slow cadence as a
-// safety net. Shows every item — active ones are orderable, inactive ones are
-// greyed out as "Sold out".
+// Public customer menu. Opens the shared WebSocket so it receives `menu_toggled`
+// events instantly when an ingredient is zeroed or a station goes unstaffed.
+// Also polls GET /api/menu at a 10s cadence as a safety net for brief WS outages.
+// Shows every item — active ones are orderable, inactive ones are greyed out as
+// "Sold out".
 
-const POLL_MS = 60_000;
+const POLL_MS = 10_000;
 
 function prettifySeedId(id: string | null | undefined): string {
   if (!id) return "Our Menu";
@@ -54,6 +55,9 @@ export default function MenuPage() {
   }, []);
 
   useEffect(() => {
+    // /menu is outside OperatorLayout so no other code opens the socket here.
+    // connect() is idempotent and re-opens a socket closed by OperatorLayout on nav.
+    wsClient.connect();
     const off = wsClient.on("menu_toggled", (p) => {
       const { menu_item_id, action } = p as unknown as MenuToggleEvent;
       setItems((prev) =>
