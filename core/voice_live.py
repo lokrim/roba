@@ -60,11 +60,12 @@ _CONNECT_TIMEOUT_S = 10.0
 # Models the UI may select via the model= query param.
 # These must be actual Vertex AI Live API model IDs (use `client.models.list()` to verify).
 _ALLOWED_LIVE_MODELS = {
-    "gemini-live-2.5-flash-native-audio",   # native voice, GA on Vertex
+    "gemini-live-2.5-flash",               # half-cascade, reliable input transcription
+    "gemini-live-2.5-flash-native-audio",  # native voice, GA on Vertex
 }
 
 # Hardcoded fallback — used when GEMINI_LIVE_MODEL env var contains an invalid name.
-_FALLBACK_LIVE_MODEL = "gemini-live-2.5-flash-native-audio"
+_FALLBACK_LIVE_MODEL = "gemini-live-2.5-flash"
 
 _DISCONNECT_EXC_NAMES = {
     "WebSocketDisconnect",
@@ -753,8 +754,8 @@ async def _client_to_gemini(
                     await session.send_realtime_input(activity_start=_gtypes.ActivityStart())
                 elif msg_type == "activity_end":
                     await session.send_realtime_input(activity_end=_gtypes.ActivityEnd())
-                    await _flush_transcript(websocket, "user", buffers)
-                    buffers.close_user_turn()
+                    # Do NOT flush/close the user turn here — input_transcription arrives
+                    # after the audio boundary; finalize on generation_complete/turn_complete.
                 elif msg_type == "end_of_turn":
                     await session.send_realtime_input(audio_stream_end=True)
                 elif msg_type == "text_input":
@@ -800,27 +801,28 @@ async def _client_to_gemini(
                                     "result": result,
                                 }
                                 await _safe_send_json(websocket, applied_frame)
-                                # B2: Inject a spoken confirmation so Roba voices the result.
-                                try:
-                                    await session.send_client_content(
-                                        turns={"parts": [{"text": "(Action confirmed via the on-screen button. Reply in one short sentence confirming it's done — e.g. 'Done.' or 'Got it.' No more than 5 words.)"}]},
-                                        turn_complete=True,
-                                    )
-                                except Exception:  # noqa: BLE001
-                                    pass  # best-effort; the visual done card already showed
+                                await _speak_confirmation(session, "done")
                             elif isinstance(result, dict) and result.get("status") == "cancelled":
-                                # B2: Inject spoken cancellation.
-                                try:
-                                    await session.send_client_content(
-                                        turns={"parts": [{"text": "(Action cancelled via the on-screen button. Reply in one short sentence: 'Cancelled.' No more than 3 words.)"}]},
-                                        turn_complete=True,
-                                    )
-                                except Exception:  # noqa: BLE001
-                                    pass  # best-effort
+                                await _speak_confirmation(session, "cancelled")
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("voice %s failed: %s", msg_type, exc)
     except asyncio.CancelledError:
         pass
+
+
+async def _speak_confirmation(session: Any, kind: str) -> None:
+    """Inject a forced spoken acknowledgement after a confirm/cancel action."""
+    if kind == "done":
+        text = "(Action confirmed. Reply with exactly: 'Done.')"
+    else:
+        text = "(Action cancelled. Reply with exactly: 'Cancelled.')"
+    try:
+        await session.send_client_content(
+            turns={"parts": [{"text": text}]},
+            turn_complete=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_speak_confirmation(%s) failed: %s", kind, exc)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -917,10 +919,14 @@ def _merge_transcript_chunk(buf: list, incoming: str) -> None:
     if not current:
         buf.append(incoming)
         return
-    # Cumulative case: incoming extends or rewrites the current text.
-    if incoming.startswith(current) or current.startswith(incoming):
+    if incoming.startswith(current):
+        # Cumulative: the new frame includes everything said so far — replace.
         buf.clear()
         buf.append(incoming)
+    elif current.startswith(incoming):
+        # STT revision sent a shorter version of what's already accumulated —
+        # keep the longer text (do not drop words already displayed).
+        return
     else:
         # True delta: append normally.
         buf.append(" " + incoming)
@@ -991,6 +997,7 @@ async def _handle_chunk(
                 # Conversation mode fallback (no activity_start/end frames):
                 # start a turn on first chunk if none is open
                 buffers.start_user_turn()
+            logger.debug("user STT chunk: %r", sc.input_transcription.text)
             _merge_transcript_chunk(buffers.user, sc.input_transcription.text)
             await _emit_partial(websocket, "user", buffers)
 
@@ -1007,7 +1014,14 @@ async def _handle_chunk(
             await _emit_partial(websocket, "roba", buffers)
 
         if getattr(sc, "generation_complete", False):
-            await _flush_transcript(websocket, "user", buffers)
+            # Do NOT flush the user turn here.  In half-cascade mode,
+            # input_transcription chunks can arrive AFTER generation_complete
+            # (especially on tool-call turns where the model fires this signal
+            # as soon as it emits the function-call, before STT is fully
+            # streamed).  Finalizing here would truncate the user bubble to
+            # whatever text had arrived so far ("do we" instead of the full
+            # utterance).  The user turn is finalized exclusively on
+            # turn_complete (or interrupted for barge-in).
             await _flush_transcript(websocket, "roba", buffers)
         if getattr(sc, "interrupted", False):
             await _flush_transcript(websocket, "roba", buffers)
@@ -1063,6 +1077,8 @@ async def _handle_chunk(
                     "result": result,
                 }
                 await _safe_send_json(websocket, applied_frame)
+                if fn_call.name in ("confirm_plan", "cancel_plan"):
+                    await _speak_confirmation(session, "done")
 
 
 async def _execute_tool(

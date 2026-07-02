@@ -549,20 +549,27 @@ class VoiceActions:
                 session.close()
 
             if delta is not None:
-                new_qty = max(0.0, current + delta)
-                from .signals import SignalType
-                self.bus.emit(
-                    SignalType.INVENTORY_RECEIPT_REPORTED,
+                if self.ledger is None:
+                    return {"error": "Ledger not available"}
+                self.ledger.apply_receipt(
                     {
                         "ingredient_id": ing_id,
                         "ingredient_ref": ing_name,
                         "qty": delta,
                         "unit": ing_unit,
                         "reason": reason,
-                    },
-                    source="voice",
-                    groups=["inventory"],
+                    }
                 )
+                # Re-read on_hand after the direct write so the return value is accurate.
+                session2 = self.db_session_factory()
+                try:
+                    from .models import InventoryLevel
+                    level2 = session2.query(InventoryLevel).filter(
+                        InventoryLevel.ingredient_id == ing_id
+                    ).first()
+                    new_qty = float(level2.on_hand_cached or 0.0) if level2 else max(0.0, current + delta)
+                finally:
+                    session2.close()
             else:
                 new_qty = float(set_to)
                 from .signals import SignalType
@@ -573,7 +580,7 @@ class VoiceActions:
                         "ingredient_ref": ing_name,
                         "qty": new_qty,
                         "unit": ing_unit,
-                        "reason": reason,
+                        "raw_text": f"set {ing_name} to {new_qty} {ing_unit}",
                     },
                     source="voice",
                     groups=["inventory"],

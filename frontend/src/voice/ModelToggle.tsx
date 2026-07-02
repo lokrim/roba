@@ -7,13 +7,18 @@
 
 const MODELS: Array<{ id: string; label: string; description: string }> = [
   {
+    id: "gemini-live-2.5-flash",
+    label: "Flash 2.5 Half-Cascade",
+    description: "Supports input transcription (Vertex AI Live)",
+  },
+  {
     id: "gemini-live-2.5-flash-native-audio",
     label: "Flash 2.5 Native Audio",
     description: "Natural voice, fast (Vertex AI Live)",
   },
 ];
 
-const DEFAULT_MODEL = "gemini-live-2.5-flash-native-audio";
+const DEFAULT_MODEL = "gemini-live-2.5-flash";
 
 interface ModelToggleProps {
   voiceModel: string | undefined;

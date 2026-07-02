@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { apiGet } from "../api";
-import type { MenuItem, SimState } from "../types";
+import type { MenuItem, SimState, MenuToggleEvent } from "../types";
+import { wsClient } from "../ws";
 
-// Public customer menu. Deliberately REST-only: it polls GET /api/menu at a low
-// cadence rather than opening the WebSocket, so this page never receives the
-// operator event firehose (see docs/06). It shows every item — active ones are
-// orderable, inactive ones are greyed out as "Sold out".
+// Public customer menu. Subscribes to the `menu_toggled` WS event for instant
+// active/sold-out updates, and also polls GET /api/menu at a slow cadence as a
+// safety net. Shows every item — active ones are orderable, inactive ones are
+// greyed out as "Sold out".
 
-const POLL_MS = 10000;
+const POLL_MS = 60_000;
 
 function prettifySeedId(id: string | null | undefined): string {
   if (!id) return "Our Menu";
@@ -50,6 +51,20 @@ export default function MenuPage() {
       cancelled = true;
       clearInterval(timer);
     };
+  }, []);
+
+  useEffect(() => {
+    const off = wsClient.on("menu_toggled", (p) => {
+      const { menu_item_id, action } = p as unknown as MenuToggleEvent;
+      setItems((prev) =>
+        prev.map((item) =>
+          item.id === menu_item_id
+            ? { ...item, active: action === "enable" ? 1 : 0 }
+            : item,
+        ),
+      );
+    });
+    return off;
   }, []);
 
   const grouped = useMemo(() => {

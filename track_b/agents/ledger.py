@@ -766,6 +766,16 @@ class InventoryLedger(BaseAgent):
             "unit": unit,
         }
 
+    # -- voice-driven receipt (called by VoiceActions) ---------------------
+
+    def apply_receipt(self, payload: Dict[str, Any]) -> None:
+        """Record a voice-reported stock receipt directly, bypassing the bus.
+
+        Delegates to ``_apply_reported_receipt`` which writes the lot + ledger
+        row and then calls ``recompute_availability`` to cascade menu state.
+        """
+        self._apply_reported_receipt(payload)
+
     # -- receipts (called by Procurement) ----------------------------------
 
     def receive(self, po_id: int) -> None:
@@ -908,6 +918,19 @@ class InventoryLedger(BaseAgent):
         finally:
             session.close()
         self.broadcast("inventory_updated", {"ingredient_id": ingredient_id, "on_hand": balance_after})
+        # Cascade: auto-enable dishes whose ingredients are now above threshold.
+        try:
+            from core.availability import recompute_availability
+            recompute_availability(
+                self.db_session_factory,
+                self.bus,
+                self.broadcast,
+                changed_ingredient_ids=[ingredient_id],
+                agent_name="ledger_receipt",
+            )
+        except Exception as _exc:
+            import logging
+            logging.getLogger(__name__).warning("availability cascade failed: %s", _exc)
         self.log_event(
             "receipt",
             f"Voice receipt recorded for {ingredient_ref or ingredient_id}; on-hand now {balance_after:.1f}.",
