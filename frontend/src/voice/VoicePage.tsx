@@ -70,9 +70,9 @@ export default function VoicePage() {
   };
 
   return (
-    <div className="min-h-screen bg-primary text-text">
+    <div className="h-screen flex flex-col overflow-hidden bg-primary text-text">
       {/* Top bar */}
-      <header className="flex items-center justify-between border-b border-muted bg-surface px-5 py-3">
+      <header className="shrink-0 flex items-center justify-between border-b border-muted bg-surface px-5 py-3">
         <div className="flex items-center gap-2">
           <Mic size={18} className="text-accent" />
           <span className="text-sm font-bold tracking-wide text-text">
@@ -103,7 +103,13 @@ export default function VoicePage() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-lg px-4 py-8">
+      <main className={
+        role === "cook"
+          /* Cook: full-width height-filling pane — CookVoice owns the internal layout */
+          ? "flex-1 min-h-0 w-full overflow-hidden px-4 py-4"
+          /* Manager + role chooser: centred narrow column, scrollable if it grows tall */
+          : "flex-1 min-h-0 mx-auto w-full max-w-lg overflow-y-auto px-4 py-8"
+      }>
         {/* Role chooser */}
         {!role && (
           <div className="flex flex-col gap-6">

@@ -97,6 +97,10 @@ const CONNECT_TIMEOUT_MS = 8_000;   // "connecting" → "unavailable"
 // Safety net only — normally cleared by the first audio byte ("speaking"),
 // the first roba transcript, a tool_result, or an error.
 const THINKING_TIMEOUT_MS = 30_000; // "thinking" → "ready" + error msg
+// Minimum mic hold duration to be treated as an intentional utterance.
+// Presses shorter than this with no audio captured are silently dropped back
+// to "ready" rather than spinning on "thinking" for 30 s.
+const MIN_UTTERANCE_MS = 500;
 
 const MIC_MODE_KEY = "roba.voice.micMode";
 const VOICE_MODEL_KEY = "roba.voice.model";
@@ -188,6 +192,9 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const cardDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const micModeRef = useRef<MicMode>(micMode);
   const voiceModelRef = useRef<string | undefined>(voiceModel);
+  // Timestamp of the most recent startListening() — used to detect sub-threshold
+  // accidental presses (empty utterance guardrail).
+  const listenStartRef = useRef<number>(0);
 
   // Keep refs in sync so callbacks close over the latest values.
   micModeRef.current = micMode;
@@ -366,17 +373,39 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     clearCardDismissTimer();
     setCardStatus("pending");
     setLastError(null);
+    listenStartRef.current = Date.now(); // stamp for empty-utterance guardrail
     setState("listening");
     await clientRef.current.startListening();
   }, []);
 
   const stopListening = useCallback(() => {
     if (!clientRef.current) return;
-    clientRef.current.stopListening();
     if (micModeRef.current === "ptt") {
-      // Push-to-talk: enter "thinking" and wait for Roba's response.
+      const elapsed = Date.now() - listenStartRef.current;
+
+      if (elapsed < MIN_UTTERANCE_MS) {
+        // Sub-threshold tap: abort — skip activity_end even if silent PCM chunks
+        // were already streamed (worklet sends chunks immediately, so <500 ms
+        // doesn't represent real speech). Server never starts a generation turn.
+        clientRef.current.stopListening({ abort: true });
+        clearThinkingTimer();
+        setState("ready");
+        return;
+      }
+
+      // Long enough press — check whether the client actually sent audio chunks
+      // (safety net for an immediately-toggled-off press in conversation mode).
+      const audioSent = clientRef.current.stopListening();
+      if (!audioSent) {
+        clearThinkingTimer();
+        setState("ready");
+        return;
+      }
+
+      // Real utterance — wait for Roba's response.
       setStateWithTimeout("thinking");
     } else {
+      clientRef.current.stopListening();
       // Conversation ended by the user — just return to ready.
       setState("ready");
     }

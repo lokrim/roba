@@ -248,8 +248,17 @@ export class RobaLiveClient {
     }
   }
 
-  stopListening(): void {
-    if (!this._listening) return;
+  /**
+   * Stop listening and tear down the mic graph.
+   *
+   * @param opts.abort  When true, skip sending `activity_end` even if audio was
+   *   captured — used for empty/accidental presses so the server never starts a
+   *   generation turn and the hook can return straight to "ready".
+   * @returns Whether at least one audio chunk was sent this press (useful for
+   *   the hook's empty-utterance guardrail).
+   */
+  stopListening(opts?: { abort?: boolean }): boolean {
+    if (!this._listening) return false;
     this._listening = false;
     // Increment session id so any in-flight startListening bails on its next check.
     this._micSession++;
@@ -260,6 +269,7 @@ export class RobaLiveClient {
     const micStream = this.micStream;
     const audioCtx = this.audioCtx;
     const audioSentThisTurn = this._audioSentThisTurn;
+    const abort = opts?.abort ?? false;
 
     // Clear instance fields immediately so the next startListening starts clean.
     this.micSource = null;
@@ -283,10 +293,12 @@ export class RobaLiveClient {
       audioCtx?.close();
 
       // In PTT mode, activity_end is the hard turn commit (VAD is disabled).
-      // Only send it if audio was actually captured this press.
+      // Only send it if audio was actually captured this press AND we're not
+      // aborting (empty/accidental press — server must not start a generation).
       // In conversation mode, Gemini's auto-VAD handles turn ends — we just
       // close the mic silently.
       if (
+        !abort &&
         this._micMode === "ptt" &&
         audioSentThisTurn &&
         this.ws?.readyState === WebSocket.OPEN
@@ -307,6 +319,10 @@ export class RobaLiveClient {
       // No worklet — nothing to flush, finalize immediately.
       finalize();
     }
+
+    // Return whether audio was sent this turn — lets the hook skip "thinking"
+    // for an accidental tap-and-immediate-release (sub-20ms, no chunks buffered).
+    return audioSentThisTurn;
   }
 
   // ---------------------------------------------------------------------------
