@@ -275,9 +275,37 @@ def recompute_availability(
         session.close()
 
     # ------------------------------------------------------------------
-    # 4. Broadcast and emit signals for items whose active state changed.
+    # 4. Cancel pending batches for items that just became disabled.
     # ------------------------------------------------------------------
     resolved_actions = [c for c in changes if c.get("reason_code") == "resolved"]
+    newly_disabled_ids = [c["menu_item_id"] for c in resolved_actions if c["action"] == "disable"]
+    if newly_disabled_ids:
+        try:
+            from .kitchen import cancel_pending_batches_for_items  # noqa: PLC0415
+            session2 = db_session_factory()
+            try:
+                cancelled = cancel_pending_batches_for_items(
+                    session2,
+                    newly_disabled_ids,
+                    now=float(bus.sim_time),
+                    reason="item auto-disabled (availability)",
+                )
+                session2.commit()
+            finally:
+                session2.close()
+            # Broadcast batch_decided for each cancelled batch so the cook panel refreshes
+            if broadcast_fn is not None and cancelled:
+                for bid in cancelled:
+                    try:
+                        broadcast_fn("batch_decided", {"batch_id": bid, "decision": "skip"})
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception as _ex:  # noqa: BLE001
+            logger.warning("cancel_pending_batches_for_items failed: %s", _ex)
+
+    # ------------------------------------------------------------------
+    # 5. Broadcast and emit signals for items whose active state changed.
+    # ------------------------------------------------------------------
     for change in resolved_actions:
         item_id = change["menu_item_id"]
         action = change["action"]

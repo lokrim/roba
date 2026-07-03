@@ -127,13 +127,20 @@ class VoiceActions:
                 if dish and dish.lower() not in name.lower():
                     continue
                 from . import kitchen as _k
-                state = _k._derive_state(b)
+                state = _k._derive_state(b.decision, b.status, b.cooked_at)
+                # Only run ingredient check for uncooked cook batches
+                if b.decision == "cook" and b.cooked_at is None:
+                    ing_block = _k.batch_ingredient_block(session, int(b.menu_item_id or 0))
+                else:
+                    ing_block = None
                 rows.append({
                     "id": int(b.id),
                     "menu_item": name,
                     "decision": b.decision,
                     "status": b.status,
                     "state": state,
+                    "feasible": ing_block is None,
+                    "blocked_reason": ing_block,
                     "planned_qty": int(b.planned_qty or 0),
                     "actual_made_qty": float(b.actual_made_qty) if b.actual_made_qty is not None else None,
                     "serve_window": b.serve_window,
@@ -856,6 +863,11 @@ class VoiceActions:
 
         Resolves range → [start, end] in sim-seconds, runs forecast_interval
         synchronously, and returns the full breakdown dict.
+
+        When item_name is provided the result is fully scoped to that one dish:
+          • total_qty, by_day, by_daypart are computed for that dish only.
+          • A top-level 'item' key provides a concise summary with disabled_reason
+            so the voice agent can report latent demand for 86'd dishes.
         """
         if self.forecaster is None:
             return {"error": "Forecaster not available"}
@@ -870,7 +882,6 @@ class VoiceActions:
         try:
             if range_key == "daypart":
                 from track_a.agents.forecaster import DAYPART_SECONDS  # noqa: PLC0415
-                from core import config as _cfg  # noqa: PLC0415
                 dp = daypart or "dinner"
                 if dp not in DAYPART_SECONDS:
                     return {"error": f"Unknown daypart: {dp!r}. Valid: {list(DAYPART_SECONDS)}"}
@@ -899,6 +910,52 @@ class VoiceActions:
                 fs = day_idx * _SECONDS_PER_DAY + 8 * 3600
                 fe = day_idx * _SECONDS_PER_DAY + 23 * 3600
 
+            # --- Resolve the requested dish (incl. inactive) before running ---
+            resolved_item = None
+            disabled_reason: Optional[str] = None
+            include_ids: Optional[list] = None
+            if item_name:
+                from .models import MenuItem, MenuToggle  # noqa: PLC0415
+                from .kitchen import _resolve_menu_item  # noqa: PLC0415
+                _session = self.db_session_factory()
+                try:
+                    resolved_item = _resolve_menu_item(_session, item_name)
+                    if resolved_item is None:
+                        return {
+                            "error": f"No dish found matching '{item_name}'",
+                            "need": "which dish?",
+                        }
+                    include_ids = [resolved_item.id]
+                    if not resolved_item.active:
+                        # Look up the disable reason from MenuToggle
+                        block = (
+                            _session.query(MenuToggle)
+                            .filter(
+                                MenuToggle.menu_item_id == resolved_item.id,
+                                MenuToggle.action == "disable",
+                                MenuToggle.active == 1,
+                            )
+                            .order_by(MenuToggle.sim_time.desc())
+                            .first()
+                        )
+                        _reason_labels = {
+                            "out_of_stock": "out of stock",
+                            "station_unstaffed": "station unstaffed",
+                            "manual": "manually disabled",
+                        }
+                        if block:
+                            code = block.reason_code or "manual"
+                            disabled_reason = _reason_labels.get(code, code)
+                        else:
+                            disabled_reason = "item disabled"
+                    # Capture values before session closes
+                    _item_id = int(resolved_item.id)
+                    _item_name = str(resolved_item.name or "")
+                    _item_active = bool(resolved_item.active)
+                    _item_price = float(resolved_item.dine_in_price or 0)
+                finally:
+                    _session.close()
+
             result = self.forecaster.forecast_interval(
                 fs,
                 fe,
@@ -907,9 +964,63 @@ class VoiceActions:
                 requested_by="voice",
                 granularity="auto",
                 persist=True,
+                include_item_ids=include_ids,
             )
 
-            if item_name:
+            if resolved_item is not None:
+                # Scope the whole payload to the requested dish only
+                needle_id = _item_id
+                item_rows = [it for it in result.get("items", []) if it.get("menu_item_id") == needle_id]
+                item_total_qty = sum(it.get("qty", 0) for it in item_rows)
+
+                # Scope by_day to this dish and recompute day totals
+                scoped_by_day = []
+                for day in result.get("by_day", []):
+                    day_items = [di for di in day.get("items", []) if di.get("menu_item_id") == needle_id]
+                    day_qty = sum(di.get("qty", 0) for di in day_items)
+                    day_baseline = sum(di.get("baseline", 0) for di in day_items)
+                    scoped_by_day.append({
+                        "day_index": day["day_index"],
+                        "start": day["start"],
+                        "end": day["end"],
+                        "qty": day_qty,
+                        "baseline": round(day_baseline, 2),
+                    })
+
+                # Recompute by_daypart from items breakdown (not directly available per item per daypart;
+                # use the ratio: item share of day × original daypart totals approximation).
+                # Simpler and correct: distribute item_total_qty proportionally across original by_daypart.
+                original_by_daypart = result.get("by_daypart", {})
+                original_total = result.get("total_qty", 1) or 1
+                scoped_by_daypart = {
+                    dp: {
+                        "qty": round(item_total_qty * v["qty"] / original_total) if original_total else 0,
+                        "baseline": round(item_total_qty * v["baseline"] / original_total, 2) if original_total else 0,
+                    }
+                    for dp, v in original_by_daypart.items()
+                }
+
+                result = dict(
+                    result,
+                    items=item_rows,
+                    total_qty=item_total_qty,
+                    by_day=scoped_by_day,
+                    by_daypart=scoped_by_daypart,
+                    # Concise top-level summary for the voice agent
+                    item={
+                        "menu_item_id": _item_id,
+                        "name": _item_name,
+                        "active": _item_active,
+                        "disabled_reason": disabled_reason,
+                        "total_qty": item_total_qty,
+                        "price": _item_price,
+                        "revenue_estimate": round(item_total_qty * _item_price, 2),
+                        "per_day": scoped_by_day,
+                        "per_daypart": scoped_by_daypart,
+                    },
+                )
+            elif item_name:
+                # item_name provided but resolve failed (shouldn't reach here, but guard anyway)
                 needle = item_name.strip().lower()
                 filtered = [
                     it for it in result.get("items", [])
@@ -993,14 +1104,35 @@ class VoiceActions:
         return self._stage_or_apply("confirm", _apply, human_readable=f"Request call to {target} ({purpose}).")
 
     def consult_reasoner(self, question: str, context: Optional[str] = None) -> Dict[str, Any]:
-        """Consult the background reasoning model for complex decisions."""
-        from . import reasoner
-        # Inject slim operational context if none provided.
-        if not context:
-            try:
-                context = f"Sim time: {self.bus.sim_time:.0f}s"
-            except Exception:  # noqa: BLE001
-                pass
+        """Consult the background reasoning model for complex decisions.
+
+        Always enriches the context with a live operational snapshot (per-dish
+        forecasts, revenue, staff coverage, sole-cover flags) so the reasoner
+        can quantify impact questions like 'how much will we lose if Marco is on leave?'
+        """
+        from . import reasoner  # noqa: PLC0415
+        # Build operational snapshot and append to whatever context the caller provided.
+        try:
+            from .ops_snapshot import build_ops_snapshot  # noqa: PLC0415
+            import json as _json  # noqa: PLC0415
+            snapshot = build_ops_snapshot(
+                self.db_session_factory,
+                self.forecaster,
+                bus=self.bus,
+            )
+            snapshot_text = _json.dumps(snapshot, indent=2, default=str)
+            context_parts = []
+            if context:
+                context_parts.append(context)
+            context_parts.append(f"OPERATIONAL SNAPSHOT:\n{snapshot_text}")
+            context = "\n\n".join(context_parts)
+        except Exception as _snap_ex:  # noqa: BLE001
+            logger.warning("ops_snapshot failed, proceeding without: %s", _snap_ex)
+            if not context:
+                try:
+                    context = f"Sim time: {self.bus.sim_time:.0f}s"
+                except Exception:  # noqa: BLE001
+                    pass
         return reasoner.consult(question, context)
 
     # -----------------------------------------------------------------------

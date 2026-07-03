@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypedDi
 from core import config
 from core.agent_base import BaseAgent
 from core.clock import DAY_CLOSE_OFFSET, DAY_OPEN_OFFSET, SECONDS_PER_DAY
+from core.kitchen import batch_ingredient_block
 from core.llm import CANNED_NOTE
 from core.models import (
     Batch,
@@ -584,6 +585,14 @@ class DemandForecaster(BaseAgent):
                 f_qty = int(round(float(forecast.forecast_qty if forecast is not None else 0.0)))
                 reasons: List[str] = []
                 available = not self._is_blocked_for_batch(item.id, definition.station_id, live, reasons)
+                # Ingredient on-hand check — block batches when required stock is depleted
+                if available:
+                    ing_block = batch_ingredient_block(session, item.id)
+                    if ing_block:
+                        available = False
+                        reasons.append(ing_block)
+                else:
+                    ing_block = None
                 should_cook = f_qty >= int(definition.batch_size_min or 0) and available
                 planned = self._round_batch_qty(f_qty, definition) if should_cook else 0
                 decision = "cook" if should_cook else "skip"
@@ -962,6 +971,7 @@ class DemandForecaster(BaseAgent):
         persist: bool = True,
         requested_by: str = "system",
         source: str = "system",
+        include_item_ids: Optional[Iterable[int]] = None,
     ) -> Dict[str, Any]:
         """Forecast demand for any interval [start, end) in sim-seconds.
 
@@ -1010,14 +1020,26 @@ class DemandForecaster(BaseAgent):
             else:
                 granularity = "custom"
 
+        # Normalise include_item_ids so we can use it in a filter
+        _extra_ids: List[int] = list(include_item_ids) if include_item_ids is not None else []
+
         session = self.db_session_factory()
         try:
-            items = (
-                session.query(MenuItem)
-                .filter(MenuItem.active == 1)
-                .order_by(MenuItem.id.asc())
-                .all()
-            )
+            from sqlalchemy import or_ as _or  # noqa: PLC0415
+            if _extra_ids:
+                items = (
+                    session.query(MenuItem)
+                    .filter(_or(MenuItem.active == 1, MenuItem.id.in_(_extra_ids)))
+                    .order_by(MenuItem.id.asc())
+                    .all()
+                )
+            else:
+                items = (
+                    session.query(MenuItem)
+                    .filter(MenuItem.active == 1)
+                    .order_by(MenuItem.id.asc())
+                    .all()
+                )
             item_ids = [item.id for item in items]
             item_map = {item.id: item for item in items}
             matrix = self._history_matrix(session, item_ids)
@@ -1051,6 +1073,7 @@ class DemandForecaster(BaseAgent):
                     item_totals[item.id] = {
                         "menu_item_id": item.id,
                         "name": item.name,
+                        "active": bool(item.active),
                         "qty": 0.0,
                         "baseline": 0.0,
                         "confidence_sum": 0.0,
@@ -1111,6 +1134,7 @@ class DemandForecaster(BaseAgent):
             items_out.append({
                 "menu_item_id": item_id,
                 "name": agg["name"],
+                "active": agg.get("active", True),
                 "qty": round(agg["qty"]),
                 "baseline": round(agg["baseline"], 2),
                 "confidence": round(avg_confidence, 3),

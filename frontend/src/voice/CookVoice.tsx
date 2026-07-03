@@ -28,6 +28,8 @@ interface BoardBatch {
   decision: string;
   status: string;
   state: "cooked" | "ready_to_cook" | "awaiting_approval" | "skipped";
+  feasible: boolean;
+  blocked_reason: string | null;
   planned_qty: number | null;
   actual_made_qty: number | null;
   cook_by: number | null;
@@ -88,7 +90,8 @@ function BatchCard({
   const pill = STATE_PILL[batch.state] ?? { label: batch.state, cls: "bg-muted/40 text-text/50" };
   const isCancelled = batch.state === "skipped";
   const isCooked = batch.state === "cooked";
-  const canCheck = !isCooked && !isCancelled;
+  const isBlocked = !isCooked && !isCancelled && batch.feasible === false;
+  const canCheck = !isCooked && !isCancelled && !isBlocked;
 
   return (
     <div
@@ -96,7 +99,9 @@ function BatchCard({
         "rounded-xl border p-4 shadow-sm transition-opacity",
         isCancelled
           ? "border-muted/30 bg-surface/30 opacity-60"
-          : "border-muted/50 bg-surface",
+          : isBlocked
+            ? "border-warning/30 bg-warning/5 opacity-80"
+            : "border-muted/50 bg-surface",
       ].join(" ")}
     >
       {/* Header row: dish name + state pill */}
@@ -109,9 +114,16 @@ function BatchCard({
         >
           {batch.dish}
         </h3>
-        <span className={`shrink-0 rounded-full px-2.5 py-0.5 text-xs font-semibold ${pill.cls}`}>
-          {pill.label}
-        </span>
+        <div className="flex flex-col items-end gap-1">
+          <span className={`shrink-0 rounded-full px-2.5 py-0.5 text-xs font-semibold ${pill.cls}`}>
+            {pill.label}
+          </span>
+          {isBlocked && (
+            <span className="shrink-0 rounded-full bg-warning/20 px-2 py-0.5 text-xs font-medium text-warning">
+              blocked: {batch.blocked_reason ?? "ingredient unavailable"}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Time-to-prep row */}

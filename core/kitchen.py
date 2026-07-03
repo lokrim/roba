@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 import re
-from typing import Any
+from typing import Any, List, Optional
 
 from . import models
 
@@ -62,6 +62,97 @@ def _recipe_instructions(session: Any, menu_item_id: int) -> list:
     ]
 
 
+def batch_ingredient_block(session, menu_item_id: int) -> Optional[str]:
+    """Return a short reason string if any required ingredient is out of stock, else None.
+
+    Checks non-optional RecipeLine ingredients for this dish against
+    InventoryLevel.on_hand_cached.  Returns e.g. "out of: Tomato, Mozzarella" or None.
+    """
+    recipe = (
+        session.query(models.Recipe)
+        .filter(models.Recipe.menu_item_id == menu_item_id)
+        .first()
+    )
+    if recipe is None:
+        return None  # no recipe → can't block
+
+    lines = (
+        session.query(models.RecipeLine)
+        .filter(
+            models.RecipeLine.recipe_id == recipe.id,
+            models.RecipeLine.optional == 0,  # only required lines
+        )
+        .all()
+    )
+    ing_ids = [rl.ingredient_id for rl in lines if rl.ingredient_id]
+    if not ing_ids:
+        return None
+
+    ings = session.query(models.Ingredient).filter(models.Ingredient.id.in_(ing_ids)).all()
+    ing_names = {i.id: i.name for i in ings}
+
+    inv_rows = (
+        session.query(models.InventoryLevel)
+        .filter(models.InventoryLevel.ingredient_id.in_(ing_ids))
+        .all()
+    )
+    on_hand: dict[int, float] = {r.ingredient_id: float(r.on_hand_cached or 0) for r in inv_rows}
+
+    missing = [
+        ing_names.get(iid, f"ingredient #{iid}")
+        for iid in ing_ids
+        if on_hand.get(iid, 0) <= 0
+    ]
+    if not missing:
+        return None
+    return "out of: " + ", ".join(missing)
+
+
+def cancel_pending_batches_for_items(
+    session,
+    item_ids: List[int],
+    now: float,
+    reason: str = "ingredient unavailable",
+) -> List[int]:
+    """Cancel all pending cook batches for the given menu item IDs.
+
+    Sets decision='skip', planned_qty=0 for batches that are:
+      - menu_item_id in item_ids
+      - decision == 'cook'
+      - status in ('decided', 'approved')
+      - cooked_at is None
+      - serve_window end > now (not yet past)
+
+    Returns list of cancelled batch IDs.
+    """
+    if not item_ids:
+        return []
+
+    cancelled: List[int] = []
+    batches = (
+        session.query(models.Batch)
+        .filter(
+            models.Batch.menu_item_id.in_(item_ids),
+            models.Batch.decision == "cook",
+            models.Batch.status.in_(["decided", "approved"]),
+            models.Batch.cooked_at.is_(None),
+        )
+        .all()
+    )
+    for b in batches:
+        # Check that the serve window hasn't already ended
+        try:
+            sw = json.loads(b.serve_window) if isinstance(b.serve_window, str) else (b.serve_window or {})
+            if float(sw.get("end", 0)) <= now:
+                continue  # already past — leave as-is
+        except Exception:  # noqa: BLE001
+            pass
+        b.decision = "skip"
+        b.planned_qty = 0.0
+        cancelled.append(int(b.id))
+    return cancelled
+
+
 def batch_board(session, *, now: float, window_sim_s: float | None = None, limit: int = 40) -> dict:
     """Return a full board snapshot: counts + batch list with dish names resolved.
 
@@ -73,12 +164,14 @@ def batch_board(session, *, now: float, window_sim_s: float | None = None, limit
         query = query.filter(models.Batch.decided_at >= now - window_sim_s)
     batches = query.order_by(models.Batch.decided_at.desc()).limit(limit).all()
 
-    # Batch-load menu item names to avoid N+1
+    # Batch-load menu item names + active flag to avoid N+1
     item_ids = {b.menu_item_id for b in batches if b.menu_item_id}
     names: dict[int, str] = {}
+    item_active: dict[int, bool] = {}
     if item_ids:
         items = session.query(models.MenuItem).filter(models.MenuItem.id.in_(item_ids)).all()
         names = {mi.id: mi.name for mi in items}
+        item_active = {mi.id: bool(mi.active) for mi in items}
 
     # Batch-load BatchDefinitions to avoid N+1
     def_ids = {b.batch_definition_id for b in batches if b.batch_definition_id}
@@ -87,8 +180,9 @@ def batch_board(session, *, now: float, window_sim_s: float | None = None, limit
         defs = session.query(models.BatchDefinition).filter(models.BatchDefinition.id.in_(def_ids)).all()
         definitions = {d.id: d for d in defs}
 
-    # Cache recipe instructions per menu_item_id (built once per unique item)
+    # Cache recipe instructions and ingredient-block results per menu_item_id
     instructions_cache: dict[int, list] = {}
+    ingredient_block_cache: dict[int, Optional[str]] = {}
 
     rows = []
     counts = {"cooked": 0, "approved": 0, "pending": 0, "skipped": 0}
@@ -120,6 +214,21 @@ def batch_board(session, *, now: float, window_sim_s: float | None = None, limit
             instructions_cache[mid] = _recipe_instructions(session, mid)
         instructions = instructions_cache.get(mid, [])
 
+        # Feasibility: cook batches that haven't been cooked yet need ingredient check
+        feasible = True
+        blocked_reason: Optional[str] = None
+        if decision == "cook" and b.cooked_at is None and mid is not None:
+            if not item_active.get(mid, True):
+                feasible = False
+                blocked_reason = "item disabled"
+            else:
+                if mid not in ingredient_block_cache:
+                    ingredient_block_cache[mid] = batch_ingredient_block(session, mid)
+                ing_block = ingredient_block_cache[mid]
+                if ing_block:
+                    feasible = False
+                    blocked_reason = ing_block
+
         rows.append({
             "id": b.id,
             "menu_item_id": b.menu_item_id,
@@ -128,6 +237,8 @@ def batch_board(session, *, now: float, window_sim_s: float | None = None, limit
             "decision": decision,
             "status": status,
             "state": state,
+            "feasible": feasible,
+            "blocked_reason": blocked_reason,
             "planned_qty": b.planned_qty,
             "actual_made_qty": b.actual_made_qty,
             "sold_qty": b.sold_qty,
@@ -146,9 +257,11 @@ def batch_board(session, *, now: float, window_sim_s: float | None = None, limit
         if state == "cooked":
             counts["cooked"] += 1
         elif state == "ready_to_cook":
-            counts["approved"] += 1
+            if feasible:
+                counts["approved"] += 1
         elif state == "awaiting_approval":
-            counts["pending"] += 1
+            if feasible:
+                counts["pending"] += 1
         elif state == "skipped":
             counts["skipped"] += 1
 

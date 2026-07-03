@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from . import models
 from .clock import DAY_CLOSE_OFFSET, DAY_OPEN_OFFSET, SECONDS_PER_DAY
+from .kitchen import batch_ingredient_block
 
 
 def _round_qty(qty: float, defn: models.BatchDefinition) -> int:
@@ -134,6 +135,9 @@ def seed_day_schedule(
             # Gracefully skip if the column exists and is False
             if hasattr(item, "is_batchable") and not item.is_batchable:
                 continue
+        # Skip seeding cook batches for dishes whose required ingredients are out of stock
+        if batch_ingredient_block(session, defn.menu_item_id):
+            continue
 
         cadence_s = float(defn.default_cadence_min or 120) * 60
         prep_s = float(defn.prep_lead_time_min or 20) * 60

@@ -561,6 +561,15 @@ User: "How many margheritas do we expect at dinner tomorrow?"
 User: "Show me today's full demand forecast."
 → forecast_demand(range="day")
 → "Today's forecast: 312 total portions across all dayparts." [ForecastCard shown]
+
+User: "What's the Margherita Pizza forecast for the week?" [even if the dish is currently 86'd]
+→ forecast_demand(range="week", item_name="Margherita Pizza")
+→ [if result.item.active is false] "Margherita Pizza is currently 86'd (tomato stockout). If reinstated, we'd expect about 84 portions this week — roughly €756 in potential revenue."
+→ [if result.item.active is true] "Margherita Pizza: ~84 portions expected this week, about €756 revenue." [ForecastCard shown]
+
+User: "How much will we lose if Marco is on leave this week?"
+→ consult_reasoner(question="How much revenue will we lose this week if Marco is on leave?", context="Need revenue-at-risk from Marco's sole-covered dishes based on current forecasts.")
+→ "Marco solely covers the Pizza station. At ~84 Margherita portions forecast this week (€9 each), that's roughly €756 at risk. Recommend covering his station or calling in a substitute."
 """
 
 _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
