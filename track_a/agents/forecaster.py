@@ -101,6 +101,8 @@ class DemandForecaster(BaseAgent):
         self.llm_auto_mode = bool(config.LLM_FORECAST_AUTO_MODE)
         self.forecast_job_enqueue: Optional[Callable[[str, str], Any]] = None
         self.subscribe(["forecasting"])
+        # Track which sim-day the batch advisor last ran to ensure once-per-day.
+        self._last_batch_suggestion_day: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Wiring
@@ -445,6 +447,10 @@ class DemandForecaster(BaseAgent):
             trigger_reason,
             optimize=bool(optimize if optimize_batches is None else optimize_batches),
         )
+        # Start-of-day batch advisor: fires once per sim-day when auto-mode is on
+        # and the current time is within the first 35 sim-minutes of day open.
+        if self.llm_auto_mode:
+            self._maybe_suggest_day_batches()
         return rows
 
     def optimize_forecast(self, trigger_reason: str = "manual") -> List[Forecast]:
@@ -695,6 +701,209 @@ class DemandForecaster(BaseAgent):
                         pass
 
         return rows
+
+    # ------------------------------------------------------------------
+    # Start-of-day batch advisor (Gemini 2.5 Pro via core.reasoner)
+    # ------------------------------------------------------------------
+
+    def _maybe_suggest_day_batches(self) -> None:
+        """Fire suggest_day_batches once per sim-day, within the first 35 min of day open.
+
+        Safe to call on every forecast run — the day-tracking guard prevents
+        duplicate runs.
+        """
+        now = float(self.bus.sim_time)
+        tod = now % SECONDS_PER_DAY
+        day_num = int(now // SECONDS_PER_DAY)
+        # Only within the first 35 sim-minutes of the operating day (08:00–08:35)
+        if not (DAY_OPEN_OFFSET <= tod <= DAY_OPEN_OFFSET + 2100):
+            return
+        if self._last_batch_suggestion_day == day_num:
+            return  # already ran today
+        try:
+            self.suggest_day_batches()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def suggest_day_batches(self, force: bool = False) -> Dict[str, Any]:
+        """Run the start-of-day batch advisor (Gemini 2.5 Pro).
+
+        Analyses today's scheduled batches and demand forecasts and proposes:
+        - ``add_batch``: a missing batch for a demand spike window
+        - ``retime``: move a batch earlier/later to match demand
+        - ``requantify``: adjust planned quantity up or down
+
+        ``add_batch`` and ``retime`` always create an ApprovalRequest for the
+        manager with full reasoning. ``requantify`` auto-applies if
+        ``batch_auto_qty`` is enabled in SimSettings, otherwise also routes to
+        approval.
+
+        Args:
+            force: When True, bypasses the once-per-day guard (for dev/testing).
+
+        Returns:
+            Dict with ``proposals``, ``schedule_assessment``, ``routed``, ``source``.
+        """
+        from core.reasoner import suggest_batch_changes
+
+        now = float(self.bus.sim_time)
+        day_num = int(now // SECONDS_PER_DAY)
+
+        if not force:
+            if self._last_batch_suggestion_day == day_num:
+                return {"proposals": [], "schedule_assessment": "Already ran today.", "routed": [], "source": "skip"}
+
+        self._last_batch_suggestion_day = day_num
+
+        session = self.db_session_factory()
+        try:
+            # Build context for the reasoner
+            day_open = day_num * SECONDS_PER_DAY + DAY_OPEN_OFFSET
+            day_close = day_num * SECONDS_PER_DAY + DAY_CLOSE_OFFSET
+
+            # Today's batch schedule
+            from core.kitchen import batch_board as _board
+            board = _board(session, now=now, window_sim_s=float(day_close - day_open + 3600), limit=80)
+
+            # Latest forecasts
+            forecasts = (
+                session.query(Forecast)
+                .order_by(Forecast.generated_at.desc())
+                .limit(30)
+                .all()
+            )
+            forecast_data = [self._forecast_to_dict(f) for f in forecasts]
+
+            # BatchDefinitions with menu item names
+            definitions = session.query(BatchDefinition).order_by(BatchDefinition.id.asc()).all()
+            def_data = []
+            for d in definitions:
+                item = session.get(MenuItem, d.menu_item_id)
+                def_data.append({
+                    **self._batch_definition_to_dict(d),
+                    "dish_name": item.name if item else f"Item #{d.menu_item_id}",
+                    "dine_in_price": float(item.dine_in_price or 0) if item else 0,
+                })
+
+            # SimSettings for batch_auto_qty flag
+            from core.models import SimSettings as _SimSettings
+            ss = session.get(_SimSettings, 1)
+            batch_auto_qty = bool(ss.batch_auto_qty) if ss and hasattr(ss, "batch_auto_qty") else False
+
+        finally:
+            session.close()
+
+        context = {
+            "sim_time": now,
+            "sim_day": day_num,
+            "today_schedule": board["batches"],
+            "counts": board["counts"],
+            "forecasts": forecast_data,
+            "batch_definitions": def_data,
+        }
+
+        result = suggest_batch_changes(context, timeout_s=45.0)
+        proposals = result.get("proposals") or []
+        routed: List[Dict[str, Any]] = []
+
+        for proposal in proposals:
+            ptype = str(proposal.get("type") or "")
+            item_id = int(proposal.get("menu_item_id") or 0)
+            dish = str(proposal.get("dish_name") or f"Item #{item_id}")
+            target_qty = int(proposal.get("target_qty") or 0)
+            target_window = float(proposal.get("target_window_start") or now)
+            forecast_demand = float(proposal.get("forecast_demand") or 0)
+            benefit = str(proposal.get("projected_benefit_description") or "")
+            reasoning = str(proposal.get("reasoning") or "")
+
+            if ptype == "requantify" and batch_auto_qty:
+                # Auto-apply: update the nearest upcoming approved batch for this item
+                try:
+                    session2 = self.db_session_factory()
+                    try:
+                        target_batch = (
+                            session2.query(Batch)
+                            .filter(
+                                Batch.menu_item_id == item_id,
+                                Batch.decision == "cook",
+                                Batch.status.in_(("approved", "decided")),
+                                Batch.cooked_at.is_(None),
+                            )
+                            .order_by(Batch.decided_at.asc())
+                            .first()
+                        )
+                        if target_batch:
+                            old_qty = float(target_batch.planned_qty or 0)
+                            target_batch.planned_qty = float(target_qty)
+                            session2.commit()
+                            self.bus.emit(
+                                "BATCH_DECISION",
+                                {
+                                    "batch_id": target_batch.id,
+                                    "menu_item_id": item_id,
+                                    "decision": "cook",
+                                    "qty": target_qty,
+                                    "by": "agent_auto_qty",
+                                    "reason": reasoning,
+                                },
+                                source="batch_advisor",
+                            )
+                            if self.ws_broadcast:
+                                self.ws_broadcast("batch_qty_adjusted", {
+                                    "batch_id": target_batch.id,
+                                    "dish": dish,
+                                    "old_qty": old_qty,
+                                    "new_qty": target_qty,
+                                    "reason": reasoning,
+                                })
+                            routed.append({"proposal": proposal, "action": "auto_applied"})
+                    finally:
+                        session2.close()
+                except Exception:  # noqa: BLE001
+                    # Fall back to approval
+                    ptype = "requantify_fallback"
+
+            if ptype != "requantify" or not batch_auto_qty:
+                # Route to manager approval
+                if self.approvals is not None:
+                    try:
+                        self.approvals.create(
+                            type="batch",
+                            title=f"Batch suggestion: {ptype.replace('_', ' ').title()} — {dish}",
+                            summary=(
+                                f"{reasoning} "
+                                f"Forecast demand: {forecast_demand:.0f} portions. {benefit}"
+                            ),
+                            payload={
+                                "proposal_type": ptype,
+                                "menu_item_id": item_id,
+                                "dish_name": dish,
+                                "target_window_start": target_window,
+                                "target_qty": target_qty,
+                                "forecast_demand": forecast_demand,
+                                "projected_benefit": benefit,
+                                "reasoning": reasoning,
+                            },
+                            urgency="normal",
+                        )
+                        routed.append({"proposal": proposal, "action": "approval_created"})
+                    except Exception:  # noqa: BLE001
+                        routed.append({"proposal": proposal, "action": "approval_error"})
+                else:
+                    routed.append({"proposal": proposal, "action": "no_approval_hub"})
+
+        self.log_event(
+            "batch_advisor",
+            f"Batch advisor ran: {len(proposals)} proposal(s), {len(routed)} routed",
+            {"proposals": len(proposals), "routed": routed, "assessment": result.get("schedule_assessment")},
+        )
+
+        return {
+            "proposals": proposals,
+            "schedule_assessment": result.get("schedule_assessment", ""),
+            "routed": routed,
+            "source": result.get("source", "unknown"),
+        }
 
     def generate_suggestions(self) -> Dict[str, Any]:
         result = {"suggestions": [], "summary": "no_change"}

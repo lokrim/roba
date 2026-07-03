@@ -191,6 +191,7 @@ def _ensure_settings_singleton(session: Any) -> models.SimSettings:
             channel_mix=dict(config.CHANNEL_MIX),
             anomaly_injections=None,
             availability_oos_mode=config.AVAILABILITY_OOS_MODE,
+            batch_auto_qty=0,
         )
         session.add(settings)
         try:
@@ -209,6 +210,7 @@ def _migrate_schema() -> None:
     migrations = [
         ("sim_settings", "availability_oos_mode", "ALTER TABLE sim_settings ADD COLUMN availability_oos_mode TEXT DEFAULT 'threshold'"),
         ("menu_toggles", "reason_code", "ALTER TABLE menu_toggles ADD COLUMN reason_code TEXT"),
+        ("sim_settings", "batch_auto_qty", "ALTER TABLE sim_settings ADD COLUMN batch_auto_qty INTEGER DEFAULT 0"),
     ]
     with db.engine.connect() as conn:
         for table, column, ddl in migrations:
@@ -516,6 +518,7 @@ class PosBody(BaseModel):
     daypart_curve: Optional[Dict[str, Any]] = None
     anomaly_injections: Optional[List[Dict[str, Any]]] = None
     availability_oos_mode: Optional[str] = None  # "threshold" | "zero"
+    batch_auto_qty: Optional[bool] = None  # forecaster adjusts batch quantities without manager approval
 
     @field_validator("availability_oos_mode")
     @classmethod
@@ -1753,7 +1756,14 @@ def kitchen_batches(
     """Return cook-facing batch queue: decided/approved 'cook' batches."""
     query = db_session.query(models.Batch).filter(models.Batch.decision == "cook")
     if status:
-        query = query.filter(models.Batch.status == status)
+        # Accept comma-separated status values (e.g. "approved,decided")
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        if len(statuses) == 1:
+            query = query.filter(models.Batch.status == statuses[0])
+        elif statuses:
+            query = query.filter(models.Batch.status.in_(statuses))
+        else:
+            query = query.filter(models.Batch.status.in_(("decided", "approved")))
     else:
         query = query.filter(models.Batch.status.in_(("decided", "approved")))
     batches = query.order_by(models.Batch.decided_at.desc()).limit(20).all()
@@ -1842,6 +1852,50 @@ def kitchen_waste(body: KitchenWasteBody) -> Dict[str, Any]:
         target_agents=["forecaster", "ledger"],
     )
     return {"waste_event_id": we_id, "status": "recorded"}
+
+
+# ---------------------------------------------------------------------------
+# Dev / demo helpers — batch schedule seeding and suggestion trigger
+# ---------------------------------------------------------------------------
+
+@app.post("/api/dev/seed-batches")
+def dev_seed_batches() -> Dict[str, Any]:
+    """Seed a full-day batch schedule from the current BatchDefinitions.
+
+    Idempotent: clears today's batch rows first, then regenerates them.
+    Useful to populate the cook's Batches panel immediately without waiting
+    for the forecaster's daypart gate to open.
+    """
+    from .batch_schedule import seed_day_schedule
+    now = float(ctx.clock.sim_time)
+    session = db.new_session()
+    try:
+        created = seed_day_schedule(session, now=now, clear=True)
+        session.commit()
+        count = len(created)
+    finally:
+        session.close()
+
+    ctx.hub.broadcast("batches_seeded", {"count": count, "sim_time": now})
+    return {"seeded": count, "sim_time": now}
+
+
+@app.post("/api/dev/suggest-batches")
+async def dev_suggest_batches() -> Dict[str, Any]:
+    """Manually trigger the start-of-day batch advisor (Gemini 2.5 Pro).
+
+    Useful for testing without waiting for the daily clock boundary.
+    Only runs if the forecaster agent is registered.
+    """
+    forecaster = ctx.track_a.get("forecaster") if ctx.track_a else None
+    if forecaster is None:
+        raise HTTPException(status_code=503, detail="Forecaster agent not available")
+    try:
+        import asyncio
+        result = await asyncio.to_thread(forecaster.suggest_day_batches, force=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return result
 
 
 @app.post("/api/calls/{call_id}/turn")

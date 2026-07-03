@@ -14,6 +14,23 @@ import type { ApprovalRequest } from "../types";
 // Approval inbox item
 // ---------------------------------------------------------------------------
 
+// Batch suggestion payload shape from the advisor
+interface BatchProposalPayload {
+  proposal_type?: string;
+  dish_name?: string;
+  target_window_start?: number;
+  target_qty?: number;
+  forecast_demand?: number;
+  projected_benefit?: string;
+  reasoning?: string;
+}
+
+function fmtSimClock(secs: number): string {
+  const h = Math.floor(secs / 3600) % 24;
+  const m = Math.floor((secs % 3600) / 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
 function ApprovalItem({
   approval,
   onResolve,
@@ -22,35 +39,99 @@ function ApprovalItem({
   onResolve: (id: number, decision: "approve" | "reject") => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  const isBatch = approval.type === "batch";
+  const payload = isBatch ? (approval.payload as BatchProposalPayload | null) : null;
+
   return (
-    <div className="flex items-start gap-3 rounded-lg border border-muted/60 bg-surface p-3">
-      <div className="flex-1 min-w-0">
-        <span className="inline-block rounded bg-muted px-1.5 py-0.5 text-xs font-medium uppercase tracking-wide text-text/50">
-          {approval.type.replace(/_/g, " ")}
-        </span>
-        <p className="mt-0.5 text-sm font-medium text-text truncate">{approval.title}</p>
-        {approval.summary && (
-          <p className="text-xs text-text/60 mt-0.5 line-clamp-2">{approval.summary}</p>
-        )}
+    <div className="rounded-lg border border-muted/60 bg-surface p-3 space-y-2">
+      <div className="flex items-start gap-3">
+        <div className="flex-1 min-w-0">
+          <span className="inline-block rounded bg-muted px-1.5 py-0.5 text-xs font-medium uppercase tracking-wide text-text/50">
+            {approval.type.replace(/_/g, " ")}
+          </span>
+          <p className="mt-0.5 text-sm font-medium text-text">{approval.title}</p>
+          {approval.summary && (
+            <p className="text-xs text-text/60 mt-0.5 line-clamp-2">{approval.summary}</p>
+          )}
+        </div>
+        <div className="flex shrink-0 flex-col gap-1.5 items-end">
+          <div className="flex gap-1.5">
+            <button
+              disabled={busy}
+              onClick={() => { setBusy(true); onResolve(approval.id, "approve"); }}
+              className="rounded-md bg-success/20 px-2 py-1 text-xs font-medium text-success hover:bg-success/30 disabled:opacity-40"
+            >
+              <CheckCircle2 size={12} className="inline mr-0.5" />
+              Approve
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => { setBusy(true); onResolve(approval.id, "reject"); }}
+              className="rounded-md bg-danger/20 px-2 py-1 text-xs font-medium text-danger hover:bg-danger/30 disabled:opacity-40"
+            >
+              <XCircle size={12} className="inline mr-0.5" />
+              Reject
+            </button>
+          </div>
+          {isBatch && payload && (
+            <button
+              onClick={() => setExpanded(v => !v)}
+              className="text-xs text-text/40 hover:text-text/70"
+            >
+              {expanded ? "Hide detail ▲" : "See reasoning ▼"}
+            </button>
+          )}
+        </div>
       </div>
-      <div className="flex shrink-0 gap-1.5">
-        <button
-          disabled={busy}
-          onClick={() => { setBusy(true); onResolve(approval.id, "approve"); }}
-          className="rounded-md bg-success/20 px-2 py-1 text-xs font-medium text-success hover:bg-success/30 disabled:opacity-40"
-        >
-          <CheckCircle2 size={12} className="inline mr-0.5" />
-          Approve
-        </button>
-        <button
-          disabled={busy}
-          onClick={() => { setBusy(true); onResolve(approval.id, "reject"); }}
-          className="rounded-md bg-danger/20 px-2 py-1 text-xs font-medium text-danger hover:bg-danger/30 disabled:opacity-40"
-        >
-          <XCircle size={12} className="inline mr-0.5" />
-          Reject
-        </button>
-      </div>
+
+      {/* Batch suggestion detail panel */}
+      {isBatch && payload && expanded && (
+        <div className="border-t border-muted/30 pt-2 space-y-1.5 text-xs">
+          {payload.proposal_type && (
+            <div className="flex gap-2">
+              <span className="text-text/40 w-28 shrink-0">Type</span>
+              <span className="text-text font-medium capitalize">{payload.proposal_type.replace(/_/g, " ")}</span>
+            </div>
+          )}
+          {payload.dish_name && (
+            <div className="flex gap-2">
+              <span className="text-text/40 w-28 shrink-0">Dish</span>
+              <span className="text-text font-medium">{payload.dish_name}</span>
+            </div>
+          )}
+          {payload.target_window_start != null && (
+            <div className="flex gap-2">
+              <span className="text-text/40 w-28 shrink-0">Target window</span>
+              <span className="text-text">{fmtSimClock(payload.target_window_start)}</span>
+            </div>
+          )}
+          {payload.target_qty != null && (
+            <div className="flex gap-2">
+              <span className="text-text/40 w-28 shrink-0">Suggested qty</span>
+              <span className="text-text">{payload.target_qty} portions</span>
+            </div>
+          )}
+          {payload.forecast_demand != null && (
+            <div className="flex gap-2">
+              <span className="text-text/40 w-28 shrink-0">Forecast demand</span>
+              <span className="text-text">{payload.forecast_demand.toFixed(1)} portions</span>
+            </div>
+          )}
+          {payload.projected_benefit && (
+            <div className="flex gap-2">
+              <span className="text-text/40 w-28 shrink-0">Benefit</span>
+              <span className="text-accent">{payload.projected_benefit}</span>
+            </div>
+          )}
+          {payload.reasoning && (
+            <div className="mt-1 rounded bg-muted/30 p-2 text-text/70 leading-relaxed">
+              {payload.reasoning}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

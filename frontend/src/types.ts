@@ -38,6 +38,7 @@ export type ApprovalType =
   | "promo"
   | "outbound_call"
   | "forecast_override_proposal"
+  | "batch"
   | "other";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";

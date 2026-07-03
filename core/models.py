@@ -978,6 +978,7 @@ class SimSettings(Base):
     channel_mix = mapped_column(JSON)
     anomaly_injections = mapped_column(JSON)
     availability_oos_mode = mapped_column(String, default="threshold")  # "threshold" | "zero"
+    batch_auto_qty = mapped_column(Integer, default=0)  # bool 0/1 — forecaster may adjust batch quantities without approval
 
     def __repr__(self):
         return (f"<SimSettings id={self.id} base_orders_per_day={self.base_orders_per_day} "

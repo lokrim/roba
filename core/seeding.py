@@ -636,6 +636,28 @@ class Seeder:
         finally:
             session.close()
 
+        # After all rows are committed, seed a full-day batch schedule so the
+        # cook's Batches panel has content immediately without waiting for the
+        # forecaster's daypart gate.
+        self._seed_batch_schedule()
+
+    def _seed_batch_schedule(self) -> None:
+        """Materialise today's batch schedule from the loaded BatchDefinitions."""
+        try:
+            from .batch_schedule import seed_day_schedule
+            from .clock import DAY_OPEN_OFFSET
+            session = self.db_session_factory()
+            try:
+                state = session.get(SimState, 1)
+                now = float(state.sim_time) if state and state.sim_time is not None else float(DAY_OPEN_OFFSET)
+                seed_day_schedule(session, now=now, clear=True)
+                session.commit()
+            finally:
+                session.close()
+        except Exception:  # noqa: BLE001
+            # Non-fatal: batch schedule seeding is a demo convenience
+            pass
+
     @staticmethod
     def _coerce_row(model: Any, row: Dict[str, Any]) -> Dict[str, Any]:
         """Keep only keys that are real columns on ``model`` (ignore extras)."""

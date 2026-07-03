@@ -26,8 +26,48 @@ def _sim_to_clock(sim_time: float) -> str:
     return f"Day {day}, {h:02d}:{m:02d}"
 
 
+def _recipe_instructions(session: Any, menu_item_id: int) -> list:
+    """Return ordered recipe lines as instruction steps for the Detail view.
+
+    Each step: {"ingredient": name, "qty": float, "unit": str, "optional": bool}.
+    """
+    recipe = (
+        session.query(models.Recipe)
+        .filter(models.Recipe.menu_item_id == menu_item_id)
+        .first()
+    )
+    if recipe is None:
+        return []
+
+    lines = (
+        session.query(models.RecipeLine)
+        .filter(models.RecipeLine.recipe_id == recipe.id)
+        .order_by(models.RecipeLine.id.asc())
+        .all()
+    )
+    ing_ids = {rl.ingredient_id for rl in lines if rl.ingredient_id}
+    ing_names: dict[int, str] = {}
+    if ing_ids:
+        ings = session.query(models.Ingredient).filter(models.Ingredient.id.in_(ing_ids)).all()
+        ing_names = {i.id: i.name for i in ings}
+
+    return [
+        {
+            "ingredient": ing_names.get(rl.ingredient_id, f"Ingredient #{rl.ingredient_id}"),
+            "qty": float(rl.qty or 0),
+            "unit": str(rl.unit or ""),
+            "optional": bool(rl.optional),
+        }
+        for rl in lines
+    ]
+
+
 def batch_board(session, *, now: float, window_sim_s: float | None = None, limit: int = 40) -> dict:
-    """Return a full board snapshot: counts + batch list with dish names resolved."""
+    """Return a full board snapshot: counts + batch list with dish names resolved.
+
+    Each batch row now includes ``prep_lead_time_min``, ``required_skill``,
+    ``station_id``, and ``instructions`` (recipe lines) for the cook's Detail view.
+    """
     query = session.query(models.Batch)
     if window_sim_s is not None:
         query = query.filter(models.Batch.decided_at >= now - window_sim_s)
@@ -40,6 +80,16 @@ def batch_board(session, *, now: float, window_sim_s: float | None = None, limit
         items = session.query(models.MenuItem).filter(models.MenuItem.id.in_(item_ids)).all()
         names = {mi.id: mi.name for mi in items}
 
+    # Batch-load BatchDefinitions to avoid N+1
+    def_ids = {b.batch_definition_id for b in batches if b.batch_definition_id}
+    definitions: dict[int, Any] = {}
+    if def_ids:
+        defs = session.query(models.BatchDefinition).filter(models.BatchDefinition.id.in_(def_ids)).all()
+        definitions = {d.id: d for d in defs}
+
+    # Cache recipe instructions per menu_item_id (built once per unique item)
+    instructions_cache: dict[int, list] = {}
+
     rows = []
     counts = {"cooked": 0, "approved": 0, "pending": 0, "skipped": 0}
     for b in batches:
@@ -49,16 +99,31 @@ def batch_board(session, *, now: float, window_sim_s: float | None = None, limit
 
         # serve_window is stored as JSON {"start":..., "end":...}
         cook_by = None
+        serve_end = None
         if b.serve_window:
             try:
                 sw = json.loads(b.serve_window) if isinstance(b.serve_window, str) else b.serve_window
                 cook_by = sw.get("start")
+                serve_end = sw.get("end")
             except Exception:
                 pass
+
+        # BatchDefinition metadata
+        defn = definitions.get(b.batch_definition_id) if b.batch_definition_id else None
+        prep_lead_time_min = float(defn.prep_lead_time_min) if defn and defn.prep_lead_time_min else None
+        required_skill = str(defn.required_skill) if defn and defn.required_skill else None
+        station_id = int(defn.station_id) if defn and defn.station_id else None
+
+        # Recipe instructions (cached per item)
+        mid = b.menu_item_id
+        if mid is not None and mid not in instructions_cache:
+            instructions_cache[mid] = _recipe_instructions(session, mid)
+        instructions = instructions_cache.get(mid, [])
 
         rows.append({
             "id": b.id,
             "menu_item_id": b.menu_item_id,
+            "batch_definition_id": b.batch_definition_id,
             "dish": names.get(b.menu_item_id, f"Item #{b.menu_item_id}"),
             "decision": decision,
             "status": status,
@@ -70,7 +135,12 @@ def batch_board(session, *, now: float, window_sim_s: float | None = None, limit
             "decided_at": b.decided_at,
             "cooked_at": b.cooked_at,
             "cook_by": cook_by,
+            "serve_end": serve_end,
             "approval_id": b.approval_id,
+            "prep_lead_time_min": prep_lead_time_min,
+            "required_skill": required_skill,
+            "station_id": station_id,
+            "instructions": instructions,
         })
 
         if state == "cooked":

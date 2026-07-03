@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { RefreshCw, Zap, TrendingUp } from "lucide-react";
-import { apiGet, apiPost } from "../../api";
+import { apiGet, apiPatch, apiPost } from "../../api";
 import { SectionHeading } from "./shared";
 import { ForecastCard } from "../../voice/ForecastCard";
 import type { IntervalForecastResult, HorizonForecast } from "../../track_a/types";
@@ -174,6 +174,18 @@ export function ForecastControls() {
   const [finBusy, setFinBusy] = useState(false);
   const [autoMode, setAutoMode] = useState<boolean | null>(null);
   const [autoMuteBusy, setAutoModeBusy] = useState(false);
+  const [batchAutoQty, setBatchAutoQty] = useState<boolean>(false);
+  const [batchQtyBusy, setBatchQtyBusy] = useState(false);
+  const [seedBusy, setSeedBusy] = useState(false);
+
+  // Load current batch_auto_qty setting on mount
+  useEffect(() => {
+    apiGet<{ batch_auto_qty?: number | boolean }>("/api/sim/pos")
+      .then((d) => {
+        if (d?.batch_auto_qty != null) setBatchAutoQty(Boolean(d.batch_auto_qty));
+      })
+      .catch(() => {});
+  }, []);
 
   async function runForecast() {
     setRunBusy(true);
@@ -194,6 +206,21 @@ export function ForecastControls() {
       await apiPost("/api/track-a/forecast/auto-mode", { enabled: next });
       setAutoMode(next);
     } catch { /* ignore */ } finally { setAutoModeBusy(false); }
+  }
+
+  async function toggleBatchAutoQty() {
+    const next = !batchAutoQty;
+    setBatchQtyBusy(true);
+    try {
+      await apiPatch("/api/sim/pos", { batch_auto_qty: next });
+      setBatchAutoQty(next);
+    } catch { /* ignore */ } finally { setBatchQtyBusy(false); }
+  }
+
+  async function seedBatches() {
+    setSeedBusy(true);
+    try { await apiPost("/api/dev/seed-batches"); }
+    catch { /* ignore */ } finally { setSeedBusy(false); }
   }
 
   return (
@@ -224,7 +251,7 @@ export function ForecastControls() {
       <div className="rounded-lg border border-muted bg-surface p-4">
         <p className="mb-1 text-sm font-medium text-text">Auto-mode</p>
         <p className="mb-3 text-xs text-text/50">
-          When enabled, the forecaster runs on every signal (weather, competitor intel, reviews, etc.) in addition to the interval timer.
+          When enabled, the forecaster runs on every signal (weather, competitor intel, reviews, etc.) in addition to the interval timer. The start-of-day batch advisor also activates.
         </p>
         <button
           type="button" onClick={() => void toggleAutoMode()} disabled={autoMuteBusy}
@@ -232,6 +259,34 @@ export function ForecastControls() {
             (autoMode ? "bg-success/20 text-success hover:bg-success/30" : "bg-muted text-text hover:bg-muted/70")}
         >
           {autoMuteBusy ? "…" : autoMode ? "Auto-mode ON — click to disable" : "Auto-mode OFF — click to enable"}
+        </button>
+      </div>
+
+      <div className="rounded-lg border border-muted bg-surface p-4">
+        <p className="mb-1 text-sm font-medium text-text">Batch quantities</p>
+        <p className="mb-3 text-xs text-text/50">
+          When enabled, the forecaster's start-of-day advisor can adjust batch quantities automatically without requiring manager approval. Structural changes (add / retime) always require approval.
+        </p>
+        <button
+          type="button" onClick={() => void toggleBatchAutoQty()} disabled={batchQtyBusy}
+          className={"rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50 " +
+            (batchAutoQty ? "bg-success/20 text-success hover:bg-success/30" : "bg-muted text-text hover:bg-muted/70")}
+        >
+          {batchQtyBusy ? "…" : batchAutoQty ? "Auto qty ON — click to require approval" : "Auto qty OFF — click to enable"}
+        </button>
+      </div>
+
+      <div className="rounded-lg border border-muted bg-surface p-4">
+        <p className="mb-1 text-sm font-medium text-text">Seed batch schedule</p>
+        <p className="mb-3 text-xs text-text/50">
+          Regenerate today's full batch schedule from the loaded batch definitions. Useful after a preset change or to reset the cook panel.
+        </p>
+        <button
+          type="button" onClick={() => void seedBatches()} disabled={seedBusy}
+          className="flex items-center gap-1 rounded-md bg-muted px-3 py-1.5 text-sm font-medium text-text hover:bg-muted/70 disabled:opacity-50"
+        >
+          <RefreshCw size={14} className={seedBusy ? "animate-spin" : undefined} />
+          {seedBusy ? "Seeding…" : "Seed batches"}
         </button>
       </div>
       </div>
