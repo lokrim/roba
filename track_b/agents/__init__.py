@@ -91,6 +91,12 @@ def register(
     )
     orchestrator.register(
         "interval",
+        optimizer.refresh_dynamic_pars,
+        interval_sim_s=config.DYNAMIC_PAR_INTERVAL_SIM_S,
+        name="optimizer_dynamic_par_refresh",
+    )
+    orchestrator.register(
+        "interval",
         market.review_prices,
         interval_sim_s=config.WEATHER_FETCH_SIM_S,
         name="market_price_review",

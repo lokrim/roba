@@ -135,6 +135,51 @@ _TOOLS: list[dict[str, Any]] = [
                 },
             },
             {
+                "name": "forecast_demand",
+                "description": (
+                    "Generate an on-demand interval demand forecast for any time range and show "
+                    "results in a card. Use this when the user asks about future demand beyond the "
+                    "current daypart — e.g. 'what will next week look like?', 'how many portions "
+                    "tomorrow?', 'forecast dinner tomorrow', 'show me the weekly outlook'. "
+                    "Returns per-item quantities, day-by-day breakdown, and daypart totals. "
+                    "range='daypart' forecasts a single daypart (specify daypart+day_offset). "
+                    "range='day' or 'today' forecasts a full day. "
+                    "range='week' forecasts the next 7 days. "
+                    "range='custom' requires explicit start/end offsets in seconds from now."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "range": {
+                            "type": "string",
+                            "enum": ["daypart", "day", "today", "week", "custom"],
+                            "description": "Time range to forecast.",
+                        },
+                        "daypart": {
+                            "type": "string",
+                            "enum": ["breakfast", "lunch", "afternoon", "dinner", "late"],
+                            "description": "Daypart (required when range='daypart').",
+                        },
+                        "day_offset": {
+                            "type": "integer",
+                            "description": "0=today, 1=tomorrow, 2=day after, etc. Default 0.",
+                        },
+                        "start": {
+                            "type": "number",
+                            "description": "Seconds from now (range='custom' only).",
+                        },
+                        "end": {
+                            "type": "number",
+                            "description": "Seconds from now (range='custom' only).",
+                        },
+                        "item_name": {
+                            "type": "string",
+                            "description": "Optional: filter results to one menu item.",
+                        },
+                    },
+                },
+            },
+            {
                 "name": "get_batches",
                 "description": (
                     "Look up production batches. Use to answer: 'what batches are scheduled', "
@@ -504,6 +549,18 @@ User: "What are the tomato prices from all our suppliers?"
 User: "What dish is the most hated right now?"
 → get_reviews(sort="most_hated")
 → "Based on recent reviews, Caesar Salad has the lowest ratings — customers say it was soggy and small."
+
+User: "What will next week look like?"
+→ forecast_demand(range="week")
+→ "Here's the 7-day forecast — total 2,340 portions expected. Dinner is the busiest period each day." [ForecastCard shown]
+
+User: "How many margheritas do we expect at dinner tomorrow?"
+→ forecast_demand(range="daypart", daypart="dinner", day_offset=1, item_name="Margherita Pizza")
+→ "Tomorrow dinner forecast for Margherita Pizza: 48 portions expected." [ForecastCard shown]
+
+User: "Show me today's full demand forecast."
+→ forecast_demand(range="day")
+→ "Today's forecast: 312 total portions across all dayparts." [ForecastCard shown]
 """
 
 _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
@@ -551,6 +608,7 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "• Disable/enable dish → disable_menu_item / enable_menu_item (supports category= or name_contains= for bulk)\n"
         "• Staff sick/leave → set_staff_attendance(staff_name_or_role=..., status=...)\n"
         "• Adjust stock → adjust_inventory(ingredient_name=..., set_to=... or delta=...)\n"
+        "• Interval forecast → forecast_demand(range=week|day|daypart|custom, daypart=..., day_offset=..., item_name=...)\n"
         "• Trigger agents → run_forecast / run_inventory_optimizer / run_competitor_scan / process_reviews\n"
         "• Outbound call → request_outbound_call (always requires approval)\n"
         "• Complex trade-off → consult_reasoner(question=..., context=...)\n\n"
@@ -1118,6 +1176,20 @@ async def _execute_tool(
             return await asyncio.to_thread(
                 voice_processor.query_forecast, args.get("item_name") or None
             )
+
+        if name == "forecast_demand":
+            if va:
+                day_offset = args.get("day_offset")
+                return await asyncio.to_thread(
+                    va.forecast_demand,
+                    range=args.get("range") or "day",
+                    daypart=args.get("daypart") or None,
+                    day_offset=int(day_offset) if day_offset is not None else 0,
+                    start=args.get("start") or None,
+                    end=args.get("end") or None,
+                    item_name=args.get("item_name") or None,
+                )
+            return {"error": "forecast_demand requires voice_actions"}
 
         if name == "get_batches":
             if va:

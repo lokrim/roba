@@ -812,6 +812,47 @@ class ForecastJob(Base):
                 f"kind={self.kind!r} status={self.status!r}>")
 
 
+class HorizonForecast(Base):
+    """Header row for an on-demand interval forecast (day / week / custom)."""
+    __tablename__ = "horizon_forecasts"
+
+    id = _pk()
+    label = mapped_column(String, nullable=True)        # human-readable e.g. "week 2026-07-03"
+    start = mapped_column(Float)                        # sim-seconds (inclusive)
+    end = mapped_column(Float)                          # sim-seconds (exclusive)
+    granularity = mapped_column(String)                 # daypart | day | week | custom
+    generated_at = mapped_column(Float)
+    trigger_reason = mapped_column(String, nullable=True)
+    source = mapped_column(String, nullable=True)       # voice | dashboard | horizon_emit | ...
+    requested_by = mapped_column(String, nullable=True)
+    total_qty = mapped_column(Float, nullable=True)
+    breakdown = mapped_column(JSON, nullable=True)      # per-day / per-daypart aggregates
+
+    def __repr__(self):
+        return (f"<HorizonForecast id={self.id} granularity={self.granularity!r} "
+                f"total_qty={self.total_qty}>")
+
+
+class HorizonForecastLine(Base):
+    """One cell (item × daypart × day) in a HorizonForecast."""
+    __tablename__ = "horizon_forecast_lines"
+
+    id = _pk()
+    horizon_id = mapped_column(ForeignKey("horizon_forecasts.id"), index=True)
+    menu_item_id = mapped_column(ForeignKey("menu_items.id"))
+    daypart = mapped_column(String)
+    day_index = mapped_column(Integer)                  # 0 = today, 1 = tomorrow, …
+    window = mapped_column(JSON)                        # {start, end} in sim-seconds
+    qty = mapped_column(Float)                          # transient-aware
+    baseline = mapped_column(Float)                     # robust median (transient-free)
+    confidence = mapped_column(Float, nullable=True)
+
+    def __repr__(self):
+        return (f"<HorizonForecastLine id={self.id} horizon_id={self.horizon_id} "
+                f"menu_item_id={self.menu_item_id} daypart={self.daypart!r} "
+                f"day_index={self.day_index} qty={self.qty}>")
+
+
 class Promotion(Base):
     __tablename__ = "promotions"
 
@@ -1014,7 +1055,8 @@ INTELLIGENCE_MODELS = [
     DemandForecasterMemory, Signal, SignalDelivery, CompetitorIntel, CompetitorObservation,
     CompetitorMenuSnapshot, CompetitorProbeResult, Review, ReviewInsight,
     SupplierPriceHistory, Negotiation,
-    ApprovalRequest, ForecastJob, Promotion, UserFact, LLMCallLog, WeatherLog, Call,
+    ApprovalRequest, ForecastJob, HorizonForecast, HorizonForecastLine,
+    Promotion, UserFact, LLMCallLog, WeatherLog, Call,
 ]
 
 CONTROL_MODELS = [

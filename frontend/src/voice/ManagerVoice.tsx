@@ -3,6 +3,7 @@ import { CheckCircle2, XCircle, Bell, Send, RefreshCw, Check, X } from "lucide-r
 import { useVoiceLive } from "./useVoiceLive";
 import { MicButton } from "./MicButton";
 import { PlanConfirmCard } from "./PlanConfirmCard";
+import { ForecastCard } from "./ForecastCard";
 import { ModeToggle } from "./ModeToggle";
 import { MicModeToggle } from "./MicModeToggle";
 import { ModelToggle } from "./ModelToggle";
@@ -215,6 +216,11 @@ export function ManagerVoice() {
           </div>
           {live.lastStatus.summary != null && <p className="text-sm text-text">{String(live.lastStatus.summary)}</p>}
         </div>
+      )}
+
+      {/* Interval forecast card (voice: forecast_demand tool result) */}
+      {live.lastForecast && (
+        <ForecastCard forecast={live.lastForecast} onDismiss={live.clearForecast} />
       )}
 
       {/* Approvals inbox */}

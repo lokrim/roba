@@ -62,6 +62,8 @@ class SignalType(str, Enum):
     OPERATIONAL_BRIEFING = "OPERATIONAL_BRIEFING"
     # Cook-reported batch progress (Stream B3): actual qty cooked, waste, status.
     BATCH_PROGRESS = "BATCH_PROGRESS"
+    # Multi-day demand horizon from the forecaster (for procurement sizing).
+    DEMAND_FORECAST_HORIZON = "DEMAND_FORECAST_HORIZON"
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +246,11 @@ SIGNAL_REGISTRY: Dict[SignalType, Dict[str, Any]] = {
         "groups": ["kitchen", "forecasting", "inventory", "human", "frontend"],
         "priority": 3,
         "default_ttl_sim_s": 14400.0,          # 4h
+    },
+    SignalType.DEMAND_FORECAST_HORIZON: {
+        "groups": ["inventory", "procurement", "forecasting", "human"],
+        "priority": 2,
+        "default_ttl_sim_s": 172800.0,         # 2 sim-days — survives between daily emits
     },
 }
 
@@ -575,6 +582,33 @@ class BatchProgressPayload(BaseModel):
     source: str = "cook"                        # cook | system
 
 
+class HorizonDayItem(BaseModel):
+    menu_item_id: int
+    qty: float        # transient-aware (includes event/competitor multipliers)
+    baseline: float   # robust median baseline (transient-free, for par sizing)
+
+
+class HorizonDay(BaseModel):
+    day_index: int
+    start: float   # sim-seconds
+    end: float
+    items: List[HorizonDayItem] = []
+
+
+class DemandForecastHorizonPayload(BaseModel):
+    """7-day rolling demand horizon emitted by the forecaster.
+
+    Each day carries per-item qty (transient-aware) and baseline (median,
+    transient-free).  Consumers use qty for immediate order sizing and
+    baseline for steady-state par recomputation.
+    """
+    horizon_days: int                                   # number of days covered
+    generated_at: float
+    days: List[HorizonDay] = []
+    # per item_id: median daily demand across the horizon (transient-free)
+    item_daily_baseline_median: Dict[str, float] = {}  # key = str(menu_item_id)
+
+
 # Convenience map: SignalType -> its payload model.
 SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.DEMAND_FORECAST: DemandForecastPayload,
@@ -612,4 +646,5 @@ SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.COMPETITOR_NOTE: CompetitorNotePayload,
     SignalType.OPERATIONAL_BRIEFING: OperationalBriefingPayload,
     SignalType.BATCH_PROGRESS: BatchProgressPayload,
+    SignalType.DEMAND_FORECAST_HORIZON: DemandForecastHorizonPayload,
 }

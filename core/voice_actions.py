@@ -843,6 +843,84 @@ class VoiceActions:
             human_readable=f"Mark {names} as {status}.",
         )
 
+    def forecast_demand(
+        self,
+        range: Optional[str] = None,          # "daypart" | "day" | "week" | "custom"
+        daypart: Optional[str] = None,         # e.g. "dinner" — used when range="daypart"
+        day_offset: int = 0,                   # 0=today, 1=tomorrow, …
+        start: Optional[float] = None,         # absolute sim-second offset (range="custom")
+        end: Optional[float] = None,
+        item_name: Optional[str] = None,       # filter to a single menu item
+    ) -> Dict[str, Any]:
+        """Generate an on-demand interval forecast and return structured results.
+
+        Resolves range → [start, end] in sim-seconds, runs forecast_interval
+        synchronously, and returns the full breakdown dict.
+        """
+        if self.forecaster is None:
+            return {"error": "Forecaster not available"}
+
+        now = float(self.bus.sim_time)
+        _SECONDS_PER_DAY = 86400.0
+
+        # Resolve day-offset base
+        day_base = now + day_offset * _SECONDS_PER_DAY
+
+        range_key = (range or "day").lower()
+        try:
+            if range_key == "daypart":
+                from track_a.agents.forecaster import DAYPART_SECONDS  # noqa: PLC0415
+                from core import config as _cfg  # noqa: PLC0415
+                dp = daypart or "dinner"
+                if dp not in DAYPART_SECONDS:
+                    return {"error": f"Unknown daypart: {dp!r}. Valid: {list(DAYPART_SECONDS)}"}
+                import math as _math  # noqa: PLC0415
+                day_idx = _math.floor(day_base / _SECONDS_PER_DAY)
+                dp_start_s, dp_end_s, _ = DAYPART_SECONDS[dp]
+                fs = day_idx * _SECONDS_PER_DAY + dp_start_s
+                fe = day_idx * _SECONDS_PER_DAY + dp_end_s
+            elif range_key in ("day", "today"):
+                import math as _math  # noqa: PLC0415
+                day_idx = _math.floor(day_base / _SECONDS_PER_DAY)
+                fs = day_idx * _SECONDS_PER_DAY + 8 * 3600   # 08:00 open
+                fe = day_idx * _SECONDS_PER_DAY + 23 * 3600  # 23:00 close
+            elif range_key == "week":
+                fs = now
+                fe = now + 7 * _SECONDS_PER_DAY
+            elif range_key == "custom":
+                if start is None or end is None:
+                    return {"error": "range='custom' requires explicit start and end offsets (in seconds from now)"}
+                fs = now + float(start)
+                fe = now + float(end)
+            else:
+                # Fallback to a full day
+                import math as _math  # noqa: PLC0415
+                day_idx = _math.floor(day_base / _SECONDS_PER_DAY)
+                fs = day_idx * _SECONDS_PER_DAY + 8 * 3600
+                fe = day_idx * _SECONDS_PER_DAY + 23 * 3600
+
+            result = self.forecaster.forecast_interval(
+                fs,
+                fe,
+                trigger_reason="voice",
+                source="voice",
+                requested_by="voice",
+                granularity="auto",
+                persist=True,
+            )
+
+            if item_name:
+                needle = item_name.strip().lower()
+                filtered = [
+                    it for it in result.get("items", [])
+                    if needle in str(it.get("name", "")).lower()
+                ]
+                result = dict(result, items=filtered)
+
+            return result
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e), "status": "error"}
+
     def run_forecast(self) -> Dict[str, Any]:
         """Trigger the demand forecaster."""
         if self.forecast_jobs is None:

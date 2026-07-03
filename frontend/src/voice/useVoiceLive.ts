@@ -22,6 +22,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { RobaLiveClient } from "./RobaLiveClient";
 import type { PlanResult, Clarification } from "./RobaLiveClient";
+import type { IntervalForecastResult } from "../track_a/types";
 
 export type VoiceState =
   | "idle"         // not connected
@@ -69,6 +70,9 @@ export interface VoiceLiveHook {
   // Tool results
   lastStatus: Record<string, unknown> | null;
   clearStatus: () => void;
+  // Interval forecast card
+  lastForecast: IntervalForecastResult | null;
+  clearForecast: () => void;
   // Last applied action (auto-mode done card)
   lastApplied: { summary: string; tool: string } | null;
   clearLastApplied: () => void;
@@ -173,6 +177,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const [clarification, setClarification] = useState<Clarification | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastStatus, setLastStatus] = useState<Record<string, unknown> | null>(null);
+  const [lastForecast, setLastForecast] = useState<IntervalForecastResult | null>(null);
   const [lastApplied, setLastApplied] = useState<{ summary: string; tool: string } | null>(null);
   const [cardStatus, setCardStatus] = useState<"pending" | "done" | "cancelled">("pending");
   const [rawFrames, setRawFrames] = useState<RawFrame[]>([]);
@@ -297,6 +302,9 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           clearThinkingTimer();
           if (ev.tool === "get_kitchen_status" && ev.result) {
             setLastStatus(ev.result as Record<string, unknown>);
+          }
+          if (ev.tool === "forecast_demand" && ev.result) {
+            setLastForecast(ev.result as IntervalForecastResult);
           }
           break;
         case "speaking":
@@ -423,6 +431,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const clearTranscript = useCallback(() => setTranscript([]), []);
   const clearStatus = useCallback(() => setLastStatus(null), []);
   const clearLastApplied = useCallback(() => setLastApplied(null), []);
+  const clearForecast = useCallback(() => setLastForecast(null), []);
   const clearRawFrames = useCallback(() => setRawFrames([]), []);
 
   const setDone = useCallback((summary: string) => {
@@ -444,6 +453,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     clearTranscript,
     lastStatus,
     clearStatus,
+    lastForecast,
+    clearForecast,
     lastApplied,
     clearLastApplied,
     setDone,

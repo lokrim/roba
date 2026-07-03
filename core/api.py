@@ -1328,6 +1328,12 @@ def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
             models.ForecastJob.created_at.desc(),
             20,
         ),
+        "horizon_forecasts": _read_rows(
+            db_session,
+            models.HorizonForecast,
+            models.HorizonForecast.generated_at.desc(),
+            20,
+        ),
         "forecast_reasoning": _read_rows(
             db_session,
             models.EventLog,
@@ -1401,6 +1407,57 @@ def track_a_finalize_forecast() -> Dict[str, Any]:
 @app.post("/api/track-a/forecast/optimize")
 def track_a_optimize_forecast() -> Dict[str, Any]:
     return track_a_finalize_forecast()
+
+
+@app.post("/api/track-a/forecast/horizon")
+def track_a_forecast_horizon(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate an on-demand interval (day/week/custom) forecast synchronously."""
+    forecaster = _track_a_agent("forecaster")
+    _sync_bus_to_clock()
+    now = float(ctx.bus.sim_time)
+    _SECONDS_PER_DAY = 86400.0
+
+    range_key = str(body.get("range") or "week").lower()
+    day_offset = int(body.get("day_offset") or 0)
+    day_base = now + day_offset * _SECONDS_PER_DAY
+
+    import math as _math  # noqa: PLC0415
+    if range_key == "week":
+        fs = now
+        fe = now + 7 * _SECONDS_PER_DAY
+    elif range_key in ("day", "today"):
+        day_idx = _math.floor(day_base / _SECONDS_PER_DAY)
+        fs = day_idx * _SECONDS_PER_DAY + 8 * 3600
+        fe = day_idx * _SECONDS_PER_DAY + 23 * 3600
+    elif range_key == "custom":
+        fs = float(body.get("start") or now)
+        fe = float(body.get("end") or now + _SECONDS_PER_DAY)
+    else:
+        fs = float(body.get("start") or now)
+        fe = float(body.get("end") or now + 7 * _SECONDS_PER_DAY)
+
+    result = forecaster.forecast_interval(
+        fs,
+        fe,
+        trigger_reason=str(body.get("trigger_reason") or "dashboard"),
+        granularity=str(body.get("granularity") or "auto"),
+        persist=True,
+        requested_by=str(body.get("requested_by") or "dashboard"),
+        source="dashboard",
+    )
+    return result
+
+
+@app.get("/api/track-a/forecast/horizons")
+def track_a_list_horizons(limit: int = 20, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """List recent HorizonForecast headers."""
+    rows = _read_rows(
+        db_session,
+        models.HorizonForecast,
+        models.HorizonForecast.generated_at.desc(),
+        limit,
+    )
+    return {"horizons": rows, "count": len(rows)}
 
 
 @app.post("/api/track-a/forecast/auto-mode")

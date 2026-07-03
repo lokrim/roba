@@ -1,7 +1,9 @@
-import { useState } from "react";
-import { RefreshCw, Zap } from "lucide-react";
-import { apiPost } from "../../api";
+import { useState, useEffect } from "react";
+import { RefreshCw, Zap, TrendingUp } from "lucide-react";
+import { apiGet, apiPost } from "../../api";
 import { SectionHeading } from "./shared";
+import { ForecastCard } from "../../voice/ForecastCard";
+import type { IntervalForecastResult, HorizonForecast } from "../../track_a/types";
 
 function ActionButton({
   label, description, icon, onClick, busy,
@@ -26,6 +28,143 @@ function ActionButton({
         <RefreshCw size={14} className={busy ? "animate-spin" : undefined} />
         {busy ? "Running…" : label}
       </button>
+    </div>
+  );
+}
+
+type RangePreset = "week" | "day" | "daypart" | "custom";
+
+function HorizonHistoryRow({ row }: { row: HorizonForecast }) {
+  const label = row.label ?? row.granularity ?? "forecast";
+  const total = row.total_qty ?? 0;
+  return (
+    <div className="flex items-center justify-between text-xs py-1 border-b border-muted/30 last:border-0">
+      <span className="text-text/60 truncate flex-1">{label}</span>
+      <span className="text-text font-medium tabular-nums ml-2">{Math.round(total).toLocaleString()} portions</span>
+    </div>
+  );
+}
+
+export function IntervalForecastPanel() {
+  const [range, setRange] = useState<RangePreset>("week");
+  const [dayOffset, setDayOffset] = useState(0);
+  const [daypart, setDaypart] = useState("dinner");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<IntervalForecastResult | null>(null);
+  const [horizons, setHorizons] = useState<HorizonForecast[]>([]);
+
+  // Fetch saved horizon headers on mount
+  useEffect(() => {
+    apiGet<{ horizons: HorizonForecast[] }>("/api/track-a/forecast/horizons")
+      .then((d) => setHorizons(d.horizons ?? []))
+      .catch(() => {});
+  }, []);
+
+  async function generate() {
+    setBusy(true);
+    try {
+      const body: Record<string, unknown> = { range, day_offset: dayOffset };
+      if (range === "daypart") body.daypart = daypart;
+      const data = await apiPost("/api/track-a/forecast/horizon", body);
+      const r = data as IntervalForecastResult;
+      setResult(r);
+      // Refresh history list
+      apiGet<{ horizons: HorizonForecast[] }>("/api/track-a/forecast/horizons")
+        .then((d) => setHorizons(d.horizons ?? []))
+        .catch(() => {});
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <SectionHeading>On-Demand Interval Forecast</SectionHeading>
+      <p className="text-[10px] text-text/40">
+        Generate a demand forecast for any future interval. Results are saved and can be used by the inventory optimizer.
+      </p>
+
+      {/* Range picker */}
+      <div className="grid grid-cols-4 gap-1.5">
+        {(["week", "day", "daypart", "custom"] as RangePreset[]).map((r) => (
+          <button
+            key={r}
+            type="button"
+            onClick={() => setRange(r)}
+            className={
+              "rounded-md px-2 py-1.5 text-xs font-medium transition-colors " +
+              (range === r
+                ? "bg-accent text-white"
+                : "bg-muted text-text/70 hover:bg-muted/70")
+            }
+          >
+            {r === "week" ? "7-Day" : r === "day" ? "Day" : r === "daypart" ? "Daypart" : "Custom"}
+          </button>
+        ))}
+      </div>
+
+      {/* Contextual inputs */}
+      {range !== "week" && (
+        <div className="flex items-center gap-3">
+          <div className="flex-1">
+            <label className="text-xs text-text/40 block mb-1">Day offset</label>
+            <select
+              value={dayOffset}
+              onChange={(e) => setDayOffset(Number(e.target.value))}
+              className="w-full rounded-md bg-muted/50 border border-muted px-2 py-1.5 text-sm text-text focus:outline-none focus:ring-1 focus:ring-accent"
+            >
+              <option value={0}>Today</option>
+              <option value={1}>Tomorrow</option>
+              <option value={2}>Day +2</option>
+              <option value={3}>Day +3</option>
+              <option value={6}>Day +6</option>
+            </select>
+          </div>
+          {range === "daypart" && (
+            <div className="flex-1">
+              <label className="text-xs text-text/40 block mb-1">Daypart</label>
+              <select
+                value={daypart}
+                onChange={(e) => setDaypart(e.target.value)}
+                className="w-full rounded-md bg-muted/50 border border-muted px-2 py-1.5 text-sm text-text focus:outline-none focus:ring-1 focus:ring-accent"
+              >
+                {["breakfast", "lunch", "afternoon", "dinner", "late"].map((dp) => (
+                  <option key={dp} value={dp}>{dp.charAt(0).toUpperCase() + dp.slice(1)}</option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => void generate()}
+        disabled={busy}
+        className="flex items-center gap-1.5 rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent/80 disabled:opacity-50 w-full justify-center"
+      >
+        <TrendingUp size={15} className={busy ? "animate-pulse" : undefined} />
+        {busy ? "Generating…" : "Generate Forecast"}
+      </button>
+
+      {/* Result card */}
+      {result && (
+        <ForecastCard forecast={result} onDismiss={() => setResult(null)} />
+      )}
+
+      {/* Saved history */}
+      {horizons.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-text/30">Recent forecasts</p>
+          <div className="rounded-lg border border-muted bg-surface/50 p-3">
+            {horizons.slice(0, 6).map((h, i) => (
+              <HorizonHistoryRow key={h.id ?? i} row={h} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -58,7 +197,8 @@ export function ForecastControls() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-8">
+      <div className="space-y-4">
       <SectionHeading>Forecast Controls</SectionHeading>
       <p className="text-[10px] text-text/40">
         Manually trigger forecast runs or configure auto-mode. The forecaster runs every 30 sim-minutes automatically when the sim is running.
@@ -94,6 +234,8 @@ export function ForecastControls() {
           {autoMuteBusy ? "…" : autoMode ? "Auto-mode ON — click to disable" : "Auto-mode OFF — click to enable"}
         </button>
       </div>
+      </div>
+      <IntervalForecastPanel />
     </div>
   );
 }

@@ -97,6 +97,59 @@ export interface ForecastAdjustment {
   created_at: number;
 }
 
+// ---------- Horizon / interval forecasts ----------
+
+export interface HorizonForecastItem {
+  menu_item_id: number;
+  name: string;
+  qty: number;
+  baseline: number;
+  confidence?: number;
+}
+
+export interface HorizonDay {
+  day_index: number;
+  start: number;
+  end: number;
+  qty: number;
+  baseline: number;
+  items: HorizonForecastItem[];
+}
+
+export interface HorizonForecast {
+  id?: number;
+  label?: string;
+  start: number;
+  end: number;
+  granularity: string;
+  generated_at: number;
+  trigger_reason?: string;
+  source?: string;
+  requested_by?: string;
+  total_qty: number;
+  breakdown?: {
+    by_day: HorizonDay[];
+    by_daypart: Record<string, { qty: number; baseline: number }>;
+  };
+}
+
+/** Result returned by forecast_demand voice tool or POST /forecast/horizon */
+export interface IntervalForecastResult {
+  status: string;
+  horizon_id?: number | null;
+  granularity: string;
+  start: number;
+  end: number;
+  total_qty: number;
+  items: HorizonForecastItem[];
+  by_day: HorizonDay[];
+  by_daypart: Record<string, { qty: number; baseline: number }>;
+  generated_at?: number;
+  trigger_reason?: string;
+  reason?: string;   // when status="empty"
+  error?: string;    // when status="error"
+}
+
 export interface ForecastJob {
   id: number;
   job_id: string;
@@ -299,6 +352,7 @@ export interface TrackASnapshot {
   forecast_traces: ForecastTraceRow[];
   forecast_adjustments: ForecastAdjustment[];
   forecast_jobs: ForecastJob[];
+  horizon_forecasts: HorizonForecast[];
   forecast_reasoning: EventLog[];
   competitors: Competitor[];
   competitor_offers: CompetitorOffer[];

@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import math
 import re
+import statistics
 from collections import defaultdict
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypedDict
 
 from core import config
 from core.agent_base import BaseAgent
@@ -29,6 +30,8 @@ from core.models import (
     ForecastAdjustment,
     ForecastOverride,
     ForecastTrace,
+    HorizonForecast,
+    HorizonForecastLine,
     MenuItem,
     OrderLine,
     Signal,
@@ -36,7 +39,12 @@ from core.models import (
     WeatherLog,
 )
 from core.pos_simulator import WINDOW_SECONDS, active_injections
-from core.signals import SignalType
+from core.signals import (
+    DemandForecastHorizonPayload,
+    HorizonDay,
+    HorizonDayItem,
+    SignalType,
+)
 
 
 def _hhmm(value: str) -> int:
@@ -111,6 +119,12 @@ class DemandForecaster(BaseAgent):
             interval_sim_s=config.SUGGESTION_INTERVAL_SIM_S,
             name="track_a_forecast_suggestions",
         )
+        orchestrator.register(
+            "interval",
+            self.emit_rolling_horizon,
+            interval_sim_s=config.HORIZON_EMIT_INTERVAL_SIM_S,
+            name="track_a_horizon_emit",
+        )
 
     def on_signal(self, signal: Signal) -> None:
         # Cook feedback: batch progress (actual < planned) or cook-source waste.
@@ -150,6 +164,16 @@ class DemandForecaster(BaseAgent):
                 else "deterministic_forecast"
             )
             self._enqueue_or_run_forecast(kind, f"signal:{signal.type}")
+            # Re-emit the rolling horizon so procurement sees updated forward demand
+            # promptly after a material signal (event spike, competitor price hike, etc.).
+            if signal.type in {
+                SignalType.DEMAND_EVENT.value,
+                SignalType.COMPETITOR_MARKET_SIGNAL.value,
+            }:
+                try:
+                    self.emit_rolling_horizon()
+                except Exception:  # noqa: BLE001 — non-critical
+                    pass
 
     def set_forecast_job_enqueue(self, fn: Callable[[str, str], Any]) -> None:
         self.forecast_job_enqueue = fn
@@ -714,6 +738,489 @@ class DemandForecaster(BaseAgent):
             result,
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Interval / horizon forecasting
+    # ------------------------------------------------------------------
+
+    def forecast_interval(
+        self,
+        start: float,
+        end: float,
+        *,
+        trigger_reason: str = "manual",
+        granularity: str = "auto",
+        persist: bool = True,
+        requested_by: str = "system",
+        source: str = "system",
+    ) -> Dict[str, Any]:
+        """Forecast demand for any interval [start, end) in sim-seconds.
+
+        Returns a structured dict with per-item totals, per-daypart breakdown,
+        per-day breakdown, and grand total.  Never calls decide_batches.
+        """
+        now = float(self.bus.sim_time)
+        start = max(float(start), now)
+        end = float(end)
+        if end <= start:
+            return {
+                "status": "empty",
+                "reason": "closed_hours",
+                "start": start,
+                "end": end,
+                "granularity": granularity,
+                "total_qty": 0,
+                "items": [],
+                "by_day": [],
+                "by_daypart": {},
+            }
+
+        cells = expand_interval(start, end)
+        if not cells:
+            return {
+                "status": "empty",
+                "reason": "no_operating_cells",
+                "start": start,
+                "end": end,
+                "granularity": granularity,
+                "total_qty": 0,
+                "items": [],
+                "by_day": [],
+                "by_daypart": {},
+            }
+
+        # Determine granularity label
+        span_days = (end - start) / SECONDS_PER_DAY
+        if granularity == "auto":
+            if span_days <= 1.1 and len({c["daypart"] for c in cells}) == 1:
+                granularity = "daypart"
+            elif span_days <= 1.5:
+                granularity = "day"
+            elif span_days <= 7.5:
+                granularity = "week"
+            else:
+                granularity = "custom"
+
+        session = self.db_session_factory()
+        try:
+            items = (
+                session.query(MenuItem)
+                .filter(MenuItem.active == 1)
+                .order_by(MenuItem.id.asc())
+                .all()
+            )
+            item_ids = [item.id for item in items]
+            item_map = {item.id: item for item in items}
+            matrix = self._history_matrix(session, item_ids)
+        finally:
+            session.close()
+
+        live = self.bus.live()
+
+        # --- Aggregate per item × cell ---
+        # item_totals: {item_id: {qty, baseline, confidence, name}}
+        item_totals: Dict[int, Dict[str, Any]] = {}
+        # day_totals: {day_index: {qty, baseline, cells: [...]}}
+        day_totals: Dict[int, Dict[str, Any]] = {}
+        # daypart_totals: {daypart: {qty, baseline}}
+        daypart_totals: Dict[str, Dict[str, float]] = {}
+        # horizon_days: {day_index: {start, end, items: {item_id: {qty, baseline}}}}
+        horizon_days: Dict[int, Dict[str, Any]] = {}
+
+        for cell in cells:
+            near_term = cell["window"]["start"] <= now + SECONDS_PER_DAY * 0.5
+
+            for item in items:
+                result = self._project_cell(session, item, cell, live, matrix, near_term)
+                qty = result["qty"]
+                baseline = result["baseline"]
+                confidence = result["confidence"]
+                day_idx = cell["day_index"]
+
+                # Item totals
+                if item.id not in item_totals:
+                    item_totals[item.id] = {
+                        "menu_item_id": item.id,
+                        "name": item.name,
+                        "qty": 0.0,
+                        "baseline": 0.0,
+                        "confidence_sum": 0.0,
+                        "cell_count": 0,
+                    }
+                item_totals[item.id]["qty"] += qty
+                item_totals[item.id]["baseline"] += baseline
+                item_totals[item.id]["confidence_sum"] += confidence
+                item_totals[item.id]["cell_count"] += 1
+
+                # Day totals
+                if day_idx not in day_totals:
+                    day_totals[day_idx] = {
+                        "day_index": day_idx,
+                        "start": cell["window"]["start"],
+                        "end": cell["window"]["end"],
+                        "qty": 0.0,
+                        "baseline": 0.0,
+                    }
+                else:
+                    day_totals[day_idx]["end"] = max(
+                        day_totals[day_idx]["end"], cell["window"]["end"]
+                    )
+                day_totals[day_idx]["qty"] += qty
+                day_totals[day_idx]["baseline"] += baseline
+
+                # Daypart totals
+                dp = cell["daypart"]
+                if dp not in daypart_totals:
+                    daypart_totals[dp] = {"qty": 0.0, "baseline": 0.0}
+                daypart_totals[dp]["qty"] += qty
+                daypart_totals[dp]["baseline"] += baseline
+
+                # Horizon days (for the signal payload)
+                if day_idx not in horizon_days:
+                    horizon_days[day_idx] = {
+                        "day_index": day_idx,
+                        "start": cell["window"]["start"],
+                        "end": cell["window"]["end"],
+                        "items": {},
+                    }
+                else:
+                    horizon_days[day_idx]["end"] = max(
+                        horizon_days[day_idx]["end"], cell["window"]["end"]
+                    )
+                hd_items = horizon_days[day_idx]["items"]
+                if item.id not in hd_items:
+                    hd_items[item.id] = {"qty": 0.0, "baseline": 0.0}
+                hd_items[item.id]["qty"] += qty
+                hd_items[item.id]["baseline"] += baseline
+
+        # Flatten item totals and build robust baseline median (across days) per item
+        item_daily_baseline_median: Dict[str, float] = {}
+        items_out: List[Dict[str, Any]] = []
+        for item_id, agg in item_totals.items():
+            cell_count = max(agg["cell_count"], 1)
+            avg_confidence = agg["confidence_sum"] / cell_count
+            items_out.append({
+                "menu_item_id": item_id,
+                "name": agg["name"],
+                "qty": round(agg["qty"]),
+                "baseline": round(agg["baseline"], 2),
+                "confidence": round(avg_confidence, 3),
+            })
+            # Robust daily baseline: median of per-day baselines for this item
+            per_day_baselines = []
+            for hd in horizon_days.values():
+                if item_id in hd["items"]:
+                    per_day_baselines.append(hd["items"][item_id]["baseline"])
+            if per_day_baselines:
+                median_val = statistics.median(per_day_baselines)
+                item_daily_baseline_median[str(item_id)] = round(median_val, 3)
+
+        total_qty = sum(round(float(i["qty"])) for i in items_out)
+
+        # Sort horizon_days by index for output
+        by_day_out = [
+            {
+                "day_index": d["day_index"],
+                "start": d["start"],
+                "end": d["end"],
+                "qty": round(sum(v["qty"] for v in d["items"].values())),
+                "baseline": round(sum(v["baseline"] for v in d["items"].values()), 2),
+                "items": [
+                    {
+                        "menu_item_id": iid,
+                        "name": item_map.get(iid, None) and item_map[iid].name,
+                        "qty": round(v["qty"]),
+                        "baseline": round(v["baseline"], 2),
+                    }
+                    for iid, v in d["items"].items()
+                ],
+            }
+            for d in sorted(horizon_days.values(), key=lambda x: x["day_index"])
+        ]
+
+        by_daypart_out = {
+            dp: {
+                "qty": round(v["qty"]),
+                "baseline": round(v["baseline"], 2),
+            }
+            for dp, v in daypart_totals.items()
+        }
+
+        breakdown = {
+            "by_day": by_day_out,
+            "by_daypart": by_daypart_out,
+        }
+
+        # Persist header + lines
+        horizon_id = None
+        if persist:
+            label = f"{granularity} t{int(now)}"
+
+            session2 = self.db_session_factory()
+            try:
+                hf = HorizonForecast(
+                    label=label,
+                    start=start,
+                    end=end,
+                    granularity=granularity,
+                    generated_at=now,
+                    trigger_reason=trigger_reason,
+                    source=source,
+                    requested_by=requested_by,
+                    total_qty=float(total_qty),
+                    breakdown=breakdown,
+                )
+                session2.add(hf)
+                session2.flush()
+                session2.refresh(hf)
+                horizon_id = hf.id
+
+                for cell in cells:
+                    for item in items:
+                        result = self._project_cell(session2, item, cell, live, matrix, cell["window"]["start"] <= now + SECONDS_PER_DAY * 0.5)
+                        line = HorizonForecastLine(
+                            horizon_id=horizon_id,
+                            menu_item_id=item.id,
+                            daypart=cell["daypart"],
+                            day_index=cell["day_index"],
+                            window=cell["window"],
+                            qty=result["qty"],
+                            baseline=result["baseline"],
+                            confidence=result["confidence"],
+                        )
+                        session2.add(line)
+                session2.commit()
+            finally:
+                session2.close()
+
+        # Emit the horizon signal for the optimizer
+        if by_day_out:
+            self._emit_horizon_signal(
+                by_day_out=by_day_out,
+                item_daily_baseline_median=item_daily_baseline_median,
+                now=now,
+            )
+
+        result_dict = {
+            "status": "ok",
+            "horizon_id": horizon_id,
+            "granularity": granularity,
+            "start": start,
+            "end": end,
+            "total_qty": total_qty,
+            "items": items_out,
+            "by_day": by_day_out,
+            "by_daypart": by_daypart_out,
+            "generated_at": now,
+            "trigger_reason": trigger_reason,
+        }
+
+        if self.ws_broadcast is not None:
+            try:
+                self.ws_broadcast("horizon_forecast_updated", {"horizon_id": horizon_id, "granularity": granularity, "total_qty": total_qty})
+            except Exception:  # noqa: BLE001
+                pass
+
+        return result_dict
+
+    def emit_rolling_horizon(self) -> None:
+        """Compute and emit the 7-day rolling demand horizon signal for procurement."""
+        now = float(self.bus.sim_time)
+        try:
+            self.forecast_interval(
+                now,
+                now + 7 * SECONDS_PER_DAY,
+                trigger_reason="horizon_emit",
+                granularity="week",
+                persist=False,       # just the signal, no DB row
+                requested_by="system",
+                source="horizon_emit",
+            )
+        except Exception:  # noqa: BLE001 — non-critical path
+            self.log_event("forecast", "emit_rolling_horizon failed", {"error": "see logs"})
+
+    def _emit_horizon_signal(
+        self,
+        by_day_out: List[Dict[str, Any]],
+        item_daily_baseline_median: Dict[str, float],
+        now: float,
+    ) -> None:
+        """Emit DEMAND_FORECAST_HORIZON for each item on the bus."""
+        days_payload = []
+        for d in by_day_out:
+            day_items = [
+                HorizonDayItem(
+                    menu_item_id=it["menu_item_id"],
+                    qty=float(it["qty"]),
+                    baseline=float(it["baseline"]),
+                )
+                for it in d["items"]
+            ]
+            days_payload.append(HorizonDay(
+                day_index=d["day_index"],
+                start=d["start"],
+                end=d["end"],
+                items=day_items,
+            ))
+
+        payload = DemandForecastHorizonPayload(
+            horizon_days=len(days_payload),
+            generated_at=now,
+            days=days_payload,
+            item_daily_baseline_median=item_daily_baseline_median,
+        )
+        try:
+            self.emit(
+                SignalType.DEMAND_FORECAST_HORIZON,
+                payload.model_dump(),
+                dedup_key="demand_forecast_horizon",
+            )
+        except Exception:  # noqa: BLE001 — non-critical
+            pass
+
+    def _project_cell(
+        self,
+        session: Any,
+        item: MenuItem,
+        cell: Dict[str, Any],
+        live: List[Any],
+        matrix: Dict[Tuple[int, str, int], List[float]],
+        near_term: bool,
+    ) -> Dict[str, Any]:
+        """Project demand for a single (item, cell) pair.
+
+        For near-term cells (overlapping ~now), applies the full multiplier stack.
+        For future cells, applies only event-window multipliers and the robust baseline.
+        """
+        daypart = cell["daypart"]
+        dow = cell["dow"]
+        fraction = cell["fraction"]
+
+        # Baseline from robust (median) history
+        baseline = self._daypart_baseline(matrix, item.id, daypart, dow, robust=True)
+        baseline_scaled = baseline * fraction
+
+        if near_term:
+            # Full multiplier stack (same as run_forecast)
+            multipliers = self._deterministic_multipliers(
+                session, item, baseline_scaled, daypart, cell["window"], live
+            )
+            hard_override = None  # horizon projections don't apply overrides
+            raw = self._raw_qty(baseline_scaled, multipliers)
+            qty = float(max(0.0, raw))
+            confidence = confidence_from(multipliers)
+        else:
+            # Future cells: only event-window multipliers (holidays, events)
+            event_mult = self._event_multiplier(item, cell["window"], live)
+            qty = float(max(0.0, baseline_scaled * event_mult))
+            confidence = self._future_cell_confidence(matrix, item.id, daypart, dow, cell)
+
+        return {
+            "qty": qty,
+            "baseline": baseline_scaled,
+            "confidence": confidence,
+        }
+
+    def _future_cell_confidence(
+        self,
+        matrix: Dict[Tuple[int, str, int], List[float]],
+        item_id: int,
+        daypart: str,
+        dow: int,
+        cell: Dict[str, Any],
+    ) -> float:
+        """Confidence decays with days-out and thin history."""
+        days_out = cell["day_index"]
+        # History support: number of days in the matrix bucket
+        bucket = matrix.get((item_id, daypart, dow)) or matrix.get((item_id, daypart, -1), [])
+        support = len(bucket)
+        history_factor = min(1.0, support / 7.0)  # saturates at 7 days of data
+        time_factor = max(0.0, 1.0 - days_out * 0.08)  # -8% per day out
+        return round(history_factor * time_factor, 3)
+
+    def _history_matrix(
+        self,
+        session: Any,
+        item_ids: List[int],
+    ) -> Dict[Tuple[int, str, int], List[float]]:
+        """Single-pass scan of OrderLine, bucketing sold qty by (item_id, daypart, dow).
+
+        Keys: (item_id, daypart, dow_int) → list of per-day totals.
+        Special key: (item_id, daypart, -1) → list across ALL dow (for any-dow fallback).
+        """
+        buckets: Dict[Tuple[int, str, int], Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+
+        item_id_set = set(item_ids)
+        rows = (
+            session.query(OrderLine)
+            .filter(OrderLine.menu_item_id.in_(item_id_set), OrderLine.status == "sold")
+            .all()
+        )
+        for row in rows:
+            item_id = int(row.menu_item_id)
+            sim_t = float(row.sim_time or 0.0)
+            tod = sim_t % SECONDS_PER_DAY
+            day = math.floor(sim_t / SECONDS_PER_DAY)
+            dow = int(day) % 7
+
+            for dp_name, (start_s, end_s, _w) in DAYPART_SECONDS.items():
+                if start_s <= tod < end_s:
+                    qty = float(row.qty or 0.0)
+                    buckets[(item_id, dp_name, dow)][day] += qty
+                    buckets[(item_id, dp_name, -1)][day] += qty  # any-dow bucket
+                    break
+
+        # Convert to sorted lists of per-day totals
+        result: Dict[Tuple[int, str, int], List[float]] = {}
+        for key, day_dict in buckets.items():
+            result[key] = list(day_dict.values())
+        return result
+
+    def _daypart_baseline(
+        self,
+        matrix: Dict[Tuple[int, str, int], List[float]],
+        item_id: int,
+        daypart: str,
+        dow: int,
+        robust: bool = False,
+    ) -> float:
+        """Full-daypart average (or median) demand for (item, daypart, dow).
+
+        Fallback chain: same-dow → any-dow → settings projected qty (mean only).
+        robust=True uses median; robust=False uses mean (preserves existing behavior).
+        """
+        def _agg(vals: List[float]) -> float:
+            if not vals:
+                return 0.0
+            if robust:
+                return statistics.median(vals) if len(vals) >= 2 else vals[0]
+            return sum(vals) / len(vals)
+
+        # Same day-of-week
+        same_dow = matrix.get((item_id, daypart, dow), [])
+        val = _agg(same_dow)
+        if val > 0:
+            return round(val, 2)
+
+        # Any day-of-week
+        any_dow = matrix.get((item_id, daypart, -1), [])
+        val = _agg(any_dow)
+        if val > 0:
+            return round(val, 2)
+
+        # Fall back to settings-projected qty (mean only — not available for robust path)
+        if not robust:
+            session = self.db_session_factory()
+            try:
+                item = session.get(MenuItem, item_id)
+                if item is None:
+                    return 0.0
+                now = float(self.bus.sim_time)
+                return max(1.0, self._settings_projected_qty(session, item, daypart, now))
+            finally:
+                session.close()
+
+        return 0.0  # robust path: return 0 rather than using now-bound settings
 
     # ------------------------------------------------------------------
     # Forecast preparation
@@ -2582,6 +3089,47 @@ def confidence_from(multipliers: Dict[str, float]) -> float:
     values = [float(v) for v in multipliers.values()]
     spread = (max(values) - min(values)) if values else 0.0
     return round(1.0 / (1.0 + spread), 3)
+
+
+def expand_interval(start: float, end: float) -> List[Dict[str, Any]]:
+    """Decompose [start, end) into (daypart, day, window, fraction) cells.
+
+    Yields one cell per (daypart × day) whose operating window intersects [start, end).
+    Only the intersection is used; fraction = intersection_len / full_daypart_len.
+
+    Yields 1 cell for a single daypart, 5 for a full day (08:00-23:00), 35 for a week.
+    Closed-hours ranges (midnight-crossing) legitimately return an empty list.
+    """
+    if end <= start:
+        return []
+
+    cells: List[Dict[str, Any]] = []
+    day_start_idx = int(math.floor(start / SECONDS_PER_DAY))
+    day_end_idx = int(math.floor((end - 1.0) / SECONDS_PER_DAY)) if end > start else day_start_idx
+
+    for day_idx in range(day_start_idx, day_end_idx + 1):
+        day_base = day_idx * SECONDS_PER_DAY
+        dow = day_idx % 7
+        for dp_name, (dp_start_s, dp_end_s, _weight) in DAYPART_SECONDS.items():
+            abs_dp_start = day_base + dp_start_s
+            abs_dp_end = day_base + dp_end_s
+            # Intersect with the requested [start, end)
+            cell_start = max(abs_dp_start, start)
+            cell_end = min(abs_dp_end, end)
+            if cell_end <= cell_start:
+                continue
+            daypart_len = max(float(dp_end_s - dp_start_s), 1.0)
+            fraction = min(1.0, max(0.0, (cell_end - cell_start) / daypart_len))
+            if fraction <= 0:
+                continue
+            cells.append({
+                "day_index": day_idx - day_start_idx,
+                "daypart": dp_name,
+                "dow": dow,
+                "window": {"start": float(cell_start), "end": float(cell_end)},
+                "fraction": fraction,
+            })
+    return cells
 
 
 def windows_overlap(a: Dict[str, float], b: Dict[str, float]) -> bool:

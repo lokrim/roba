@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 import track_a.forecast_jobs as forecast_jobs_module
@@ -1066,3 +1068,250 @@ def test_approved_llm_proposal_persists_override_and_reforecasts(bus, session_fa
         assert latest.multipliers["authority_override"] == 1.0
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# Part 6 — Interval forecasting tests
+# ---------------------------------------------------------------------------
+
+from core.clock import SECONDS_PER_DAY  # noqa: E402
+from track_a.agents.forecaster import expand_interval  # noqa: E402
+
+
+# Constants matching config.DAYPARTS:
+# breakfast 08:00-11:00 (28800-39600), lunch 11:00-15:00 (39600-54000),
+# afternoon 15:00-17:00 (54000-61200), dinner 17:00-22:00 (61200-79200),
+# late 22:00-23:00 (79200-82800).
+_DAY_OPEN = 28800.0   # 08:00
+_DAY_CLOSE = 82800.0  # 23:00
+
+
+# -- expand_interval ---------------------------------------------------------
+
+def test_expand_interval_single_daypart():
+    """Exactly one cell when the interval exactly matches one daypart."""
+    cells = expand_interval(_DAY_OPEN, 39600.0)  # breakfast only
+    assert len(cells) == 1
+    assert cells[0]["daypart"] == "breakfast"
+    assert cells[0]["fraction"] == pytest.approx(1.0)
+    assert cells[0]["day_index"] == 0
+
+
+def test_expand_interval_full_day_five_cells():
+    """A full operating day (08:00-23:00) yields exactly 5 cells — one per daypart."""
+    cells = expand_interval(_DAY_OPEN, _DAY_CLOSE)
+    assert len(cells) == 5
+    dayparts_seen = {c["daypart"] for c in cells}
+    assert dayparts_seen == {"breakfast", "lunch", "afternoon", "dinner", "late"}
+    # All fractions should be 1.0 for a full-day window
+    for c in cells:
+        assert c["fraction"] == pytest.approx(1.0), f"{c['daypart']} fraction != 1.0"
+
+
+def test_expand_interval_week_35_cells():
+    """A 7-day window (day 0 through day 6) yields 35 cells (5 per day)."""
+    week_start = 0.0
+    week_end = 7 * SECONDS_PER_DAY
+    cells = expand_interval(week_start, week_end)
+    assert len(cells) == 35
+    day_indices = sorted({c["day_index"] for c in cells})
+    assert day_indices == list(range(7))
+    # Each day should have exactly 5 cells
+    for d in range(7):
+        day_cells = [c for c in cells if c["day_index"] == d]
+        assert len(day_cells) == 5, f"day {d} has {len(day_cells)} cells"
+
+
+def test_expand_interval_partial_window_fraction():
+    """When the interval clips into a daypart mid-stream, fraction < 1."""
+    # breakfast: 28800-39600 (10800s long). Start at 32400 (09:00) = 1h into it.
+    partial_start = 32400.0  # 09:00
+    cells = expand_interval(partial_start, 39600.0)  # rest of breakfast
+    assert len(cells) == 1
+    assert cells[0]["daypart"] == "breakfast"
+    expected_fraction = (39600.0 - 32400.0) / (39600.0 - 28800.0)  # 7200/10800 ≈ 0.667
+    assert cells[0]["fraction"] == pytest.approx(expected_fraction, rel=1e-3)
+
+
+def test_expand_interval_closed_hours_empty():
+    """Midnight-to-opening (00:00-08:00) lies outside all dayparts — returns []."""
+    cells = expand_interval(0.0, _DAY_OPEN)
+    assert cells == []
+
+
+def test_expand_interval_empty_when_end_lte_start():
+    """end <= start → always empty."""
+    assert expand_interval(5000.0, 5000.0) == []
+    assert expand_interval(5000.0, 4000.0) == []
+
+
+def test_expand_interval_day_index_increases_across_days():
+    """Each new calendar day increments day_index."""
+    # Use 0 to 3 days — each full-midnight-to-midnight range definitely crosses daypart windows.
+    cells = expand_interval(0.0, 3 * SECONDS_PER_DAY)
+    day_indices = sorted({c["day_index"] for c in cells})
+    assert 0 in day_indices
+    assert 1 in day_indices
+    assert 2 in day_indices
+
+
+# -- _history_matrix / _daypart_baseline / robust median ---------------------
+
+def test_daypart_baseline_robust_median_vs_mean(bus, session_factory, seeded):
+    """Median (robust=True) rejects a spike that contaminates the mean.
+
+    Setup: 6 quiet days (10 portions/dinner) + 1 spike day (100 portions/dinner).
+    All entries on the SAME day-of-week (multiples of 7) so they land in the
+    same (item_id, "dinner", dow) bucket.
+    Mean = (6*10 + 100) / 7 ≈ 22.9  — inflated
+    Median = 10.0               — stable
+    """
+    from core.models import OrderLine
+
+    # Use days that are multiples of -7: all have dow = (-7k) % 7 = 0.
+    # 6 quiet days: -7, -14, -21, -28, -35, -42 (10 portions each at 18:03 dinner).
+    # 1 spike day:  -49 (100 portions at dinner).
+    quiet_days = [-7, -14, -21, -28, -35, -42]
+    spike_day = -49
+    dinner_tod = 65000.0  # 18:03 → well within dinner (17:00–22:00)
+
+    session = session_factory()
+    try:
+        for day in quiet_days:
+            session.add(OrderLine(
+                order_id=None, menu_item_id=1, qty=10.0,
+                unit_price=12.0, modifiers=[], discount=0.0, line_total=120.0,
+                status="sold",
+                sim_time=day * SECONDS_PER_DAY + dinner_tod,
+            ))
+        session.add(OrderLine(
+            order_id=None, menu_item_id=1, qty=100.0,
+            unit_price=12.0, modifiers=[], discount=0.0, line_total=1200.0,
+            status="sold",
+            sim_time=spike_day * SECONDS_PER_DAY + dinner_tod,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    forecaster = DemandForecaster(bus, session_factory)
+    session2 = session_factory()
+    try:
+        matrix = forecaster._history_matrix(session2, [1])
+    finally:
+        session2.close()
+
+    # All dinner entries are on dow=0 (multiples of -7 → % 7 = 0).
+    # The same-dow bucket (item=1, "dinner", dow=0) has 7 entries: [10,10,10,10,10,10,100].
+    # Mean = (60 + 100) / 7 ≈ 22.86; Median = 10.0.
+    robust_val = forecaster._daypart_baseline(matrix, 1, "dinner", 0, robust=True)
+    mean_val = forecaster._daypart_baseline(matrix, 1, "dinner", 0, robust=False)
+
+    assert mean_val > 15.0, f"Mean {mean_val} should be inflated by spike"
+    assert robust_val <= 15.0, f"Median {robust_val} should be near 10, not spike-inflated"
+
+
+# -- forecast_interval -------------------------------------------------------
+
+def test_forecast_interval_returns_valid_shape(bus, session_factory, seeded):
+    """forecast_interval returns a dict with expected keys and positive totals."""
+    forecaster = DemandForecaster(bus, session_factory)
+    bus.sim_time = _DAY_OPEN  # start of business day
+
+    result = forecaster.forecast_interval(
+        _DAY_OPEN,
+        _DAY_OPEN + SECONDS_PER_DAY,
+        trigger_reason="test",
+        granularity="day",
+        persist=False,
+    )
+
+    assert result["status"] == "ok"
+    assert result["total_qty"] > 0
+    assert len(result["items"]) > 0
+    assert "by_day" in result
+    assert "by_daypart" in result
+    assert result["granularity"] == "day"
+
+
+def test_forecast_interval_empty_closed_hours(bus, session_factory, seeded):
+    """forecast_interval returns empty status for closed-hours range."""
+    forecaster = DemandForecaster(bus, session_factory)
+    bus.sim_time = 0.0  # midnight
+
+    result = forecaster.forecast_interval(
+        500.0,    # 00:08 — inside closed window
+        10000.0,  # 02:46 — still closed
+        trigger_reason="test",
+        persist=False,
+    )
+
+    assert result["status"] in ("empty",)
+    assert result["total_qty"] == 0
+
+
+def test_forecast_interval_never_calls_decide_batches(bus, session_factory, seeded):
+    """forecast_interval must NOT trigger any batch decisions (§locked design)."""
+    from core.models import Batch
+
+    forecaster = DemandForecaster(bus, session_factory)
+    bus.sim_time = _DAY_OPEN
+
+    # Record batch count before
+    s = session_factory()
+    try:
+        batch_count_before = s.query(Batch).count()
+    finally:
+        s.close()
+
+    forecaster.forecast_interval(
+        _DAY_OPEN,
+        _DAY_OPEN + 7 * SECONDS_PER_DAY,
+        trigger_reason="test",
+        persist=False,
+    )
+
+    s = session_factory()
+    try:
+        batch_count_after = s.query(Batch).count()
+    finally:
+        s.close()
+
+    assert batch_count_before == batch_count_after, (
+        "forecast_interval must not create Batch rows"
+    )
+
+
+def test_forecast_interval_auto_granularity(bus, session_factory, seeded):
+    """granularity='auto' correctly labels daypart/day/week spans."""
+    forecaster = DemandForecaster(bus, session_factory)
+    bus.sim_time = _DAY_OPEN
+
+    # Single daypart → "daypart"
+    r = forecaster.forecast_interval(_DAY_OPEN, 39600.0, persist=False)
+    assert r["granularity"] == "daypart"
+
+    # Full day → "day"
+    r = forecaster.forecast_interval(_DAY_OPEN, _DAY_OPEN + SECONDS_PER_DAY, persist=False)
+    assert r["granularity"] == "day"
+
+    # Week → "week"
+    r = forecaster.forecast_interval(
+        _DAY_OPEN, _DAY_OPEN + 7 * SECONDS_PER_DAY, persist=False,
+    )
+    assert r["granularity"] == "week"
+
+
+def test_forecast_interval_week_has_7_day_entries(bus, session_factory, seeded):
+    """A week forecast returns by_day with 7 entries."""
+    forecaster = DemandForecaster(bus, session_factory)
+    bus.sim_time = _DAY_OPEN
+
+    result = forecaster.forecast_interval(
+        _DAY_OPEN,
+        _DAY_OPEN + 7 * SECONDS_PER_DAY,
+        persist=False,
+    )
+
+    assert result["status"] == "ok"
+    assert len(result["by_day"]) == 7

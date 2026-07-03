@@ -201,6 +201,7 @@ class InventoryOptimizer(BaseAgent):
             if on_hand > float(level.reorder_point):
                 return
             par_level = float(level.par_level or 0.0)
+            safety_stock = float(level.safety_stock or 0.0)
 
             # Don't pile on another PO while one is already in flight for this
             # ingredient (proposed/approved/placed, i.e. not yet delivered).
@@ -237,6 +238,9 @@ class InventoryOptimizer(BaseAgent):
                 .filter(Supplier.id.in_([c["supplier_id"] for c in specs]))
                 .all()
             } if specs else {}
+
+            # Load ingredient metadata for perishability check
+            ing = session.get(Ingredient, ingredient_id)
         finally:
             session.close()
 
@@ -249,7 +253,27 @@ class InventoryOptimizer(BaseAgent):
             )
             return
 
-        needed = par_level - on_hand
+        lead_days = float(lead_by_supplier.get(candidate["supplier_id"], 1.0))
+
+        # --- Forecast-aware sizing ---
+        # Floor: cover demand over lead time + safety stock (avoid lost sales).
+        # Degrades to par top-up when no horizon is live (identical to today's behavior).
+        demand_lead = self._demand_over_lead(ingredient_id, lead_days)
+        forecast_target = demand_lead + safety_stock - on_hand
+        needed = max(par_level - on_hand, forecast_target)
+
+        # Ceiling: for perishables, never order more than can be sold before expiry
+        # (avoids wastage).  Skip ceiling when no horizon is live (demand_before_expiry→0
+        # → ceiling doesn't bind because forecast_target also→0).
+        if ing is not None and ing.perishable and ing.shelf_life_days:
+            shelf_life = float(ing.shelf_life_days)
+            expiry_demand = self._demand_before_expiry(ingredient_id, shelf_life)
+            if expiry_demand > 0:  # only cap when we have forecast data
+                demand_ceiling = max(0.0, expiry_demand - on_hand)
+                # Cap at ceiling but never below the par floor
+                if demand_ceiling < needed:
+                    needed = max(par_level - on_hand, demand_ceiling)
+
         if needed <= 0:
             return
         pack_size = candidate["pack_size"] or 1.0
@@ -266,6 +290,204 @@ class InventoryOptimizer(BaseAgent):
                 }
             ],
             created_by=self.name,
+        )
+
+    # -- recipe / yield helpers (mirrors ledger pattern; core.models only, no track_a import) -----
+
+    def _yield_factor(self, session: Any, ingredient_id: int) -> float:
+        """Return the yield factor for an ingredient (waste/prep loss adjustment)."""
+        level = (
+            session.query(InventoryLevel)
+            .filter(InventoryLevel.ingredient_id == ingredient_id)
+            .first()
+        )
+        if level is None or not level.yield_factor:
+            return 1.0
+        return float(level.yield_factor)
+
+    def _ingredient_qty_for_menu_item(
+        self,
+        session: Any,
+        menu_item_id: int,
+        ingredient_id: int,
+    ) -> float:
+        """How much of ingredient_id is needed per 1 portion of menu_item_id.
+
+        Copied verbatim from ledger._ingredient_qty_for_menu_item (core.models only).
+        """
+        rows = (
+            session.query(RecipeLine.qty)
+            .join(Recipe, Recipe.id == RecipeLine.recipe_id)
+            .filter(
+                Recipe.menu_item_id == menu_item_id,
+                RecipeLine.ingredient_id == ingredient_id,
+                RecipeLine.optional == 0,
+            )
+            .all()
+        )
+        if not rows:
+            return 0.0
+        return float(sum((row[0] or 0.0) for row in rows)) / max(
+            self._yield_factor(session, ingredient_id), 0.0001
+        )
+
+    def _demand_over_lead(
+        self,
+        ingredient_id: int,
+        lead_days: float,
+    ) -> float:
+        """Total ingredient demand over the next (lead_days + reorder_interval) days.
+
+        Reads the latest DEMAND_FORECAST_HORIZON signal from the bus pull-style.
+        Returns 0.0 when no horizon is available (formulae degrade to today's behavior).
+        """
+        horizon_signals = self.bus.live(type=SignalType.DEMAND_FORECAST_HORIZON)
+        if not horizon_signals:
+            return 0.0
+
+        sig = horizon_signals[0]
+        payload = sig.payload or {}
+        days = payload.get("days") or []
+        coverage_days = math.ceil(lead_days + config.REORDER_INTERVAL_DAYS)
+
+        total_usage = 0.0
+        session = self.db_session_factory()
+        try:
+            for day in days:
+                day_idx = day.get("day_index", 999)
+                if day_idx >= coverage_days:
+                    break
+                for item_entry in day.get("items") or []:
+                    menu_item_id = item_entry.get("menu_item_id")
+                    qty = float(item_entry.get("qty") or 0.0)
+                    if qty <= 0 or menu_item_id is None:
+                        continue
+                    ing_qty = self._ingredient_qty_for_menu_item(session, int(menu_item_id), ingredient_id)
+                    total_usage += qty * ing_qty
+        finally:
+            session.close()
+        return total_usage
+
+    def _demand_before_expiry(
+        self,
+        ingredient_id: int,
+        shelf_life_days: float,
+    ) -> float:
+        """Total ingredient demand over the next shelf_life_days.
+
+        Used as a perishability ceiling: never order more than can be sold.
+        Returns 0.0 when no horizon is available.
+        """
+        horizon_signals = self.bus.live(type=SignalType.DEMAND_FORECAST_HORIZON)
+        if not horizon_signals:
+            return 0.0
+
+        sig = horizon_signals[0]
+        payload = sig.payload or {}
+        days = payload.get("days") or []
+        cap_days = math.ceil(shelf_life_days)
+
+        total_usage = 0.0
+        session = self.db_session_factory()
+        try:
+            for day in days:
+                day_idx = day.get("day_index", 999)
+                if day_idx >= cap_days:
+                    break
+                for item_entry in day.get("items") or []:
+                    menu_item_id = item_entry.get("menu_item_id")
+                    qty = float(item_entry.get("qty") or 0.0)
+                    if qty <= 0 or menu_item_id is None:
+                        continue
+                    ing_qty = self._ingredient_qty_for_menu_item(session, int(menu_item_id), ingredient_id)
+                    total_usage += qty * ing_qty
+        finally:
+            session.close()
+        return total_usage
+
+    # -- dynamic par recompute -----------------------------------------------
+
+    def refresh_dynamic_pars(self) -> None:
+        """Recompute par_level/reorder_point/safety_stock from the weekly horizon.
+
+        Uses the robust daily baseline median (transient-free) so one-off event
+        spikes don't contaminate the «normal week» par level.  Durable changes
+        (e.g. competitor keeps prices elevated) are adopted after a few days as
+        the rolling median shifts.
+
+        Safe: only writes when a horizon is available and robust_usage > 0.
+        Never zeroes out an existing par (guarded by `if robust_usage > 0`).
+        """
+        horizon_signals = self.bus.live(type=SignalType.DEMAND_FORECAST_HORIZON)
+        if not horizon_signals:
+            return  # no horizon yet; skip silently
+
+        payload = horizon_signals[0].payload or {}
+        item_baseline_median: Dict[str, float] = payload.get("item_daily_baseline_median") or {}
+        if not item_baseline_median:
+            return
+
+        session = self.db_session_factory()
+        try:
+            levels = session.query(InventoryLevel).all()
+            for level in levels:
+                ingredient_id = int(level.ingredient_id)
+                # Sum across all menu items: robust_daily_ingredient_usage
+                robust_usage = 0.0
+                for item_id_str, daily_baseline in item_baseline_median.items():
+                    if float(daily_baseline) <= 0:
+                        continue
+                    try:
+                        menu_item_id = int(item_id_str)
+                    except (ValueError, TypeError):
+                        continue
+                    ing_qty = self._ingredient_qty_for_menu_item(session, menu_item_id, ingredient_id)
+                    robust_usage += float(daily_baseline) * ing_qty
+
+                if robust_usage <= 0:
+                    continue  # no demand data for this ingredient; preserve existing pars
+
+                ing = session.get(Ingredient, ingredient_id)
+                lead_days = 1.0
+                catalog = (
+                    session.query(SupplierCatalog)
+                    .filter(SupplierCatalog.ingredient_id == ingredient_id)
+                    .all()
+                )
+                if catalog:
+                    supplier_ids = [c.supplier_id for c in catalog]
+                    suppliers = (
+                        session.query(Supplier)
+                        .filter(Supplier.id.in_(supplier_ids))
+                        .all()
+                    )
+                    if suppliers:
+                        lead_days = min(float(s.lead_time_days or 1.0) for s in suppliers)
+
+                safety_stock = config.SAFETY_FRACTION * robust_usage * lead_days
+                reorder_point = robust_usage * lead_days + safety_stock
+                par_level = robust_usage * (lead_days + config.REORDER_INTERVAL_DAYS + config.SAFETY_DAYS)
+
+                # Perishability cap on par
+                if ing is not None and ing.perishable and ing.shelf_life_days:
+                    shelf_cap = robust_usage * float(ing.shelf_life_days)
+                    par_level = min(par_level, shelf_cap)
+
+                # Never lower par below existing value if it would zero out procurement
+                level.safety_stock = round(max(level.safety_stock or 0.0, safety_stock), 4)
+                level.reorder_point = round(max(level.reorder_point or 0.0, reorder_point * 0.5), 4)
+                level.par_level = round(max(level.par_level or 0.0, par_level * 0.5), 4)
+
+            session.commit()
+        except Exception:  # noqa: BLE001
+            session.rollback()
+        finally:
+            session.close()
+
+        self.log_event(
+            "optimizer",
+            "Dynamic pars refreshed from 7-day horizon (robust baseline).",
+            {"signal_age": float((self.bus.live(type=SignalType.DEMAND_FORECAST_HORIZON) or [{}])[0].payload.get("generated_at", 0) if horizon_signals else 0)},
         )
 
     @staticmethod

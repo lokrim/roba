@@ -73,6 +73,20 @@ EXPIRY_SCAN_SIM_S = 3600
 EXPIRY_WINDOW_SIM_S = 172800               # 2 sim-days
 PROMO_DISCOUNT_PCT = 20
 APPROVAL_PO_THRESHOLD = 200                # currency units; above -> needs approval
+
+# procurement — forecast-driven par / reorder sizing
+# REORDER_INTERVAL_DAYS: expected days between reorder checks (how long between sweeps)
+REORDER_INTERVAL_DAYS = float(os.getenv("REORDER_INTERVAL_DAYS", "1.0"))
+# SAFETY_FRACTION: safety_stock = SAFETY_FRACTION * robust_daily_usage * lead_days
+SAFETY_FRACTION = float(os.getenv("SAFETY_FRACTION", "0.25"))
+# DYNAMIC_PAR_INTERVAL_SIM_S: how often to recompute par/reorder_point from the horizon
+DYNAMIC_PAR_INTERVAL_SIM_S = float(
+    os.getenv("DYNAMIC_PAR_INTERVAL_SIM_S", str(SUGGESTION_INTERVAL_SIM_S * 7))
+)  # ~1 sim-week
+# HORIZON_EMIT_INTERVAL_SIM_S: how often to emit the rolling 7-day horizon signal
+HORIZON_EMIT_INTERVAL_SIM_S = float(
+    os.getenv("HORIZON_EMIT_INTERVAL_SIM_S", str(54000.0))  # ~1 sim-day
+)
 INVENTORY_SHORTAGE_SIGNALS_ENABLED = os.getenv(
     "INVENTORY_SHORTAGE_SIGNALS_ENABLED", "true"
 ).strip().lower() not in {"0", "false", "no", "off"}

@@ -33,7 +33,11 @@ CAPABILITIES: List[ModuleCapability] = [
             SignalType.COMPETITOR_NOTE.value,
             SignalType.CUSTOMER_FEEDBACK_NOTE.value,
         ],
-        produces=[SignalType.DEMAND_FORECAST.value, SignalType.BATCH_DECISION.value],
+        produces=[
+            SignalType.DEMAND_FORECAST.value,
+            SignalType.BATCH_DECISION.value,
+            SignalType.DEMAND_FORECAST_HORIZON.value,
+        ],
         examples=["rush expected", "pizza oven broken", "VIP event tonight"],
     ),
     ModuleCapability(
@@ -81,6 +85,8 @@ CAPABILITIES: List[ModuleCapability] = [
             SignalType.EXPIRY_RISK.value,
             SignalType.EXPIRY_USE_PRIORITY.value,
             SignalType.MENU_TOGGLE_REQUEST.value,
+            SignalType.DEMAND_FORECAST.value,
+            SignalType.DEMAND_FORECAST_HORIZON.value,
         ],
         produces=[
             SignalType.MENU_TOGGLE.value,

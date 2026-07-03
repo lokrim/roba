@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { IntervalForecastPanel } from "../shell/control/ForecastControls";
 import {
   Bar,
   BarChart,
@@ -302,6 +303,10 @@ export function ForecastDashboard() {
         selectedItemId={selectedForecast?.menu_item_id ?? null}
         onSelect={setSelectedItemId}
       />
+
+      <div className="mt-6 rounded-xl border border-muted bg-surface/50 p-5">
+        <IntervalForecastPanel />
+      </div>
     </TrackAShell>
   );
 }
