@@ -294,6 +294,25 @@ class InventoryOptimizer(BaseAgent):
     # -- menu toggle (§18.8) -------------------------------------------------
 
     def _maybe_toggle(self, ingredient_id: int, projected_runout: float) -> None:
+        # Guard: if this is the only active dish using the ingredient, skip disabling —
+        # leaving the restaurant with zero dishes to serve is worse than serving with
+        # low stock.  This guard is optimizer-specific (projected shortages); voice
+        # confirms (zero-stock commands) bypass this path entirely.
+        session = self.db_session_factory()
+        try:
+            from core.models import MenuItem, Recipe, RecipeLine
+            active_count = (
+                session.query(MenuItem.id)
+                .join(Recipe, Recipe.menu_item_id == MenuItem.id)
+                .join(RecipeLine, RecipeLine.recipe_id == Recipe.id)
+                .filter(RecipeLine.ingredient_id == ingredient_id, MenuItem.active == 1)
+                .count()
+            )
+        finally:
+            session.close()
+        if active_count <= 1:
+            return  # skip: would leave no active dishes for this ingredient
+
         # Delegate to the deterministic resolver, which disables ALL dishes using this
         # ingredient at/below threshold, not just the lowest-value one.
         try:

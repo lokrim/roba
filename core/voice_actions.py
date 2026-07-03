@@ -583,6 +583,24 @@ class VoiceActions:
                         "raw_text": f"set {ing_name} to {new_qty} {ing_unit}",
                     }
                 )
+            # Cascade: disable/enable menu items whose ingredient is now at/below
+            # threshold.  Mirror the pattern used by record_spoilage and
+            # set_staff_attendance, which call recompute_availability directly at
+            # the voice layer using self.hub_broadcast.  The ledger's internal
+            # recompute (inside _apply_reported_count/_apply_reported_receipt) uses
+            # a swallowed try/except, so its broadcast is unreliable under contention;
+            # this direct call is the authoritative instant update.
+            try:
+                from .availability import recompute_availability
+                recompute_availability(
+                    self.db_session_factory,
+                    self.bus,
+                    self.hub_broadcast,
+                    changed_ingredient_ids=[ing_id],
+                    agent_name="voice_inventory",
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("adjust_inventory recompute_availability failed", exc_info=True)
             return {
                 "ok": True,
                 "ingredient": ing_name,

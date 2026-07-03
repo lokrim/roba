@@ -281,7 +281,7 @@ class WasteEventPayload(BaseModel):
     lot_id: Optional[int] = None
     qty: float
     unit: str
-    cost: float
+    cost: Optional[float] = None  # nullable: voice spoilage paths don't compute cost
     reason: str
 
 

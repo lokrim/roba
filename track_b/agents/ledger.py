@@ -512,13 +512,20 @@ class InventoryLedger(BaseAgent):
         return min(candidates) if candidates else now + config.EXPIRY_WINDOW_SIM_S * 2
 
     def _affected_menu_items(self, ingredient_id: int) -> List[int]:
+        """Return all menu items that use this ingredient.
+
+        Intentionally does NOT filter by active==1: a dish that was already
+        disabled because of this same ingredient shortage is still "affected"
+        and should appear in STOCKOUT_RISK / LOW_STOCK signals so that
+        downstream agents (procurement, notifications) see the full impact.
+        """
         session = self.db_session_factory()
         try:
             rows = (
                 session.query(MenuItem.id)
                 .join(Recipe, Recipe.menu_item_id == MenuItem.id)
                 .join(RecipeLine, RecipeLine.recipe_id == Recipe.id)
-                .filter(RecipeLine.ingredient_id == ingredient_id, MenuItem.active == 1)
+                .filter(RecipeLine.ingredient_id == ingredient_id)
                 .all()
             )
             return [r[0] for r in rows]
@@ -738,21 +745,29 @@ class InventoryLedger(BaseAgent):
         self.broadcast(
             "inventory_updated", {"ingredient_id": ingredient_id, "on_hand": on_hand_after}
         )
-        self.emit(
-            SignalType.WASTE_EVENT,
-            {
-                "waste_type": waste_type,
-                "ingredient_id": ingredient_id,
-                "menu_item_id": None,
-                "qty": depleted,
-                "unit": unit,
-                "reason": reason,
-                "source": "voice",
-                "waste_event_id": we_id,
-            },
-            source="voice",
-            groups=["inventory", "procurement", "human"],
-        )
+        try:
+            self.emit(
+                SignalType.WASTE_EVENT,
+                {
+                    "waste_type": waste_type,
+                    "ingredient_id": ingredient_id,
+                    "menu_item_id": None,
+                    "qty": depleted,
+                    "unit": unit,
+                    "reason": reason,
+                    "source": "voice",
+                    "waste_event_id": we_id,
+                },
+                source="voice",
+                groups=["inventory", "procurement", "human"],
+            )
+        except Exception:  # noqa: BLE001
+            # Stock is already committed; a signal validation error must never
+            # abort the caller and prevent the menu recompute from running.
+            import logging
+            logging.getLogger(__name__).warning(
+                "WASTE_EVENT emit failed (non-fatal, stock already committed)", exc_info=True
+            )
         self.log_event(
             "waste",
             f"Voice spoilage: {depleted:.1f} {unit} of ingredient {ingredient_id} marked as {waste_type}.",
@@ -938,7 +953,7 @@ class InventoryLedger(BaseAgent):
             )
         except Exception as _exc:
             import logging
-            logging.getLogger(__name__).warning("availability cascade failed: %s", _exc)
+            logging.getLogger(__name__).warning("availability cascade failed: %s", _exc, exc_info=True)
         self.log_event(
             "receipt",
             f"Voice receipt recorded for {ingredient_ref or ingredient_id}; on-hand now {balance_after:.1f}.",
@@ -990,7 +1005,7 @@ class InventoryLedger(BaseAgent):
             )
         except Exception as _exc:
             import logging
-            logging.getLogger(__name__).warning("availability cascade failed: %s", _exc)
+            logging.getLogger(__name__).warning("availability cascade failed: %s", _exc, exc_info=True)
         self.log_event(
             "reconciliation",
             f"Voice count for ingredient {ingredient_id}: on-hand now {qty:.1f} (drift recorded).",

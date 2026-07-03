@@ -330,6 +330,9 @@ def _upsert_block(
         sim_time=now,
         active=1,
     ))
+    session.flush()  # make the new block visible to same-txn reads;
+                     # session is autoflush=False so _any_block_active would
+                     # otherwise query the DB without seeing the pending add
 
 
 def _has_active_block(session: Any, MenuToggle: Any, item_id: int, reason_code: str) -> bool:
