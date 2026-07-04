@@ -27,6 +27,7 @@ import type { IntervalForecastResult } from "../track_a/types";
 export type VoiceState =
   | "idle"         // not connected
   | "connecting"   // WS open, waiting for "connected" / "unavailable"
+  | "reconnecting" // unexpected drop; auto-reconnect in progress
   | "ready"        // connected & ready to talk
   | "listening"    // mic is live, user speaking
   | "thinking"     // awaiting Roba response (PTT only)
@@ -101,6 +102,8 @@ const THINKING_TIMEOUT_MS = 30_000; // "thinking" → "ready" + error msg
 // Presses shorter than this with no audio captured are silently dropped back
 // to "ready" rather than spinning on "thinking" for 30 s.
 const MIN_UTTERANCE_MS = 500;
+// Conversation mode: auto-exit after this long with no speech from anyone.
+const CONVERSATION_IDLE_MS = 60_000;
 
 const MIC_MODE_KEY = "roba.voice.micMode";
 const VOICE_MODEL_KEY = "roba.voice.model";
@@ -190,6 +193,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const connectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const thinkingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cardDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Conversation-mode idle: fired when no speech in CONVERSATION_IDLE_MS.
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const micModeRef = useRef<MicMode>(micMode);
   const voiceModelRef = useRef<string | undefined>(voiceModel);
   // Timestamp of the most recent startListening() — used to detect sub-threshold
@@ -216,6 +221,12 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     if (cardDismissTimerRef.current) {
       clearTimeout(cardDismissTimerRef.current);
       cardDismissTimerRef.current = null;
+    }
+  }
+  function clearIdleTimer() {
+    if (idleTimerRef.current) {
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
     }
   }
 
@@ -250,11 +261,31 @@ export function useVoiceLive(role: string): VoiceLiveHook {
       });
     }, CONNECT_TIMEOUT_MS);
 
+    // Arm (or reset) the conversation-mode idle timer.
+    // Only active in conversation mode; fires stopListening after CONVERSATION_IDLE_MS of silence.
+    function armIdleTimer() {
+      if (micModeRef.current !== "conversation") return;
+      clearIdleTimer();
+      idleTimerRef.current = setTimeout(() => {
+        clientRef.current?.stopListening();
+        setState("ready");
+        setLastError("Conversation paused after 60 s of silence — tap to resume.");
+      }, CONVERSATION_IDLE_MS);
+    }
+
     const unsub = client.on((ev) => {
       switch (ev.type) {
         case "connected":
           clearConnectTimer();
           setState("ready");
+          break;
+        case "reconnecting":
+          // Unexpected socket drop; auto-reconnect is in progress.
+          // Clear any running connect timer — the timeout was only for initial connect.
+          clearConnectTimer();
+          clearThinkingTimer();
+          clearIdleTimer();
+          setState("reconnecting");
           break;
         case "unavailable":
           clearConnectTimer();
@@ -279,6 +310,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
             clearThinkingTimer();
             setState("speaking");
           }
+          // Any speech resets the conversation idle timer.
+          armIdleTimer();
           break;
         }
         case "plan_preview":
@@ -318,6 +351,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           // First audio byte arrived — the pipeline is responding.
           clearThinkingTimer();
           setState("speaking");
+          // Roba speaking counts as activity — reset idle timer.
+          armIdleTimer();
           break;
         case "turn_complete":
           // Done generating; stay "speaking" until audio drains (playback_done).
@@ -328,6 +363,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           // the mic stays open; in PTT the user is pressing the button.
           clearThinkingTimer();
           setState("listening");
+          // User is speaking — reset idle timer.
+          armIdleTimer();
           break;
         case "playback_done":
           setState((cur) =>
@@ -342,6 +379,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
         case "disconnected":
           clearConnectTimer();
           clearThinkingTimer();
+          clearIdleTimer();
           setState("idle");
           break;
       }
@@ -358,6 +396,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
       clearConnectTimer();
       clearThinkingTimer();
       clearCardDismissTimer();
+      clearIdleTimer();
       client.disconnect();
     };
     // Reconnect when role, micMode, or voiceModel changes. The Live session's
@@ -375,11 +414,22 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     setLastError(null);
     listenStartRef.current = Date.now(); // stamp for empty-utterance guardrail
     setState("listening");
+    // Arm the idle timer when entering conversation mode.
+    if (micModeRef.current === "conversation") {
+      clearIdleTimer();
+      idleTimerRef.current = setTimeout(() => {
+        clientRef.current?.stopListening();
+        setState("ready");
+        setLastError("Conversation paused after 60 s of silence — tap to resume.");
+      }, CONVERSATION_IDLE_MS);
+    }
     await clientRef.current.startListening();
   }, []);
 
   const stopListening = useCallback(() => {
     if (!clientRef.current) return;
+    // Always cancel the idle timer on explicit stop (or mode switch).
+    clearIdleTimer();
     if (micModeRef.current === "ptt") {
       const elapsed = Date.now() - listenStartRef.current;
 

@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from .config import GEMINI_LIVE_MODEL
@@ -56,6 +57,8 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_TIMEOUT_S = 20.0
 _CONNECT_TIMEOUT_S = 10.0
+_RESUME_BACKOFF_S = (1.0, 2.0, 4.0)   # per-attempt wait before retrying a resume
+_MAX_RESUME_FAILS = 3                  # consecutive resume failures before giving up
 
 # Models the UI may select via the model= query param.
 # These must be actual Vertex AI Live API model IDs (use `client.models.list()` to verify).
@@ -92,6 +95,18 @@ async def _safe_send_json(websocket: Any, payload: Dict[str, Any]) -> bool:
         else:
             logger.warning("websocket send failed: %s", exc)
         return False
+
+
+@dataclass
+class _BridgeState:
+    """Mutable state shared between the two relay tasks and the reconnect loop."""
+    handle: Optional[str] = field(default=None)  # latest session-resumption handle from Gemini
+    client_gone: bool = field(default=False)       # browser WS closed → stop looping
+    resume_wanted: bool = field(default=False)     # upstream session ended → reconnect
+
+
+class _GoAway(Exception):
+    """Raised inside _handle_chunk to signal an imminent Gemini session expiry (go_away frame)."""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -757,72 +772,129 @@ async def live_bridge(
             automatic_activity_detection=_gtypes.AutomaticActivityDetection(disabled=True),
         )
 
-    live_config = _gtypes.LiveConnectConfig(
-        response_modalities=["AUDIO"],
-        system_instruction=system_instruction,
-        tools=_TOOLS,  # type: ignore[arg-type]
-        input_audio_transcription=_gtypes.AudioTranscriptionConfig(),
-        output_audio_transcription=_gtypes.AudioTranscriptionConfig(),
-        realtime_input_config=realtime_input_config,
-    )
+    # Shared mutable state across reconnect iterations.
+    bridge = _BridgeState()
+    buffers = _TurnBuffer()
+    first_connect = True
+    fail_streak = 0
 
-    connect_ctx = client.aio.live.connect(model=live_model, config=live_config)
-    try:
-        async with asyncio.timeout(_CONNECT_TIMEOUT_S):
-            session = await connect_ctx.__aenter__()
-    except (TimeoutError, asyncio.TimeoutError):
-        logger.warning("Vertex AI Live session connect timed out")
-        await _safe_send_json(websocket, {"type": "unavailable", "reason": "connect_timeout"})
-        return
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Vertex AI Live connect failed: %s", exc)
-        await _safe_send_json(websocket, {"type": "unavailable", "reason": str(exc)})
-        return
+    while True:
+        # Build (or rebuild) the config each iteration so the latest handle is used.
+        # On first connect handle is None, which is equivalent to a fresh session.
+        live_config = _gtypes.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            system_instruction=system_instruction,
+            tools=_TOOLS,  # type: ignore[arg-type]
+            input_audio_transcription=_gtypes.AudioTranscriptionConfig(),
+            output_audio_transcription=_gtypes.AudioTranscriptionConfig(),
+            realtime_input_config=realtime_input_config,
+            # Enable resumption so the SDK can continue context across session limits.
+            session_resumption=_gtypes.SessionResumptionConfig(handle=bridge.handle),
+            # Prevent the context window from growing unbounded in long sessions.
+            context_window_compression=_gtypes.ContextWindowCompressionConfig(
+                sliding_window=_gtypes.SlidingWindow(),
+            ),
+        )
 
-    try:
-        if not await _safe_send_json(
-            websocket, {"type": "connected", "model": live_model}
-        ):
-            return
-
-        buffers = _TurnBuffer()
-        task_c2g = asyncio.create_task(
-            _client_to_gemini(websocket, session, voice_processor, voice_actions, buffers),
-            name="voice_live_c2g",
-        )
-        task_g2c = asyncio.create_task(
-            _gemini_to_client(websocket, session, voice_processor, role, mode, voice_actions, buffers),
-            name="voice_live_g2c",
-        )
-        done, pending = await asyncio.wait(
-            [task_c2g, task_g2c], return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        for t in done:
-            exc = t.exception()
-            if exc:
-                logger.warning("voice live task raised: %s", exc)
-    except Exception as exc:  # noqa: BLE001
-        if _is_disconnect(exc):
-            logger.info("voice live client disconnected: %s", exc)
-        else:
-            logger.exception("Vertex AI Live session error: %s", exc)
-            await _safe_send_json(websocket, {"type": "error", "message": str(exc)})
-    finally:
+        connect_ctx = client.aio.live.connect(model=live_model, config=live_config)
         try:
-            await connect_ctx.__aexit__(None, None, None)
-        except Exception:  # noqa: BLE001
-            pass
+            async with asyncio.timeout(_CONNECT_TIMEOUT_S):
+                session = await connect_ctx.__aenter__()
+        except (TimeoutError, asyncio.TimeoutError):
+            if first_connect:
+                logger.warning("Vertex AI Live session connect timed out")
+                await _safe_send_json(websocket, {"type": "unavailable", "reason": "connect_timeout"})
+                return
+            fail_streak += 1
+            logger.warning("Vertex AI Live resume timed out (streak=%d)", fail_streak)
+            if fail_streak >= _MAX_RESUME_FAILS:
+                await _safe_send_json(websocket, {"type": "error", "message": "Voice session could not resume — please refresh."})
+                return
+            await asyncio.sleep(_RESUME_BACKOFF_S[min(fail_streak - 1, len(_RESUME_BACKOFF_S) - 1)])
+            continue
+        except Exception as exc:  # noqa: BLE001
+            if first_connect:
+                logger.warning("Vertex AI Live connect failed: %s", exc)
+                await _safe_send_json(websocket, {"type": "unavailable", "reason": str(exc)})
+                return
+            fail_streak += 1
+            logger.warning("Vertex AI Live resume connect failed: %s (streak=%d)", exc, fail_streak)
+            if fail_streak >= _MAX_RESUME_FAILS:
+                await _safe_send_json(websocket, {"type": "error", "message": f"Voice session could not resume: {exc}"})
+                return
+            await asyncio.sleep(_RESUME_BACKOFF_S[min(fail_streak - 1, len(_RESUME_BACKOFF_S) - 1)])
+            continue
+
+        # Connected (or resumed with prior context).
+        if first_connect:
+            if not await _safe_send_json(websocket, {"type": "connected", "model": live_model}):
+                try:
+                    await connect_ctx.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            first_connect = False
+        else:
+            logger.info(
+                "Vertex AI Live session resumed (handle=%s…)",
+                (bridge.handle or "")[:20],
+            )
+
+        bridge.resume_wanted = False
+        fail_streak = 0
+
+        try:
+            task_c2g = asyncio.create_task(
+                _client_to_gemini(websocket, session, voice_processor, voice_actions, buffers, bridge),
+                name="voice_live_c2g",
+            )
+            task_g2c = asyncio.create_task(
+                _gemini_to_client(websocket, session, voice_processor, role, mode, voice_actions, buffers, bridge),
+                name="voice_live_g2c",
+            )
+            done, pending = await asyncio.wait(
+                [task_c2g, task_g2c], return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for t in done:
+                exc = t.exception()
+                if exc:
+                    logger.warning("voice live task raised: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            if _is_disconnect(exc):
+                logger.info("voice live client disconnected: %s", exc)
+                bridge.client_gone = True
+            else:
+                logger.exception("Vertex AI Live session error: %s", exc)
+                await _safe_send_json(websocket, {"type": "error", "message": str(exc)})
+        finally:
+            try:
+                await connect_ctx.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ── Decide whether to loop (resume) or exit. ──────────────────────
+        if bridge.client_gone:
+            logger.debug("voice live: browser disconnected, ending bridge")
+            break
+        if bridge.resume_wanted:
+            logger.info(
+                "voice live: upstream session ended cleanly, resuming (handle=%s…)",
+                (bridge.handle or "none")[:20],
+            )
+            continue
+        # Genuine error (already surfaced to the client) — stop the loop.
+        break
 
 
 async def _client_to_gemini(
     websocket: Any, session: Any, voice_processor: Any, voice_actions: Optional[Any],
-    buffers: "_TurnBuffer",
+    buffers: "_TurnBuffer", bridge: "_BridgeState",
 ) -> None:
     """Read frames from the browser WS and relay to the Live session."""
     from google.genai import types as _gtypes
@@ -832,6 +904,7 @@ async def _client_to_gemini(
             try:
                 data = await websocket.receive()
             except Exception:
+                bridge.client_gone = True
                 return
 
             if "bytes" in data and data["bytes"]:
@@ -1038,6 +1111,7 @@ async def _gemini_to_client(
     mode: str,
     voice_actions: Optional[Any],
     buffers: "_TurnBuffer",
+    bridge: "_BridgeState",
 ) -> None:
     """Read from the Vertex AI Live session and relay audio/events to the browser."""
     from google.genai import types as _gtypes
@@ -1049,7 +1123,7 @@ async def _gemini_to_client(
                     async for chunk in session.receive():
                         await _handle_chunk(
                             chunk, websocket, session, voice_processor,
-                            role, mode, _gtypes, buffers, voice_actions,
+                            role, mode, _gtypes, buffers, voice_actions, bridge,
                         )
             except asyncio.TimeoutError:
                 logger.debug("Vertex AI Live idle (no output in %.0fs)", _RESPONSE_TIMEOUT_S)
@@ -1058,9 +1132,16 @@ async def _gemini_to_client(
                 continue
             except asyncio.CancelledError:
                 raise
+            except _GoAway:
+                # go_away already set bridge.resume_wanted — exit so the loop reconnects.
+                logger.info("Vertex AI Live go_away received, exiting receive loop for resume")
+                return
             except Exception as exc:  # noqa: BLE001
                 if _is_disconnect(exc):
-                    logger.info("Vertex AI Live session closed: %s", exc)
+                    # Clean close from Gemini (session time-limit or normal end).
+                    # Signal the reconnect loop instead of letting the WS drop.
+                    logger.info("Vertex AI Live upstream session closed: %s — will resume", exc)
+                    bridge.resume_wanted = True
                     return
                 logger.exception("Vertex AI Live receive error: %s", exc)
                 await _safe_send_json(websocket, {"type": "error", "message": str(exc)})
@@ -1079,8 +1160,22 @@ async def _handle_chunk(
     _gtypes: Any,
     buffers: "_TurnBuffer",
     voice_actions: Optional[Any],
+    bridge: "_BridgeState",
 ) -> None:
     """Process one LiveServerMessage chunk."""
+    # ── Session lifecycle events ─────────────────────────────────────────────
+    if chunk.session_resumption_update:
+        update = chunk.session_resumption_update
+        if update.resumable and update.new_handle:
+            bridge.handle = update.new_handle
+            logger.debug("Vertex AI Live resumption handle updated (%s…)", update.new_handle[:16])
+
+    if chunk.go_away:
+        time_left = getattr(chunk.go_away, "time_left", "?")
+        logger.info("Vertex AI Live go_away (time_left=%s) — rotating session", time_left)
+        bridge.resume_wanted = True
+        raise _GoAway()
+
     if chunk.data:
         try:
             await websocket.send_bytes(chunk.data)

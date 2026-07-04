@@ -68,6 +68,7 @@ export function MicButton({
   const disabled =
     state === "idle" ||
     state === "connecting" ||
+    state === "reconnecting" ||
     state === "unavailable" ||
     state === "thinking";
 

@@ -11,6 +11,7 @@
 export type LiveClientEvent =
   | { type: "connected"; model?: string }
   | { type: "unavailable"; reason?: string }
+  | { type: "reconnecting" }   // socket dropped unexpectedly; auto-reconnect in progress
   | { type: "transcript"; role: "user" | "roba"; text: string; turn_id: string; final: boolean }
   | { type: "plan_preview"; plan: PlanResult }
   | { type: "tool_result"; tool: string; result: unknown }
@@ -21,6 +22,10 @@ export type LiveClientEvent =
   | { type: "interrupted" }    // barge-in: Roba stopped, mic should stay open
   | { type: "error"; message: string }
   | { type: "disconnected" };
+
+// Backoff delays (ms) for browser-socket auto-reconnect.
+// Capped at the last value for any subsequent attempts.
+const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000];
 
 export interface PlanResult {
   plan_id?: string;
@@ -76,6 +81,11 @@ export class RobaLiveClient {
   private _lastUserTurnId = "";
   private _lastRobaTurnId = "";
 
+  // Auto-reconnect for unexpected browser-socket drops.
+  private _closedByUser = false;
+  private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private _reconnectAttempt = 0;
+
   constructor(role = "manager", mode = "confirm", micMode: "ptt" | "conversation" = "ptt", model?: string) {
     this.role = role;
     this.mode = mode;
@@ -111,6 +121,19 @@ export class RobaLiveClient {
   // ---------------------------------------------------------------------------
 
   async connect(): Promise<void> {
+    this._closedByUser = false;
+    this._reconnectAttempt = 0;
+    this._openSocket();
+  }
+
+  /** Internal: open a fresh WebSocket, wiring up all handlers. */
+  private _openSocket(): void {
+    // Cancel any pending reconnect before opening a new socket.
+    if (this._reconnectTimer !== null) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+
     const base = window.location.host;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const params = new URLSearchParams({
@@ -120,14 +143,16 @@ export class RobaLiveClient {
     });
     if (this._model) params.set("model", this._model);
     const url = `${proto}://${base}/ws/voice/live?${params.toString()}`;
-    this.ws = new WebSocket(url);
-    this.ws.binaryType = "arraybuffer";
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
 
-    this.ws.onopen = () => {
+    ws.onopen = () => {
       // Connected — wait for the server's "connected" or "unavailable" frame.
     };
 
-    this.ws.onmessage = (ev) => {
+    ws.onmessage = (ev) => {
+      if (this.ws !== ws) return; // stale socket
       if (typeof ev.data === "string") {
         try {
           const msg = JSON.parse(ev.data) as Record<string, unknown>;
@@ -141,16 +166,44 @@ export class RobaLiveClient {
       }
     };
 
-    this.ws.onclose = () => {
-      this.emit({ type: "disconnected" });
+    ws.onclose = () => {
+      if (this.ws !== ws) return; // stale socket
+      this.ws = null;
+      if (this._closedByUser) {
+        // Intentional teardown (mode change / unmount) — inform the hook.
+        this.emit({ type: "disconnected" });
+      } else {
+        // Unexpected drop — auto-reconnect with backoff.
+        this._scheduleReconnect();
+      }
     };
 
-    this.ws.onerror = () => {
-      this.emit({ type: "error", message: "WebSocket error" });
+    ws.onerror = () => {
+      if (this.ws !== ws) return; // stale socket
+      // Let onclose drive reconnect; just flag the error for onerror-only events.
+      // Closing a CONNECTING socket produces a browser warning, skip it.
+      if (ws.readyState === WebSocket.OPEN) ws.close();
     };
   }
 
+  private _scheduleReconnect(): void {
+    if (this._reconnectTimer !== null) return; // already scheduled
+    const delay =
+      RECONNECT_DELAYS_MS[Math.min(this._reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+    this._reconnectAttempt++;
+    this.emit({ type: "reconnecting" });
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      if (!this._closedByUser) this._openSocket();
+    }, delay);
+  }
+
   disconnect() {
+    this._closedByUser = true;
+    if (this._reconnectTimer !== null) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     this.stopListening();
     this.ws?.close();
     this.ws = null;

@@ -421,6 +421,12 @@ export function CookVoice() {
     </div>
   ) : (
     <div className="shrink-0 flex flex-col items-center gap-3">
+      {live.state === "reconnecting" && (
+        <span className="flex items-center gap-1.5 rounded-full bg-warning/15 px-3 py-1 text-xs font-medium text-warning">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-warning" />
+          Reconnecting…
+        </span>
+      )}
       <MicButton
         state={live.state}
         micMode={live.micMode}
