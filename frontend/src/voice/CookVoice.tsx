@@ -181,25 +181,20 @@ function BatchCard({
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => setQty(q => Math.max(0, q - 1))}
-                      className="flex items-center justify-center w-10 h-10 rounded-lg border border-muted/60 bg-surface hover:bg-muted/30 text-text/60 hover:text-text transition-colors"
+                      className="flex items-center justify-center w-12 h-12 rounded-xl border border-muted/60 bg-surface hover:bg-muted/30 text-text/60 hover:text-text transition-colors"
                       aria-label="Decrease"
                     >
-                      <Minus size={18} />
+                      <Minus size={22} />
                     </button>
-                    <input
-                      type="number"
-                      min={0}
-                      value={qty}
-                      onChange={(e) => setQty(Math.max(0, Number(e.target.value) || 0))}
-                      className="w-16 rounded-lg border border-muted bg-primary/60 px-2 py-2 text-xl font-bold text-text text-center focus:border-accent focus:outline-none tabular-nums"
-                      aria-label="Actual qty made"
-                    />
+                    <span className="w-12 text-center text-3xl font-bold tabular-nums text-text select-none">
+                      {qty}
+                    </span>
                     <button
                       onClick={() => setQty(q => q + 1)}
-                      className="flex items-center justify-center w-10 h-10 rounded-lg border border-muted/60 bg-surface hover:bg-muted/30 text-text/60 hover:text-text transition-colors"
+                      className="flex items-center justify-center w-12 h-12 rounded-xl border border-muted/60 bg-surface hover:bg-muted/30 text-text/60 hover:text-text transition-colors"
                       aria-label="Increase"
                     >
-                      <Plus size={18} />
+                      <Plus size={22} />
                     </button>
                   </div>
                 </div>
