@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Loader2, ChefHat, Trash2, Send, RefreshCw, Check, X,
-  ChevronDown, ChevronUp, BookOpen, CheckSquare,
+  ChevronDown, ChevronUp, BookOpen, CheckSquare, Minus, Plus,
 } from "lucide-react";
 import { useVoiceLive } from "./useVoiceLive";
 import { MicButton } from "./MicButton";
 import { PlanConfirmCard } from "./PlanConfirmCard";
+import { ForecastCard } from "./ForecastCard";
 import { ModeToggle } from "./ModeToggle";
 import { MicModeToggle } from "./MicModeToggle";
 import { apiGet, apiPost } from "../api";
@@ -86,120 +87,163 @@ function BatchCard({
   onCheck: (batch: BoardBatch, qty: number) => void;
 }) {
   const [detailOpen, setDetailOpen] = useState(false);
-  const [qty, setQty] = useState(String(batch.planned_qty ?? 0));
+  const [qty, setQty] = useState(batch.planned_qty ?? 0);
   const pill = STATE_PILL[batch.state] ?? { label: batch.state, cls: "bg-muted/40 text-text/50" };
   const isCancelled = batch.state === "skipped";
   const isCooked = batch.state === "cooked";
   const isBlocked = !isCooked && !isCancelled && batch.feasible === false;
   const canCheck = !isCooked && !isCancelled && !isBlocked;
 
+  const rel = batch.cook_by != null && !isCancelled ? relativeTime(batch.cook_by, nowSim) : null;
+  const isOverdue = rel != null && rel.startsWith("overdue");
+
   return (
     <div
       className={[
-        "rounded-xl border p-4 shadow-sm transition-opacity",
+        "rounded-xl border shadow-sm transition-opacity",
         isCancelled
           ? "border-muted/30 bg-surface/30 opacity-60"
           : isBlocked
-            ? "border-warning/30 bg-warning/5 opacity-80"
+            ? "border-warning/40 bg-warning/5 opacity-80"
             : "border-muted/50 bg-surface",
       ].join(" ")}
     >
-      {/* Header row: dish name + state pill */}
-      <div className="flex items-start justify-between gap-3">
+      {/* ── Top bar: dish name + state pill ─────────────────────────────── */}
+      <div className="flex items-start justify-between gap-3 px-4 pt-4 pb-2">
         <h3
           className={[
-            "text-lg font-bold leading-tight",
+            "text-xl font-bold leading-tight",
             isCancelled ? "line-through text-text/40" : "text-text",
           ].join(" ")}
         >
           {batch.dish}
         </h3>
-        <div className="flex flex-col items-end gap-1">
-          <span className={`shrink-0 rounded-full px-2.5 py-0.5 text-xs font-semibold ${pill.cls}`}>
+        <div className="flex flex-col items-end gap-1 shrink-0">
+          <span className={`rounded-full px-3 py-1 text-sm font-semibold ${pill.cls}`}>
             {pill.label}
           </span>
           {isBlocked && (
-            <span className="shrink-0 rounded-full bg-warning/20 px-2 py-0.5 text-xs font-medium text-warning">
+            <span className="rounded-full bg-warning/20 px-2 py-0.5 text-xs font-medium text-warning">
               blocked: {batch.blocked_reason ?? "ingredient unavailable"}
             </span>
           )}
         </div>
       </div>
 
-      {/* Time-to-prep row */}
+      {/* ── Time row (large) ─────────────────────────────────────────────── */}
       {batch.cook_by != null && !isCancelled && (
-        <div className="mt-2 flex items-center gap-3 text-sm">
-          <span className="font-semibold text-text">
+        <div className="flex items-baseline gap-3 px-4 pb-1">
+          <span className="text-3xl font-bold tabular-nums text-text">
             {fmtSimTime(batch.cook_by)}
           </span>
-          <span className="text-text/40 text-xs">
-            {relativeTime(batch.cook_by, nowSim)}
+          <span className={[
+            "text-base font-semibold",
+            isOverdue ? "text-danger" : "text-text/50",
+          ].join(" ")}>
+            {rel}
           </span>
           {batch.prep_lead_time_min != null && (
-            <span className="ml-auto text-xs text-text/40">
+            <span className="ml-auto text-sm text-text/40">
               {batch.prep_lead_time_min} min prep
             </span>
           )}
         </div>
       )}
 
-      {/* Qty row */}
+      {/* ── Quantity section ─────────────────────────────────────────────── */}
       {!isCancelled && (
-        <div className="mt-2 text-xs text-text/50">
-          {isCooked
-            ? `Made: ${batch.actual_made_qty ?? "?"} / ${batch.planned_qty ?? "?"}`
-            : `Planned: ${batch.planned_qty ?? "?"}`}
+        <div className="px-4 py-3 border-t border-muted/20">
+          {isCooked ? (
+            /* Cooked: show what was made vs planned */
+            <div className="flex items-baseline gap-2">
+              <span className="text-3xl font-bold tabular-nums text-success">
+                {batch.actual_made_qty ?? "?"}
+              </span>
+              <span className="text-sm text-text/50">
+                made / {batch.planned_qty ?? "?"} planned
+              </span>
+            </div>
+          ) : (
+            /* Not cooked: planned qty + stepper for actual */
+            <div className="flex items-center gap-4">
+              {/* Planned qty — informational */}
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-text/40 mb-0.5">Planned</p>
+                <span className="text-3xl font-bold tabular-nums text-text">
+                  {batch.planned_qty ?? "?"}
+                </span>
+              </div>
+
+              {/* Stepper for actual qty — only when actionable */}
+              {canCheck && (
+                <div className="ml-auto flex flex-col items-end gap-1">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-text/40">Actual made</p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setQty(q => Math.max(0, q - 1))}
+                      className="flex items-center justify-center w-10 h-10 rounded-lg border border-muted/60 bg-surface hover:bg-muted/30 text-text/60 hover:text-text transition-colors"
+                      aria-label="Decrease"
+                    >
+                      <Minus size={18} />
+                    </button>
+                    <input
+                      type="number"
+                      min={0}
+                      value={qty}
+                      onChange={(e) => setQty(Math.max(0, Number(e.target.value) || 0))}
+                      className="w-16 rounded-lg border border-muted bg-primary/60 px-2 py-2 text-xl font-bold text-text text-center focus:border-accent focus:outline-none tabular-nums"
+                      aria-label="Actual qty made"
+                    />
+                    <button
+                      onClick={() => setQty(q => q + 1)}
+                      className="flex items-center justify-center w-10 h-10 rounded-lg border border-muted/60 bg-surface hover:bg-muted/30 text-text/60 hover:text-text transition-colors"
+                      aria-label="Increase"
+                    >
+                      <Plus size={18} />
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {/* Action row: Detail + Check */}
-      <div className="mt-3 flex items-center gap-2">
-        {/* Detail button */}
+      {/* ── Primary action: CHECK button ─────────────────────────────────── */}
+      {canCheck && (
+        <div className="px-4 pb-4">
+          <button
+            onClick={() => onCheck(batch, qty || batch.planned_qty || 0)}
+            className="w-full flex items-center justify-center gap-3 rounded-xl bg-success/85 hover:bg-success px-4 py-4 text-lg font-bold text-white transition-colors shadow-sm"
+          >
+            <CheckSquare size={24} />
+            Mark Cooked
+          </button>
+        </div>
+      )}
+
+      {/* ── Detail disclosure ─────────────────────────────────────────────── */}
+      <div className="px-4 pb-3">
         <button
           onClick={() => setDetailOpen(v => !v)}
-          className="flex items-center gap-1 rounded-lg border border-muted/60 px-2.5 py-1.5 text-xs text-text/60 hover:bg-muted/30 transition-colors"
+          className="flex items-center gap-1.5 text-sm text-text/40 hover:text-text/60 transition-colors"
         >
-          <BookOpen size={12} />
-          Detail
-          {detailOpen ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+          <BookOpen size={14} />
+          Recipe
+          {detailOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
         </button>
 
-        {/* Check / mark-cooked area */}
-        {canCheck && (
-          <div className="ml-auto flex items-center gap-2">
-            <input
-              type="number"
-              min={0}
-              value={qty}
-              onChange={(e) => setQty(e.target.value)}
-              className="w-16 rounded-lg border border-muted bg-primary/60 px-2 py-1 text-sm text-text text-center focus:border-accent focus:outline-none"
-              title="Actual qty made"
-            />
-            <button
-              onClick={() => onCheck(batch, Number(qty) || Number(batch.planned_qty) || 0)}
-              className="flex items-center gap-1.5 rounded-lg bg-success/80 px-3 py-1.5 text-xs font-semibold text-white hover:bg-success transition-colors"
-            >
-              <CheckSquare size={13} />
-              Check
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* Detail panel: recipe instructions */}
-      {detailOpen && (
-        <div className="mt-3 border-t border-muted/30 pt-3 space-y-2">
-          {batch.required_skill && (
-            <p className="text-xs text-text/40">
-              <span className="font-medium text-text/60">Skill required: </span>{batch.required_skill}
-            </p>
-          )}
-          {batch.instructions.length > 0 ? (
-            <div>
-              <p className="text-xs font-semibold text-text/50 mb-1.5 uppercase tracking-wide">Recipe</p>
+        {detailOpen && (
+          <div className="mt-2 border-t border-muted/30 pt-3 space-y-2">
+            {batch.required_skill && (
+              <p className="text-xs text-text/40">
+                <span className="font-medium text-text/60">Skill required: </span>{batch.required_skill}
+              </p>
+            )}
+            {batch.instructions.length > 0 ? (
               <ul className="space-y-1">
                 {batch.instructions.map((step, i) => (
-                  <li key={i} className="flex items-baseline gap-2 text-xs">
+                  <li key={i} className="flex items-baseline gap-2 text-sm">
                     <span className="text-text/30 w-4 shrink-0 text-right">{i + 1}.</span>
                     <span className={step.optional ? "text-text/40 italic" : "text-text/70"}>
                       {step.qty > 0 && (
@@ -211,12 +255,12 @@ function BatchCard({
                   </li>
                 ))}
               </ul>
-            </div>
-          ) : (
-            <p className="text-xs text-text/30 italic">No recipe on file.</p>
-          )}
-        </div>
-      )}
+            ) : (
+              <p className="text-xs text-text/30 italic">No recipe on file.</p>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -415,6 +459,13 @@ export function CookVoice() {
   /** Status / plan / done cards — shrink-0 section between mic and transcript */
   const voiceCards = (
     <>
+      {/* Forecast card — shown when forecast_demand tool fires */}
+      {live.lastForecast && (
+        <div className="shrink-0">
+          <ForecastCard forecast={live.lastForecast} onDismiss={live.clearForecast} />
+        </div>
+      )}
+
       {/* Error strip */}
       {live.lastError && (
         <div className="shrink-0 flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
@@ -651,7 +702,8 @@ export function CookVoice() {
   return (
     <>
       {/* ── LARGE screens: side-by-side ───────────────────────────────────── */}
-      <div className="hidden lg:grid lg:grid-cols-[minmax(0,1fr)_340px] gap-4 h-full min-h-0">
+      {/* Voice pane is wider (55%) so ForecastCards and other infographics have room */}
+      <div className="hidden lg:grid lg:grid-cols-[minmax(0,9fr)_minmax(0,11fr)] gap-4 h-full min-h-0">
         {/* Left — scrollable batch list */}
         {batchesPanel}
 

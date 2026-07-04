@@ -124,12 +124,21 @@ _TOOLS: list[dict[str, Any]] = [
                 "description": (
                     "Look up demand forecasts (expected quantities per menu item and daypart). "
                     "If no forecast exists, automatically runs the forecaster and returns fresh values. "
-                    "Pass item_name to filter to one dish. Pass daypart to filter (breakfast/lunch/dinner/etc)."
+                    "Pass item_name to filter to one dish. Pass daypart to filter (breakfast/lunch/dinner/etc). "
+                    "IMPORTANT: if the user names a specific dish (e.g. 'cheeseburger forecast', "
+                    "'how many fries do we expect'), you MUST set item_name to that dish's name."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "item_name": {"type": "string", "description": "Optional menu item filter."},
+                        "item_name": {
+                            "type": "string",
+                            "description": (
+                                "The dish name to scope results to. REQUIRED whenever the user asks "
+                                "about a specific dish (e.g. 'Classic Cheeseburger', 'French Fries'). "
+                                "Omit only when the user asks for the overall/whole-menu forecast."
+                            ),
+                        },
                         "daypart": {"type": "string", "description": "Optional daypart filter."},
                     },
                 },
@@ -140,12 +149,14 @@ _TOOLS: list[dict[str, Any]] = [
                     "Generate an on-demand interval demand forecast for any time range and show "
                     "results in a card. Use this when the user asks about future demand beyond the "
                     "current daypart — e.g. 'what will next week look like?', 'how many portions "
-                    "tomorrow?', 'forecast dinner tomorrow', 'show me the weekly outlook'. "
+                    "tomorrow?', 'forecast dinner tomorrow', 'show me the weekly outlook', "
+                    "'how many cheeseburgers next week?' (→ set item_name='Classic Cheeseburger'). "
                     "Returns per-item quantities, day-by-day breakdown, and daypart totals. "
                     "range='daypart' forecasts a single daypart (specify daypart+day_offset). "
                     "range='day' or 'today' forecasts a full day. "
                     "range='week' forecasts the next 7 days. "
-                    "range='custom' requires explicit start/end offsets in seconds from now."
+                    "range='custom' requires explicit start/end offsets in seconds from now. "
+                    "IMPORTANT: if the user names a specific dish, you MUST set item_name."
                 ),
                 "parameters": {
                     "type": "object",
@@ -174,7 +185,12 @@ _TOOLS: list[dict[str, Any]] = [
                         },
                         "item_name": {
                             "type": "string",
-                            "description": "Optional: filter results to one menu item.",
+                            "description": (
+                                "The dish name to scope the forecast to. REQUIRED whenever the user "
+                                "asks about a specific dish — e.g. 'Classic Cheeseburger forecast for "
+                                "the week' → item_name='Classic Cheeseburger'. Omit only when the "
+                                "user asks for the overall/whole-menu forecast."
+                            ),
                         },
                     },
                 },
@@ -554,9 +570,17 @@ User: "What will next week look like?"
 → forecast_demand(range="week")
 → "Here's the 7-day forecast — total 2,340 portions expected. Dinner is the busiest period each day." [ForecastCard shown]
 
-User: "How many margheritas do we expect at dinner tomorrow?"
-→ forecast_demand(range="daypart", daypart="dinner", day_offset=1, item_name="Margherita Pizza")
-→ "Tomorrow dinner forecast for Margherita Pizza: 48 portions expected." [ForecastCard shown]
+User: "How many cheeseburgers do we expect at dinner tomorrow?"
+→ forecast_demand(range="daypart", daypart="dinner", day_offset=1, item_name="Classic Cheeseburger")
+→ "Tomorrow dinner forecast for Classic Cheeseburger: 48 portions expected." [ForecastCard shown]
+
+User: "Classic cheeseburger forecast for the week"
+→ forecast_demand(range="week", item_name="Classic Cheeseburger")
+→ "Classic Cheeseburger: ~210 portions expected this week." [ForecastCard shown]
+
+User: "How many fries do we go through in a week?"
+→ forecast_demand(range="week", item_name="French Fries")
+→ "French Fries: ~340 portions forecast this week." [ForecastCard shown]
 
 User: "Show me today's full demand forecast."
 → forecast_demand(range="day")
@@ -566,6 +590,10 @@ User: "What's the Margherita Pizza forecast for the week?" [even if the dish is 
 → forecast_demand(range="week", item_name="Margherita Pizza")
 → [if result.item.active is false] "Margherita Pizza is currently 86'd (tomato stockout). If reinstated, we'd expect about 84 portions this week — roughly €756 in potential revenue."
 → [if result.item.active is true] "Margherita Pizza: ~84 portions expected this week, about €756 revenue." [ForecastCard shown]
+
+RULE — dish-named forecast: If the user names ANY specific dish in a forecast question, you MUST
+pass item_name=<that dish's name> to forecast_demand or get_forecast. Never omit item_name when
+a dish is named. Only omit it for whole-menu / "all dishes" queries.
 
 User: "How much will we lose if Marco is on leave this week?"
 → consult_reasoner(question="How much revenue will we lose this week if Marco is on leave?", context="Need revenue-at-risk from Marco's sole-covered dishes based on current forecasts.")
@@ -618,6 +646,7 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "• Staff sick/leave → set_staff_attendance(staff_name_or_role=..., status=...)\n"
         "• Adjust stock → adjust_inventory(ingredient_name=..., set_to=... or delta=...)\n"
         "• Interval forecast → forecast_demand(range=week|day|daypart|custom, daypart=..., day_offset=..., item_name=...)\n"
+        "  ↳ ALWAYS set item_name when the user names a specific dish.\n"
         "• Trigger agents → run_forecast / run_inventory_optimizer / run_competitor_scan / process_reviews\n"
         "• Outbound call → request_outbound_call (always requires approval)\n"
         "• Complex trade-off → consult_reasoner(question=..., context=...)\n\n"
@@ -650,7 +679,9 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "• Mark cooked → confirm_batch_cooked(dish_or_batch=..., actual_qty=...)\n"
         "• Waste (dish) → record_waste(item_name=..., qty=..., cause=...)\n"
         "• Ingredient spoiled → record_spoilage(ingredient_name=..., all_stock=...)\n"
-        "• Inventory check → get_inventory(item_name=...)\n\n"
+        "• Inventory check → get_inventory(item_name=...)\n"
+        "• Dish forecast → forecast_demand(range=week|day|daypart, item_name=...)\n"
+        "  ↳ ALWAYS set item_name when the user names a specific dish.\n\n"
         "BATCH STATES: approved=cook now; decided=needs approval; ready=already cooked; skipped=skip.\n\n"
         + _FEW_SHOTS
     ),
@@ -1102,8 +1133,12 @@ async def _handle_chunk(
             await _safe_send_json(websocket, {"type": "turn_complete"})
 
     if chunk.tool_call:
+        # Capture the accumulated user STT so we can recover a missing item_name below.
+        # STT chunks may still be arriving (half-cascade) so this is best-effort; it is
+        # strictly additive — only used when the model omitted the arg entirely.
+        user_text = "".join(buffers.user)
         for fn_call in (chunk.tool_call.function_calls or []):
-            result = await _execute_tool(fn_call, voice_processor, role, mode, voice_actions)
+            result = await _execute_tool(fn_call, voice_processor, role, mode, voice_actions, user_text=user_text)
             try:
                 await session.send_tool_response(
                     function_responses=_gtypes.FunctionResponse(
@@ -1148,12 +1183,61 @@ async def _handle_chunk(
                     await _speak_confirmation(session, "done")
 
 
+def _infer_item_name_from_text(user_text: str, va: Any) -> Optional[str]:
+    """Scan user_text for a single menu-item name match and return it (or None).
+
+    Used as a server-side safety net when the live model omits item_name from a
+    forecast tool call even though the user named a specific dish.  We only auto-fill
+    when exactly ONE distinct dish is found to avoid mis-scoping multi-dish utterances.
+
+    Two-pass matching (either pass can match; exact wins):
+      1. Full item name is contained in the utterance (e.g. "classic cheeseburger" in text).
+      2. Any significant word (≥4 chars) from the utterance is contained in an item name
+         (e.g. "fries" in "French Fries", "cheeseburger" in "Classic Cheeseburger").
+    If either pass yields more than one distinct item, we return None (ambiguous).
+    """
+    if not user_text or va is None:
+        return None
+    try:
+        import re  # noqa: PLC0415
+        from .models import MenuItem  # noqa: PLC0415
+        session = va.db_session_factory()
+        try:
+            items = session.query(MenuItem.id, MenuItem.name).all()
+        finally:
+            session.close()
+        text_lower = user_text.lower()
+        # Significant tokens from the utterance (≥4 chars, letters only)
+        tokens = [t for t in re.split(r"\W+", text_lower) if len(t) >= 4]
+        matched: list[str] = []
+        for _, item_name in items:
+            if not item_name:
+                continue
+            name_lower = item_name.lower()
+            hit = (
+                # Pass 1: full name appears in utterance
+                name_lower in text_lower
+                # Pass 2: any utterance word is a substring of the item name
+                or any(tok in name_lower for tok in tokens)
+            )
+            if hit and item_name not in matched:
+                matched.append(item_name)
+        if len(matched) == 1:
+            logger.debug("voice_live item_name fallback: inferred %r from %r", matched[0], user_text)
+            return matched[0]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("voice_live item_name fallback error: %s", exc)
+    return None
+
+
 async def _execute_tool(
     fn_call: Any,
     voice_processor: Any,
     role: str,
     mode: str,
     voice_actions: Optional[Any],
+    *,
+    user_text: str = "",
 ) -> Dict[str, Any]:
     """Execute a tool call via VoiceActions (primary) or VoiceProcessor (fallback reads)."""
     name = str(fn_call.name or "")
@@ -1176,17 +1260,27 @@ async def _execute_tool(
             )
 
         if name == "get_forecast":
+            # Server-side fallback: recover item_name from the user utterance when the
+            # model omitted it despite the user naming a dish.
+            item_name_gf = args.get("item_name") or None
+            if not item_name_gf and user_text:
+                item_name_gf = _infer_item_name_from_text(user_text, va)
             if va:
                 return await asyncio.to_thread(
                     va.get_forecast,
-                    item_name=args.get("item_name") or None,
+                    item_name=item_name_gf,
                     daypart=args.get("daypart") or None,
                 )
             return await asyncio.to_thread(
-                voice_processor.query_forecast, args.get("item_name") or None
+                voice_processor.query_forecast, item_name_gf
             )
 
         if name == "forecast_demand":
+            # Server-side fallback: recover item_name from the user utterance when the
+            # model omitted it despite the user naming a dish.
+            item_name_fd = args.get("item_name") or None
+            if not item_name_fd and user_text:
+                item_name_fd = _infer_item_name_from_text(user_text, va)
             if va:
                 day_offset = args.get("day_offset")
                 return await asyncio.to_thread(
@@ -1196,7 +1290,7 @@ async def _execute_tool(
                     day_offset=int(day_offset) if day_offset is not None else 0,
                     start=args.get("start") or None,
                     end=args.get("end") or None,
-                    item_name=args.get("item_name") or None,
+                    item_name=item_name_fd,
                 )
             return {"error": "forecast_demand requires voice_actions"}
 
